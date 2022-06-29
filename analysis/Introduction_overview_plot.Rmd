@@ -140,8 +140,15 @@ patAnno.sub %>%
     theme(axis.title.x = element_blank(),
         legend.position="none") +
     scale_fill_manual(values=color_vec)
-```
 
+patAnno.sub %>%
+  ggplot(aes(x="", y=diagnosis, fill=diagnosis)) +
+  geom_bar(stat="identity", width=1) +
+  coord_polar("y", start=0) +
+  #geom_text(aes(y = ypos, label = group), color = "grey", size=6) +
+  scale_fill_manual(values=color_vec) +
+  theme_void()
+```
 
 # Genetic landscape of CLL cohort
 

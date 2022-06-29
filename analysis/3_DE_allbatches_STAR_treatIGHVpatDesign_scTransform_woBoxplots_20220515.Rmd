@@ -1,0 +1,1225 @@
+---
+title: "DE of treatment (Ibr, Duv, Nut) and genotype of all batches, pre-processed with STAR + HTSeq"
+author: "Caroline Lohoff"
+date: "May 15 2022"
+output:
+  BiocStyle::html_document:
+    toc_float: true
+---
+
+# Description
+Before DESeq2 is used, the raw counts are adjusted with scTransform. 
+
+In this script a differential expression analysis is performed which considers the different drug treatments and a genotype, such as TP53 mutational status, trisomy12 or IGHV status, while correcting for the variance in the data set due to patient effects. 
+In order to compare the treatments with DMSO and additionally consider the genotype, a nested design is chosen for DESeq2.
+Design formulas:
+TP53 + TP53:patIDgroup + TP53:treatment  (Nut)
+IGHV + IGHV:patIDgroup + IGHV:treatment  (Ibr, Duv)
+trisomy12 + trisomy12:patIDgroup + trisomy12:treatment  (Ibr, Duv)
+
+For Ibr and Duv, we assume that trisomy 12 and 19 enhance BCR signalling due to the results from the MOFA analysis. Bruch and Giles et all identified trisomy 12 as an amplifier of drug responses to microenvironmental stimuli, mediated by the transcription factors Spi-B and PU.1, [see paper](https://www.biorxiv.org/content/10.1101/2021.07.23.453514v2.full).
+In other words we have an experiment with individual patients grouped by TP53 mutational status, where we seek to test the group-specific effect of a treatment, while controlling for individual effects. The individuals are nested within the groups: a patient can only be in one of the groups, although each individual has one or more observations across conditions.
+A detailed description of this design can be viewed in the [DESeq2 vignette](http://bioconductor.org/packages/devel/bioc/vignettes/DESeq2/inst/doc/DESeq2.html#group-specific-condition-effects-individuals-nested-within-groups).
+
+The aim is to predict the effectiveness of Ibrutinib, Duvelisib and Nutlin on patients grouped by IGHV status, TP53 mutation and trisomy12. So far, these biomarkers can aid prognostication, but may also be capable of predicting the efficacy of various treatment strategies in subgroups of patients. In an [interesting review](https://www.frontiersin.org/articles/10.3389/fonc.2021.780085/full) the treatment approaches to CLL with high-risk molecular features are discussed. In this review the TP53 status has no impact on Ibrutinib treatment after first-line treatment with fludarabine monotherapy (F) or fludarabine and cyclophosphamide (FC). But they show an impressive efficacy of Ibrutinib in R/R CLL with TP53 aberrations. Several trials have also demonstrated a high efficacy of ibrutinib in R/R U-CLL.
+
+# Load libraries and set options
+
+Set global options
+```{r setup, include=FALSE, cache = FALSE}
+knitr::opts_knit$set(root.dir = "~/Documents/R/drugseq_test")
+knitr::opts_chunk$set(warning = FALSE, message = FALSE)
+```
+
+Load libraries
+```{r}
+suppressPackageStartupMessages({
+  library(DESeq2)
+  library(tidyverse)
+  library(RColorBrewer)
+  library(pheatmap)
+  library(clusterProfiler)
+  library(enrichplot)
+  library(cowplot)
+  library(org.Hs.eg.db)
+  library(annotate)
+  library(BiocParallel)
+})
+register(MulticoreParam(2))
+```
+
+Set global ggplot variables
+```{r}
+theme_set(theme_bw() + theme(axis.text = element_text(size=12), 
+                             axis.title = element_text(size=16),
+                             legend.title = element_text(size=16),
+                             legend.text = element_text(size=14),
+                             plot.title = element_text(size=18,
+                                                       hjust=0.5,face="bold")))
+```
+
+# Load data and add annotations
+```{r}
+# Load dds data set containing 1106 samples and count matrix
+load("./output/ddsDrug_htseq_batchPilot1c234_20220426.RData")
+
+# Load meta data including genotyping info
+load("./data/patmeta_210324.RData")
+
+# Add columns to DESeq object using patient meta data
+col_vec <- c("diagnosis", "gender", "Methylation_Cluster", "trisomy12", "NOTCH1", "TP53")
+ddsDrug@colData@listData <- lapply(col_vec, function(n) {
+  ddsDrug[[n]] <- patMeta[match(ddsDrug$patID, patMeta$Patient.ID), n]
+}) %>% bind_cols() %>% sjmisc::add_columns(ddsDrug@colData@listData)
+
+names(ddsDrug@colData@listData)[names(ddsDrug@colData@listData) == "Methylation_Cluster"] <- "Methylation"
+ddsDrug$IGHVpat <- patMeta[match(ddsDrug$patID, patMeta$Patient.ID),]$IGHV.status
+ddsDrug$IGHV <- ifelse(is.na(ddsDrug$IGHV), ddsDrug$IGHVpat, ddsDrug$IGHV)
+
+# Add meta data to the samples from the pilot batch
+ddsDrug$diagnosis[ddsDrug$batch == "pilot"] <- "CLL" 
+ddsDrug$trisomy12[ddsDrug$batch == "pilot"] <- 0
+ddsDrug$NOTCH1[ddsDrug$batch == "pilot"] <- 0
+ddsDrug$TP53[ddsDrug$batch == "pilot"] <- 0
+ddsDrug$IGHV[ddsDrug$batch == "pilot" & ddsDrug$patID %in% c("PID1095", "PID1222")] <- "U"
+ddsDrug$IGHV[ddsDrug$batch == "pilot" & ddsDrug$patID %in% c("PID1177", "PID1210")] <- "M"
+ddsDrug$gender[ddsDrug$batch == "pilot" & ddsDrug$patID %in% c("PID1095", "PID1222")] <- "f"
+ddsDrug$gender[ddsDrug$batch == "pilot" & ddsDrug$patID %in% c("PID1177", "PID1210")] <- "m"
+
+# Rename IGHV status from 'U' and 'M' to 0 and 1
+ddsDrug$IGHV[ddsDrug$IGHV == "U"] <- 0
+ddsDrug$IGHV[ddsDrug$IGHV == "M"] <- 1
+ddsDrug$IGHV <- as.factor(ddsDrug$IGHV)
+ddsDrug$IGHVpat <- NULL
+
+# Replace spaces in treatment names
+ddsDrug$treatment <- str_replace_all(ddsDrug$treatment,"[- ]","_")
+
+dim(ddsDrug)
+```
+
+Filter patients
+```{r}
+# Remove patients with a low mapping rate & little counts
+remPat <- c("P0437", "P0738", "P0029")
+ddsAll <- ddsDrug[, !ddsDrug$patID %in% remPat]
+
+# Keep only CLL patients and remove Jurkat samples
+ddsAll <- ddsAll[,ddsAll$diagnosis == "CLL" &
+                   ddsAll$treatment != "Baseline" &
+                   ddsAll$Replicate == 1]
+dim(ddsAll)
+
+# Remove patients without DMSO sample
+patIDs <- unique(ddsAll$patID)
+vec <- c()
+for(id in patIDs){
+  if(ddsDrug$treatment[ddsDrug$patID == id] == "DMSO"){
+    vec <- append(vec, id)
+  }
+}
+removepat <- setdiff(patIDs, vec)
+ddsAll <- ddsAll[, !ddsAll$patID %in% removepat]
+
+# Remove patients with undefined IGHV status
+ddsAll <- ddsAll[, !is.na(ddsAll$IGHV)]
+ddsAll$IGHV <- factor(ddsAll$IGHV)
+```
+
+Filter genes by their counts and type
+```{r}
+# Only use protein coding genes and remove genes with unknown gene symbol
+ddsAll <- ddsAll[rowData(ddsAll)$biotype == "protein_coding" & !rowData(ddsAll)$symbol %in% c(NA, ""),]
+
+# Remove genes on Y chromosome, mitochondrial and artificial chromosomes
+ddsAll <- ddsAll[rowData(ddsAll)$chromosome %in% c(1:22,"X")]
+table(rowData(ddsAll)$chromosome)
+
+# Keep only genes with a minimum of 10 counts in any sample
+keep_counts <- apply(counts(ddsAll), 1, function(x) any(x >= 10))
+ddsAll <- ddsAll[keep_counts,]
+
+# Keep only genes expressed in at least 30% of all samples, 
+# since most genes have a basal expression. 
+# With this function the sparsity of the expression matrix is reduced.
+expr_min <- round(ncol(counts(ddsAll)) * 0.7)
+keep_counts_expr <- apply(counts(ddsAll), 1, function(x) sum(x == 0) < expr_min)
+ddsAll <- ddsAll[keep_counts_expr,]
+
+dim(ddsAll)
+```
+
+Extract counts and annotation data frame
+```{r}
+# Extract count matrix
+counts_df <- data.frame(assay(ddsAll))
+
+# Extract patient annotation
+patAnno <- data.frame(colData(ddsAll))
+
+# Number of patients used for this analysis
+length(unique(ddsAll$patID))
+```
+
+# Differential expression using DESeq2
+
+Differential expression analysis of genomic data types uses linear models to determine the size and direction of the changes in gene expression.
+
+## Preparations of input data
+
+### Correct count matrix with scTransform
+(Resulting counts are integers and can be used as input for DESeq2)
+```{r, results=FALSE}
+countMat <- counts(ddsAll)
+scModel <- sctransform::vst(countMat,
+                            return_corrected_umi = TRUE)
+
+# Extract normalized counts matrix
+countMat.norm <- as.matrix(scModel$umi_corrected)
+
+# Create new ddsAll object with norm. counts matrix and colData from ddsDrug
+ddsAll.adj <- DESeqDataSetFromMatrix(countMat.norm,
+                                     colData = colData(ddsAll), design = ~1)
+rowData(ddsAll.adj) <- rowData(ddsAll[rownames(countMat.norm)],)
+
+# Reset size factors
+ddsAll.adj$sizeFactor <- 1
+```
+
+Subset dds object into different objects with one treatment and DMSO
+```{r}
+allTreat <- c("Ibrutinib", "Duvelisib", "Nutlin_3a")
+
+ddstr <- lapply(allTreat, function(tr) {
+  patIDtr <- unique(ddsAll.adj$patID[ddsAll.adj$treatment == tr])
+  ddsdrug <- ddsAll.adj[, ddsAll.adj$treatment %in% c(tr, "DMSO") & ddsAll.adj$patID %in% patIDtr]
+})
+names(ddstr) <- allTreat
+```
+
+
+### Create the design matrix for each treatment
+
+For Ibrutinib, Duvelisib and Nutlin we create three designs each in combination with TP53, IGHV, and trisomy12, respectively.
+```{r, include=TRUE, eval=FALSE}
+genotype <- c("TP53", "trisomy12", "IGHV")
+
+for(geno in genotype){
+  for(drug in allTreat){
+    
+    # Extract dds object
+    dds <- ddstr[[drug]]
+    
+    # Extract number of patients for each genotype group
+    g0 <- unique(dds$patID[dds[[geno]] == 0])
+    g1 <- unique(dds$patID[dds[[geno]] == 1])
+    
+    # Add new column to rename the patients
+    dds$patIDgroup <- NA
+
+    for(pat in g0){
+      dds$patIDgroup[dds$patID == pat] <- which(g0 == pat)
+    }
+    for(pat in g1){
+      dds$patIDgroup[dds$patID == pat] <- which(g1 == pat)
+    }
+    dds$patIDgroup <- factor(dds$patIDgroup)
+    
+    # Create data frame to set differences
+    patAnno <- data.frame(colData(dds)) %>%
+      dplyr::select(TP53, trisomy12, IGHV, treatment, patIDgroup) %>%
+      mutate(treatment = factor(treatment, levels = c("DMSO",setdiff(unique(treatment),"DMSO"))))
+    
+    # Create design matrix
+    if(geno == "TP53"){
+      designMat <- model.matrix(~ TP53 + TP53:patIDgroup + TP53:treatment, patAnno)
+    }else if(geno == "trisomy12"){
+      designMat <- model.matrix(~ trisomy12 + trisomy12:patIDgroup + trisomy12:treatment, patAnno)
+    }else{
+      designMat <- model.matrix(~ IGHV + IGHV:patIDgroup + IGHV:treatment, patAnno)
+    }
+    
+    # Remove empty columns in design matrix
+    all.zero <- apply(designMat, 2, function(x) all(x==0))
+    remove <- which(all.zero)
+    if(length(remove) > 0){
+      designMat <- designMat[,-remove]
+    }
+    print(dim(designMat))
+
+    # Add the design matrix to dds object
+    design(dds) <- designMat
+
+    # Save dds object
+    save(dds, file = sprintf("./DE/dds_%s_%s_allbatches_STAR_scTransform_20220515.RData", geno, drug))
+  }
+}
+```
+
+## Run DESeq2
+
+The DESeq function fits the raw counts to the negative binomial model. The final dds object contains all the information needed for performing DE testing between specific sample groups. New information such as shrunken dispersions, model coefficients, Wald test results, and gene-wise dispersions will be added to the dds object.
+```{r,include=TRUE, eval=FALSE}
+for(geno in genotype){
+  for(drug in allTreat){
+    load(sprintf("./DE/dds_%s_%s_allbatches_STAR_scTransform_20220515.RData", geno, drug))
+    DEres <- DESeq(dds, parallel=TRUE)
+    save(DEres, file = sprintf("./DE/DEres_%s_%s_allbatches_STAR_scTransform_20220515.RData", geno, drug))
+  }
+}
+```
+
+
+# Analyze results for IGHV
+
+## Load and transform results
+
+Load DESeq2 results of individual treatments and combine them to a list
+```{r}
+DEres_list <- list()
+for(drug in allTreat){
+  load(sprintf("./DE/DEres_IGHV_%s_allbatches_STAR_scTransform_20220515.RData", drug))
+  DEres_list <- append(DEres_list, list(DEres))
+}
+names(DEres_list) <- allTreat
+
+namesTrMut <- c("Ibrutinib_u", "Ibrutinib_m", "Duvelisib_u",
+                "Duvelisib_m", "Nutlin_u", "Nutlin_m")
+```
+
+The results for wild type and mutated IGHV are extracted separately with prior shrinkage of LFC values using the apeglm estimator. 
+```{r, include=TRUE, eval=FALSE}
+resIbrShrink_u <- lfcShrink(DEres_list$Ibrutinib[which(mcols(DEres_list$Ibrutinib)$betaConv),],
+                             coef="IGHV0.treatmentIbrutinib", type="apeglm", parallel=TRUE)
+resIbrShrink_m <- lfcShrink(DEres_list$Ibrutinib[which(mcols(DEres_list$Ibrutinib)$betaConv),],
+                            coef="IGHV1.treatmentIbrutinib", type="apeglm", parallel=TRUE)
+                                  
+resDuvShrink_u <- lfcShrink(DEres_list$Duvelisib[which(mcols(DEres_list$Duvelisib)$betaConv),],
+                             coef="IGHV0.treatmentDuvelisib", type="apeglm", parallel=TRUE)
+resDuvShrink_m <- lfcShrink(DEres_list$Duvelisib[which(mcols(DEres_list$Duvelisib)$betaConv),],
+                            coef="IGHV1.treatmentDuvelisib", type="apeglm", parallel=TRUE)
+                                  
+resNutShrink_u <- lfcShrink(DEres_list$Nutlin_3a[which(mcols(DEres_list$Nutlin_3a)$betaConv),],
+                                coef="IGHV0.treatmentNutlin_3a", type="apeglm", parallel=TRUE)
+resNutShrink_m <- lfcShrink(DEres_list$Nutlin_3a[which(mcols(DEres_list$Nutlin_3a)$betaConv),],
+                               coef="IGHV1.treatmentNutlin_3a", type="apeglm", parallel=TRUE)
+
+allResShrink_IGHV <- list(resIbrShrink_u, resIbrShrink_m, resDuvShrink_u,
+                          resDuvShrink_m, resNutShrink_u, resNutShrink_m)  
+names(allResShrink_IGHV) <- namesTrMut
+
+save(allResShrink_IGHV, file = "./DE/allResShrink_IGHV_IbrDuvNut_allbatches_STAR_scTransform_20220515.RData")
+## total running time ~ 1 hour
+```
+
+Load results data frames with shrunken LFC values as list
+```{r}
+load("./DE/allResShrink_IGHV_IbrDuvNut_allbatches_STAR_scTransform_20220515.RData")
+```
+
+Create results data frames from the resulting dds files with shrunken LFCs
+```{r}
+counter <- 0
+allRes <- lapply(allResShrink_IGHV, function(res) {
+  counter <<- counter + 1
+  resTab <- data.frame(res@listData) %>%
+      mutate(treatment = sprintf("%s_IGHV%s",
+                                 strsplit(names(allResShrink_IGHV), "[_]")[[counter]][1],
+                                 strsplit(names(allResShrink_IGHV), "[_]")[[counter]][2])) %>%
+      rownames_to_column(var = "Ensembl") %>%
+      mutate(symbol = rowData(ddsDrug)[Ensembl,]$symbol) %>%
+      mutate(chromosome = rowData(ddsDrug)[Ensembl,]$chromosome)
+  names(resTab)[names(resTab) == "log2FoldChange"] <- "LFC"
+  resTab_final <- resTab
+})
+names(allRes) <- namesTrMut
+```
+
+The results of the different drugs are combined to one df
+```{r}
+# Change names of columns by adding treatment and mutation status
+colname <- c("Ibr_u", "Ibr_m", "Duv_u", "Duv_m", "Nut_u", "Nut_m")
+name <- 0
+
+allRes_names <- lapply(allRes, function(df) {
+  name <<- name + 1
+  dfsub <- dplyr::select(df, c(-treatment, -symbol, -chromosome))
+  colnames(dfsub) <- paste(colnames(dfsub),colname[name],sep="_")
+  dfnew <- dfsub
+})
+names(allRes_names) <- namesTrMut
+
+# Create one df with the results of all treatments
+allRes_combined <- allRes$Ibrutinib_u %>%
+  dplyr::select(Ensembl, symbol, chromosome)
+
+coljoin <- c("Ensembl_Ibr_u", "Ensembl_Ibr_m", "Ensembl_Duv_u",
+             "Ensembl_Duv_m", "Ensembl_Nut_u", "Ensembl_Nut_m")
+enumerator <- 0
+
+for(df in allRes_names){
+  enumerator <- enumerator + 1
+  allRes_combined <- full_join(allRes_combined, df,
+                             by=c("Ensembl"=coljoin[enumerator]),
+                             keep=FALSE)
+}
+```
+
+Save combined data frame as csv file
+```{r}
+write.csv(allRes_combined,
+          file="./output/Resdf_IGHV_IbrDuvNut_STAR_scTransform_20220515.csv", sep="\t")
+save(allRes_combined,
+     file = "./output/Resdf_IGHV_IbrDuvNut_STAR_scTransform_20220515.RData")
+```
+
+## Visualize DE results
+
+In this section we explore how well our data fit the model.
+
+### Dispersion of results before shrinkage
+
+```{r}
+# Ibrutinib
+DEres_IbrutinibC <- DEres_list$Ibrutinib[which(mcols(DEres_list$Ibrutinib)$betaConv),]
+plotDispEsts(DEres_IbrutinibC)
+
+# Duvelisib
+DEres_DuvelisibC <- DEres_list$Duvelisib[which(mcols(DEres_list$Duvelisib)$betaConv),]
+plotDispEsts(DEres_DuvelisibC)
+
+# Nutlin
+DEres_NutlinC <- DEres_list$Nutlin[which(mcols(DEres_list$Nutlin)$betaConv),]
+plotDispEsts(DEres_NutlinC)
+```
+This plot looks quite good, as we expect the dispersion values to decrease with increasing mean and that they cluster around the fitted maximum likelihood line. Larger numbers of replicates can estimate the mean and variation more accurately, so yield less shrinkage.
+
+### Distribution of shrunken LFCs
+
+Plot distribution of shrunken LFCs for wild type and mutated genotype.
+
+The function plotMA shows the log2 fold changes attributable to a given variable over the mean of normalized counts for all the samples in the data set. Points will be colored red if the adjusted p value is less than 0.1. Points which fall out of the window are plotted as open triangles pointing either up or down.
+```{r}
+# Ibrutinib
+plotMA(allResShrink_IGHV$Ibrutinib_u, ylim=c(-3,3),
+             cex=.8, main="Ibrutinib U-CLL")
+abline(h=c(-1,1), col="dodgerblue", lwd=2)
+
+plotMA(allResShrink_IGHV$Ibrutinib_m, ylim=c(-3,3),
+             cex=.8, main="Ibrutinib M-CLL")
+abline(h=c(-1,1), col="dodgerblue", lwd=2)
+
+# Duvelisib
+plotMA(allResShrink_IGHV$Duvelisib_u, ylim=c(-3,3),
+             cex=.8, main="Duvelisib U-CLL")
+abline(h=c(-1,1), col="dodgerblue", lwd=2)
+
+plotMA(allResShrink_IGHV$Duvelisib_m, ylim=c(-3,3),
+             cex=.8, main="Duvelisib M-CLL")
+abline(h=c(-1,1), col="dodgerblue", lwd=2)
+
+# Nutlin
+plotMA(allResShrink_IGHV$Nutlin_u, ylim=c(-3,3),
+             cex=.8, main="Nutlin U-CLL")
+abline(h=c(-1,1), col="dodgerblue", lwd=2)
+
+plotMA(allResShrink_IGHV$Nutlin_m, ylim=c(-3,3),
+             cex=.8, main="Nutlin M-CLL")
+abline(h=c(-1,1), col="dodgerblue", lwd=2)
+```
+
+
+### P-value histogram
+
+```{r, fig.height=6, fig.width=7}
+hist_list <- lapply(allRes, function(res) {
+ ggplot(res, aes(x=pvalue)) +
+    geom_histogram(fill="lightblue", color="black",binwidth=0.025) +
+  geom_vline(xintercept=0.05,color="red",linetype="longdash") +
+  facet_wrap(~ treatment) +
+  scale_x_continuous(breaks = seq(0,1,by=0.2)) +
+  ylab("# of genes") +
+  theme(plot.title = element_text(face="bold",hjust=0.5))
+})
+
+plot_grid(plotlist=hist_list, ncol=2)
+```
+The p-value histograms look very good, as we have many genes with a low p-value and fewer genes with a p-value of 1.
+
+### Number of significant DE genes 
+
+When looking at the p-value histograms, one would like to know how many genes pass a certain p-value cutoff. In the p-value histograms the cutoff is indicated at 0.05 (5% FDR). The barplots below answer the question, how many genes have a smaller adjusted p-value then 0.05, 0.1 and 0.25? 
+
+#### Preparation
+Function for creating a df with significant up- or downregulated genes
+```{r}
+sig_genes_df <- function(gle, fdr){
+  # Create new df with number of sig. genes for each treatment
+  genes_df <- setNames(data.frame(matrix(ncol = 2, nrow = 0)),
+                         c("treatment", "sig_genes"))
+  compare <- match.fun(gle)
+
+  for(df in allRes){
+    n_genes <- filter(df, compare(LFC,0) & padj < fdr) %>% 
+      summarise(n=length(Ensembl)) %>% pull(n)
+    tr <- unique(df$treatment)
+    tr <- gsub('IGHV', '', tr)
+  
+    new_row <- c(tr, n_genes)
+    genes_df[nrow(genes_df) + 1, ] <- new_row
+  }
+  genes_df$sig_genes <- as.numeric(genes_df$sig_genes)
+  genes_df$treatment <- factor(genes_df$treatment,
+                                 levels = namesTrMut)
+  return(genes_df)
+}
+```
+
+Function for plotting number of significant genes for each treatment
+```{r}
+sigDEgenes <- function(df, title){
+  plot <- ggplot(df, aes(x=treatment, y=sig_genes)) +
+    geom_bar(stat = "identity", color="black", fill="#0C3C9F") +
+    theme(axis.text.x = element_text(angle = 90, vjust=0.5, hjust=1)) +
+    ylab("# significant DE genes") +
+    theme(axis.title.x = element_blank()) +
+    ggtitle(title) +
+    geom_text(aes(label=sig_genes),vjust=-0.25,size=3)
+  return(plot)
+}
+```
+
+#### 5% FDR
+```{r,fig.height=4, fig.width=8}
+# Upregulated
+sig_genes_df_up <- sig_genes_df(gle=">", fdr=0.05)
+genes_5FDRup <- sigDEgenes(df=sig_genes_df_up, title="5% FDR upregulated")
+
+# Downregulated
+sig_genes_df_down <- sig_genes_df(gle="<", fdr=0.05)
+genes_5FDRdown <- sigDEgenes(df=sig_genes_df_down, title="5% FDR downregulated")
+
+plot_grid(genes_5FDRup, genes_5FDRdown, ncol=2)
+```
+
+#### 10% FDR
+```{r,fig.height=4, fig.width=8}
+# Upregulated
+sig_genes_df_up <- sig_genes_df(gle=">", fdr=0.1)
+genes_10FDRup <- sigDEgenes(df=sig_genes_df_up, title="10% FDR upregulated")
+
+# Downregulated
+sig_genes_df_down <- sig_genes_df(gle="<", fdr=0.1)
+genes_10FDRdown <- sigDEgenes(df=sig_genes_df_down, title="10% FDR downregulated")
+
+plot_grid(genes_10FDRup, genes_10FDRdown, ncol=2)
+```
+
+#### 25% FDR
+```{r,fig.height=4, fig.width=8}
+# Upregulated
+sig_genes_df_up <- sig_genes_df(gle=">", fdr=0.25)
+genes_25FDRup <- sigDEgenes(df=sig_genes_df_up, title="25% FDR upregulated")
+
+# Downregulated
+sig_genes_df_down <- sig_genes_df(gle="<", fdr=0.25)
+genes_25FDRdown <- sigDEgenes(df=sig_genes_df_down, title="25% FDR downregulated")
+
+plot_grid(genes_25FDRup, genes_25FDRdown, ncol=2)
+```
+These barplots indicate that samples treated with Duvelisib have the most differentially expressed genes compared to DMSO, followed by Ibrutinib and Nutlin 3a. 
+For Ibrutinib and Duvelisib patients with U-CLL have more DE genes than patients with M-CLL. This result fits to the current state of research that U-CLL is more aggressive than M-CLL. Treatment with Ibrutinib or Duvelisib leads to a stronger response of the cell in terms of gene expression.
+For samples treated with Nutlin the opposite is the case. Treatment of M-CLL cells leads to more DE genes than treatment of U-CLL cells. 
+
+### Overlap of differentially expressed genes
+
+#### All genes
+
+Prepare gene lists with all significant genes per treatment (5% FDR)
+```{r, fig.height=3, fig.width=6}
+geneList.all <- lapply(namesTrMut, function(tr) {
+  genes <- filter(allRes[[tr]], padj < 0.05)$Ensembl
+  })
+names(geneList.all) <- namesTrMut
+
+UpSetR::upset(UpSetR::fromList(geneList.all), nsets = 20)
+```
+
+#### U-CLL
+Overlap of significant genes in U-CLL samples (5% FDR)
+```{r, fig.height=3, fig.width=6}
+namesTrMut_u <- c("Ibrutinib_u", "Duvelisib_u", "Nutlin_u")
+geneList.U <- lapply(namesTrMut_u, function(tr) {
+  genes <- filter(allRes[[tr]], padj < 0.05)$Ensembl
+  })
+names(geneList.U) <- namesTrMut_u
+
+UpSetR::upset(UpSetR::fromList(geneList.U), nsets = 20)
+```
+The overlap between Ibrutinib and Duvelisib is quite large (734 genes). However, there are still 1086 unique genes for Duvelisib and 470 genes for Ibrutinib. These are the interesting genes we would like to investigate further using Pathway enrichment analysis and boxplots of gene expression. 
+There is only little overlap of DE genes between Nutlin and Ibrutinib or Nutlin and Duvelisib, since Nutlin has a different mechanism of action. 
+
+Check whether genes are unique for Ibrutinib and Duvelisib or shared between both treatments. Add these gene vectors to the list.
+```{r}
+Ibr_u_unique <- setdiff(geneList.U$Ibrutinib_u, geneList.U$Duvelisib_u)
+Duv_u_unique <- setdiff(geneList.U$Duvelisib_u, geneList.U$Ibrutinib_u)
+IbrDuv_u_shared <- intersect(geneList.U$Duvelisib_u, geneList.U$Ibrutinib_u)
+
+# Add to list for U-CLL
+geneList.U <- c(geneList.U, list(Ibr_u_unique=Ibr_u_unique,
+                                 Duv_u_unique=Duv_u_unique,
+                                 IbrDuv_u_shared=IbrDuv_u_shared))
+```
+
+#### M-CLL
+Overlap of significant genes in M-CLL samples (5% FDR)
+```{r, fig.height=3, fig.width=6}
+namesTrMut_m <- c("Ibrutinib_m", "Duvelisib_m", "Nutlin_m")
+geneList.M <- lapply(namesTrMut_m, function(tr) {
+  genes <- filter(allRes[[tr]], padj < 0.05)$Ensembl
+  })
+names(geneList.M) <- namesTrMut_m
+
+UpSetR::upset(UpSetR::fromList(geneList.M), nsets = 20)
+```
+For M-CLL the overlap between Duvelisib and Ibrutinib is smaller, but the overlap between Duvelisib and Nutlin is larger. 
+
+Check whether genes are unique for Ibrutinib and Duvelisib or shared between both treatments. Add these gene vectors to the list.
+```{r}
+Ibr_m_unique <- setdiff(geneList.M$Ibrutinib_m, geneList.U$Duvelisib_m)
+Duv_m_unique <- setdiff(geneList.M$Duvelisib_m, geneList.U$Ibrutinib_m)
+IbrDuv_m_shared <- intersect(geneList.M$Duvelisib_m, geneList.U$Ibrutinib_m)
+
+# Add to list for M-CLL
+geneList.M <- c(geneList.M, list(Ibr_m_unique=Ibr_m_unique,
+                                 Duv_m_unique=Duv_m_unique,
+                                 IbrDuv_m_shared=IbrDuv_m_shared))
+```
+
+#### Upregulated genes
+
+Retrieve only up-regulated genes (FDR 5%)
+```{r, fig.height=3, fig.width=6}
+geneList.up <- lapply(namesTrMut, function(tr) {
+  up <- filter(allRes[[tr]], LFC > 0)
+  genes <- filter(up, padj < 0.05)$Ensembl
+  })
+names(geneList.up) <- namesTrMut
+
+UpSetR::upset(UpSetR::fromList(geneList.up), nsets = 20)
+```
+
+#### Downregulated genes
+
+Retrieve only down-regulated genes (FDR 5%)
+```{r, fig.height=3, fig.width=6}
+geneList.down <- lapply(namesTrMut, function(tr) {
+  down <- filter(allRes[[tr]], LFC < 0)
+  genes <- filter(down, padj < 0.05)$Ensembl
+  })
+names(geneList.down) <- namesTrMut
+
+UpSetR::upset(UpSetR::fromList(geneList.down), nsets = 20)
+```
+
+### Table of significant associations of all treatments and IGHV
+
+U-CLL (genes with adjusted p-value below 5% for any treatment)
+```{r}
+geneList.Uvec <- unique(c(geneList.U$Ibrutinib_u,
+                          geneList.U$Duvelisib_u,
+                          geneList.U$Nutlin_u))
+
+allRes_combined %>%
+  dplyr::filter(Ensembl %in% geneList.Uvec) %>%
+  dplyr::select(Ensembl, symbol, chromosome,
+                LFC_Ibr_u, padj_Ibr_u,
+                LFC_Duv_u, padj_Duv_u,
+                LFC_Nut_u, padj_Nut_u) %>%
+  mutate_if(is.numeric, formatC, digits=2) %>%
+  DT::datatable()
+```
+
+M-CLL (genes with adjusted p-value below 5% for any treatment)
+```{r}
+geneList.Mvec <- unique(c(geneList.M$Ibrutinib_m,
+                          geneList.M$Duvelisib_m,
+                          geneList.M$Nutlin_m))
+
+allRes_combined %>%
+  dplyr::filter(Ensembl %in% geneList.Mvec) %>%
+  dplyr::select(Ensembl, symbol, chromosome,
+                LFC_Ibr_m, padj_Ibr_m,
+                LFC_Duv_m, padj_Duv_m,
+                LFC_Nut_m, padj_Nut_m) %>%
+  mutate_if(is.numeric, formatC, digits=2) %>%
+  DT::datatable()
+```
+
+### Volcano plots
+
+Function for creating volcano plot
+```{r}
+volcano <- function(res, title){
+  plot <- ggplot(res, aes(x=LFC, y=-log10(padj))) +
+    geom_vline(xintercept = 0, color="black", linetype="solid", size=0.25) +
+    geom_hline(yintercept = -log10(0.01), color="darkgrey", linetype="dashed") +
+    geom_hline(yintercept = -log10(0.10), color="darkgrey", linetype="dashed") +
+    geom_vline(xintercept = 1, color="darkgrey", linetype="dashed") +
+    geom_vline(xintercept =-1, color="darkgrey", linetype="dashed") +
+    geom_point(data=res[res$LFC >= 0 & res$padj <= 0.1,],
+              color="firebrick3", size=0.9) +
+    geom_point(data=res[res$LFC <= 0 & res$padj <= 0.1,],
+              color="navy", size=0.9) +
+    geom_point(data=res[res$padj >= 0.1,], color="darkgrey", size=0.9) +
+    ggrepel::geom_label_repel(data=res[res$LFC > 0 & res$padj <= 0.001,],
+                              aes(label=symbol), color="firebrick3", size=2,
+                              max.overlaps=20) +
+    ggrepel::geom_label_repel(data=res[res$LFC < 0 & res$padj <= 0.001,],
+                              aes(label=symbol), color="navy", size=2,
+                              max.overlaps=20) +
+    ggtitle(title) +
+    theme(plot.title = element_text(hjust=0.5, face="bold"))
+  return(plot)
+}
+```
+
+Remove genes with non-calculated adjusted p-values
+```{r}
+allRes_na<- lapply(allRes, function(df) {
+  df <- df[!is.na(df$padj),]
+  })
+names(allRes_na) <- namesTrMut
+```
+
+Show volcano plot for all conditions
+```{r, fig.height=18, fig.width=12}
+p1 <- volcano(allRes_na$Ibrutinib_u, title="Ibrutinib U-CLL")
+p2 <- volcano(allRes_na$Ibrutinib_m, title="Ibrutinib M-CLL")
+p3 <- volcano(allRes_na$Duvelisib_u, title="Duvelisib U-CLL")
+p4 <- volcano(allRes_na$Duvelisib_m, title="Duvelisib M-CLL")
+p5 <- volcano(allRes_na$Nutlin_u, title="Nutlin U-CLL")
+p6 <- volcano(allRes_na$Nutlin_m, title="Nutlin M-CLL")
+
+plot_grid(p1, p2, p3, p4, p5, p6, ncol=2)
+```
+
+### Heatmap
+
+#### Preparations
+
+Extract the top genes of the individual results. 
+First, we filter the log fold change values, then we select the top 500 genes with the smallest p-values.
+```{r}
+ngenes <- 500
+lfc <- 1
+
+namesTrMut_u <- c("Ibrutinib_u", "Duvelisib_u", "Nutlin_u")
+namesTrMut_m <- c("Ibrutinib_m", "Duvelisib_m", "Nutlin_m")
+
+
+### U-CLL
+# All significant genes
+top_genes <- lapply(namesTrMut_u, function(tr) {
+  allRes_sub <- allRes[[tr]] %>%
+    filter(LFC < -lfc | LFC > lfc) %>%
+    arrange(padj) %>% slice(1:ngenes)
+  vec <- allRes_sub$Ensembl
+  })
+all_top_genes_u <- unique(unlist(top_genes))
+
+# Upregulated significant genes
+top_genes_up <- lapply(namesTrMut_u, function(tr) {
+  allRes_sub <- allRes[[tr]] %>%
+    filter(LFC > lfc) %>%
+    arrange(padj) %>% slice(1:ngenes)
+  vec <- allRes_sub$Ensembl
+  })
+all_top_genes_up_u <- unique(unlist(top_genes_up))
+
+# Downregulated significant genes
+top_genes_down <- lapply(namesTrMut_u, function(tr) {
+  allRes_sub <- allRes[[tr]] %>%
+    filter(LFC < -lfc) %>%
+    arrange(padj) %>% slice(1:ngenes)
+  vec <- allRes_sub$Ensembl
+  })
+all_top_genes_down_u <- unique(unlist(top_genes_down))
+
+
+### M-CLL
+# All significant genes
+top_genes <- lapply(namesTrMut_m, function(tr) {
+  allRes_sub <- allRes[[tr]] %>%
+    filter(LFC < -lfc | LFC > lfc) %>%
+    arrange(padj) %>% slice(1:ngenes)
+  vec <- allRes_sub$Ensembl
+  })
+all_top_genes_m <- unique(unlist(top_genes))
+
+# Upregulated significant genes
+top_genes_up <- lapply(namesTrMut_m, function(tr) {
+  allRes_sub <- allRes[[tr]] %>%
+    filter(LFC > lfc) %>%
+    arrange(padj) %>% slice(1:ngenes)
+  vec <- allRes_sub$Ensembl
+  })
+all_top_genes_up_m <- unique(unlist(top_genes_up))
+
+# Downregulated significant genes
+top_genes_down <- lapply(namesTrMut_m, function(tr) {
+  allRes_sub <- allRes[[tr]] %>%
+    filter(LFC < -lfc) %>%
+    arrange(padj) %>% slice(1:ngenes)
+  vec <- allRes_sub$Ensembl
+  })
+all_top_genes_down_m <- unique(unlist(top_genes_down))
+```
+
+Define annotations and colors
+```{r}
+# Define annotations
+annoCol <- as.data.frame(ddsAll@colData) %>%
+  dplyr::select(patID, FSC.SSC, treatment, IGHV, TP53, trisomy12, batch)
+
+annoCol$IGHV <- as.character(annoCol$IGHV)
+annoCol$IGHV[annoCol$IGHV == "0"] <- "U"
+annoCol$IGHV[annoCol$IGHV == "1"] <- "M"
+annoCol$TP53 <- as.character(annoCol$TP53)
+annoCol$TP53[annoCol$TP53 == "0"] <- "wt"
+annoCol$TP53[annoCol$TP53 == "1"] <- "m"
+annoCol$trisomy12 <- as.character(annoCol$trisomy12)
+annoCol$trisomy12[annoCol$trisomy12 == "0"] <- "wt"
+annoCol$trisomy12[annoCol$trisomy12 == "1"] <- "m"
+
+# Define colors of annotations
+color_anno = list(
+  batch = c(pilot="#F8F417", batch1="#B5E222", batch2="#76EE3D", batch3="#07D256", batch4="#0A9C43"),
+  trisomy12 = c(wt = "#DB86C6", m = "#9E137B"),
+  TP53 = c(wt = "#F0C538", m = "#AC8400"),
+  IGHV = c(U="#A4FFF4", M="#17C6B1"),
+  treatment = c(DMSO="#A1A1A1", Duvelisib="#F133B7", 
+                Ibrutinib="#FFE133", Nutlin_3a="#3C33F1"))
+
+# Define fill colors of heatmap
+color_fill <- colorRampPalette( rev(brewer.pal(9,"RdBu")) )(255)
+```
+
+Prepare expression matrix
+```{r}
+# Normalized expression matrix
+ddsAll.adjnorm <- vst(ddsAll.adj)
+
+# Remove patient effect
+exprMat.norm <- limma::removeBatchEffect(assay(ddsAll.adjnorm),
+                                         batch=factor(ddsAll.adjnorm$patID))
+
+IbrDuvNutDMSO <- c("DMSO", allTreat)
+```
+
+Function for plotting heatmap
+```{r}
+plotHeatmap <- function(geneList, type){
+  # Subset normalized expression matrix by using only top genes
+  exprMatsub <- exprMat.norm[rownames(exprMat.norm) %in% geneList,]
+
+  # Subset columns by only using treatments of interest
+  smp <- unique(ddsAll$ID[ddsAll$treatment %in% IbrDuvNutDMSO])
+  exprMatsub <- exprMatsub[,colnames(exprMatsub) %in% smp]
+
+  # Scale expression matrix
+  exprMatsub <- jyluMisc::mscale(exprMatsub, censor=2)
+  
+  pheatmap(exprMatsub, color = color_fill, annotation_col = annoCol,
+         annotation_colors = color_anno, clustering_method = "ward.D2", fontsize=13,
+         labels_col = paste0(patAnno[colnames(exprMatsub),]$patID,"_",
+                             patAnno[colnames(exprMatsub),]$treatment),
+         show_rownames=T, fontsize_row=3, show_colnames=T, fontsize_col=2,
+         main = sprintf("Heatmap of %s top %s genes of IGHV u and m (Ibrutinib, Duvelisib, Nutlin)",
+                        type, ngenes))
+}
+```
+
+
+#### Plot heatmaps U-CLL
+
+Heatmap of all significant genes in U-CLL
+```{r, fig.width=16, fig.height=13}
+heatmap_all <- plotHeatmap(all_top_genes_u, "all U-CLL")
+```
+
+Heatmap of all upregulated significant genes in U-CLL
+```{r, fig.width=16, fig.height=13}
+heatmap_all <- plotHeatmap(all_top_genes_up_u, "upregulated U-CLL")
+```
+
+Heatmap of all downregulated significant genes in U-CLL
+```{r, fig.width=16, fig.height=13}
+heatmap_all <- plotHeatmap(all_top_genes_down_u, "downregulated U-CLL")
+```
+
+#### Plot heatmaps M-CLL
+
+Heatmap of all significant genes in M-CLL
+```{r, fig.width=16, fig.height=13}
+heatmap_all <- plotHeatmap(all_top_genes_m, "all M-CLL")
+```
+
+Heatmap of all upregulated significant genes in M-CLL
+```{r, fig.width=16, fig.height=13}
+heatmap_all <- plotHeatmap(all_top_genes_up_m, "upregulated M-CLL")
+```
+
+Heatmap of all downregulated significant genes in M-CLL
+```{r, fig.width=16, fig.height=13}
+heatmap_all <- plotHeatmap(all_top_genes_down_m, "downregulated M-CLL")
+```
+
+
+# Pathway Enrichment Analysis
+
+For the pathway enrichment analysis the genes considered as differentially expressed between treatment and DMSO with a p-value below 0.05 are used as input. 
+
+The genes are only filtered by adjusted p-value, regardless of log-fold change
+```{r}
+# U-CLL
+Ibr_u_df <- allRes$Ibrutinib_u %>%
+  dplyr::filter(padj < 0.05) %>%
+  dplyr::select(Ensembl, symbol, treatment)
+Duv_u_df <- allRes$Duvelisib_u %>%
+  dplyr::filter(padj < 0.05) %>%
+  dplyr::select(Ensembl, symbol, treatment)
+gene_list_df_u <- rbind(Ibr_u_df, Duv_u_df)
+
+# M-CLL
+Ibr_m_df <- allRes$Ibrutinib_m %>%
+  dplyr::filter(padj < 0.05) %>%
+  dplyr::select(Ensembl, symbol, treatment)
+Duv_m_df <- allRes$Duvelisib_m %>%
+  dplyr::filter(padj < 0.05) %>%
+  dplyr::select(Ensembl, symbol, treatment)
+gene_list_df_m <- rbind(Ibr_m_df, Duv_m_df)
+```
+
+
+## clusterProfiler
+clusterProfiler is a universal enrichment tool for interpreting omics data and supports several ontology and pathway annotations.
+[ClusterProfiler 4.0](https://doi.org/10.1016/j.xinn.2021.100141) was expanded for conducting biological theme comparison. 
+The provided function "compareCluster" calculates enriched functional profiles of each gene cluster and aggregates the results into a single object. Therefore, we can analyze the effects of all treatments at once. The disadvantage of "compareCluster" is that it can only perform over-representation analyses and not gene set enrichment analyses.
+
+Perpare gene lists as data frames
+```{r prepare-cP}
+# Convert Ensembl IDs to Entrez IDs
+EntrezID_u = mapIds(org.Hs.eg.db,
+                    keys=gene_list_df_u$Ensembl,
+                    column="ENTREZID",
+                    keytype="ENSEMBL",
+                    multiVals="first")
+
+EntrezID_m = mapIds(org.Hs.eg.db,
+                    keys=gene_list_df_m$Ensembl,
+                    column="ENTREZID",
+                    keytype="ENSEMBL",
+                    multiVals="first")
+
+# Add EntredID column to df
+cluster_df_u <- add_column(gene_list_df_u, EntrezID_u, .before = "symbol")
+cluster_df_u <- cluster_df_u[!is.na(cluster_df_u$EntrezID),]
+cluster_df_m <- add_column(gene_list_df_m, EntrezID_m, .before = "symbol")
+cluster_df_m <- cluster_df_m[!is.na(cluster_df_m$EntrezID),]
+```
+
+### ORA with “compareCluster” function and GO pathways
+
+In this analysis we use pathways from gene ontology.
+```{r}
+clusterResGO_u <- compareCluster(EntrezID_u~treatment, data=cluster_df_u, fun="enrichGO",
+                                  OrgDb=org.Hs.eg.db, pvalueCutoff=0.2, pAdjustMethod="BH")
+clusterResGO_m <- compareCluster(EntrezID_m~treatment, data=cluster_df_m, fun="enrichGO",
+                                  OrgDb=org.Hs.eg.db, pvalueCutoff=0.2, pAdjustMethod="BH")
+```
+
+**Dotplot** 
+Each column in the dotplot represents an enrichment result of a treatment. For every treatment the five most significant pathways are depicted. To make the comparison among different clusters more informative, also not significant pathways are displayed if they are under the top five of any other treatment. The color gradient based on p-values may indicate which categories are more likely to have biological meanings. The size of the dots refers to the number of genes considered as significant within a pathway.
+```{r, fig.height=7, fig.width=8}
+dotplot(clusterResGO_u, showCategory=5, size="Count")
+dotplot(clusterResGO_m, showCategory=5, size="Count")
+```
+
+### ORA with “compareCluster” function and Reactome pathways
+
+In this analysis we use pathways from Reactome, an open-source, manually curated and peer-reviewed pathway database.
+```{r}
+library(ReactomePA)
+clusterResReactome_u <- compareCluster(EntrezID_u~treatment, data=cluster_df_u,
+                                       fun="enrichPathway", pvalueCutoff=0.2, pAdjustMethod="BH")
+clusterResReactome_m <- compareCluster(EntrezID_m~treatment, data=cluster_df_m,
+                                       fun="enrichPathway", pvalueCutoff=0.2, pAdjustMethod="BH")
+```
+
+**Dotplot** 
+```{r, fig.height=8, fig.width=8}
+dotplot(clusterResReactome_u, showCategory=6, size="Count")
+dotplot(clusterResReactome_m, showCategory=6, size="Count")
+```
+
+### GSEA with "gseKEGG" function
+If we want to conduct a gene set enrichment analysis (GSEA) instead of an over-representation analysis, we have to use the "gseKEGG" function, which can only deal with one drug treatment at once. Thus, the function has to be packed into a for loop.
+
+Function for preparing gene vector and running GSEA
+```{r, include=FALSE, eval=FALSE}
+run_GSEA <- function(df, libType){
+  
+  Tr_df <- allRes[[df]] %>%
+  dplyr::filter(padj < 0.05) %>%
+  dplyr::select(Ensembl, symbol, treatment, padj, LFC)
+
+  # Add EntrezID column to df
+  EntrezID = mapIds(org.Hs.eg.db,
+                    keys=Tr_df$Ensembl,
+                    column="ENTREZID",
+                    keytype="ENSEMBL",
+                    multiVals="first")
+
+  # Add EntrezID column to df
+  Tr_df <- add_column(Tr_df, EntrezID, .before = "symbol")
+  Tr_df <- Tr_df[!is.na(Tr_df$EntrezID),]
+
+  # Extract sorted gene list
+  Tr_df <- Tr_df[order(Tr_df$padj, decreasing=TRUE),]
+  TrgeneList <- Tr_df$padj
+  names(TrgeneList) <- Tr_df$EntrezID
+
+  gseKEGG_res <- gseKEGG(geneList=TrgeneList, organism="hsa",
+                          pvalueCutoff=0.7, pAdjustMethod="BH",
+                         scoreType="pos", keyType=libType)
+  return(gseKEGG_res)
+}
+```
+
+#### KEGG pathways
+
+Run function separately for treatments
+```{r, include=FALSE, eval=FALSE}
+# U-CLL
+GSEA_res_Ibr_u <- run_GSEA("Ibrutinib_u", "kegg")
+GSEA_res_Duv_u <- run_GSEA("Duvelisib_u", "kegg")
+
+names_gsea_u <- c("Ibrutinib_u", "Duvelisib_u")
+GSEA_res_all_u <- list(GSEA_res_Ibr_u, GSEA_res_Duv_u)
+names(GSEA_res_all_u) <- names_gsea_u
+
+# M-CLL
+GSEA_res_Ibr_m <- run_GSEA("Ibrutinib_m", "kegg")
+GSEA_res_Duv_m <- run_GSEA("Duvelisib_m", "kegg")
+
+names_gsea_m <- c("Ibrutinib_m", "Duvelisib_m")
+GSEA_res_all_m <- list(GSEA_res_Ibr_m, GSEA_res_Duv_m)
+names(GSEA_res_all_m) <- names_gsea_m
+```
+
+***Dotplot***
+Plot most important pathways for every drug treatment as dotplot (U-CLL)
+```{r dotplot-cP-GSEA-U, fig.width=12, fig.height=5, include=FALSE, eval=FALSE}
+plot_list <- lapply(GSEA_res_all_u, function(tr) {
+    if (nrow(tr@result)) {
+    dotplot(tr, showCategory=5, split=".sign") + facet_grid(.~.sign) +
+        theme(axis.text.y=element_text(face="bold"))
+      }
+    })
+plot_grid(plotlist=plot_list, ncol=2, labels=names_gsea_u)
+```
+
+Plot most important pathways for every drug treatment as dotplot (M-CLL)
+```{r dotplot-cP-GSEA-M, fig.width=12, fig.height=5, include=FALSE, eval=FALSE}
+plot_list <- lapply(GSEA_res_all_m, function(tr) {
+    if (nrow(tr@result)) {
+    dotplot(tr, showCategory=5, split=".sign") + facet_grid(.~.sign) +
+        theme(axis.text.y=element_text(face="bold"))
+      }
+    })
+plot_grid(plotlist=plot_list, ncol=2, labels=names_gsea_m)
+```
+
+***Enrichment map***
+Enrichment map organizes enriched terms into a network with edges connecting overlapping gene sets. In this way, mutually overlapping gene sets are tend to cluster together, making it easy to identify functional modules.
+
+U-CLL
+```{r enrich-cP-GSEA-U, fig.width=12, fig.height=8, include=FALSE, eval=FALSE}
+plot_list <- lapply(GSEA_res_all_u, function(tr) {
+    if (nrow(tr@result)) {
+      map <- pairwise_termsim(tr)
+      emapplot(map, showCategory=10)
+      }
+  })
+plot_grid(plotlist=plot_list, ncol=2, labels=names_gsea_u)
+```
+
+M-CLL
+```{r enrich-cP-GSEA-M, fig.width=12, fig.height=8, include=FALSE, eval=FALSE}
+plot_list <- lapply(GSEA_res_all_m, function(tr) {
+    if (nrow(tr@result)) {
+      map <- pairwise_termsim(tr)
+      emapplot(map, showCategory=10)
+      }
+  })
+plot_grid(plotlist=plot_list, ncol=2, labels=names_gsea_m)
+```
+
+## camera
+
+This method was proposed by Wu and Smyth in 2012. [camera](https://www.rdocumentation.org/packages/limma/versions/3.28.14/topics/camera) performs a competitive test in the sense defined by [Goeman and Buhlmann](https://doi.org/10.1093/bioinformatics/btm051). It tests whether the genes in the set are highly ranked in terms of differential expression relative to genes not in the set and thereby accounts for inter-gene correlation. As input camera only needs a count matrix and a design matrix. No prior differential expression (DE) is required, as camera performs a DE internally. Again, we can perform a gene set enrichment analysis for every drug treatment individually.
+
+### Preparations
+First, we have to prepare the gene lists and create the design matrix.
+```{r prepare-camera}
+gmt_KEGG <- read.gmt("data/c2.cp.kegg.v7.4.symbols.gmt.txt")
+gmt_Hallmark <- read.gmt("data/h.all.v7.4.symbols.gmt.txt")
+
+#Function for converting gene name data frame into list
+geneList <- function(source) {
+  pathwayNames <- levels(source$term)
+  newList<- vector("list")
+
+  for (pathway in pathwayNames) {
+    genes <- source$gene[source$term == pathway]
+    newList[[length(newList) + 1]] <- genes 
+  }
+  names(newList) <- pathwayNames
+  return(newList)
+}
+
+geneList_KEGG <- geneList(gmt_KEGG)
+geneList_Hallmark <- geneList(gmt_Hallmark)
+```
+
+Function for converting Ensembl IDs to gene symbols
+```{r}
+convertIDs <- function(counts_df){
+
+  # Convert Ensembl IDs to Entrez IDs
+  entrezID = mapIds(org.Hs.eg.db,
+                      keys=row.names(counts_df),
+                      column="ENTREZID",
+                      keytype="ENSEMBL",
+                      multiVals="first")
+
+  # Convert Entrez IDs to gene symbols
+  gene_symbols <- getSYMBOL(na.omit(as.vector(entrezID)),
+                            data="org.Hs.eg.db")
+
+  # Create new df with gene symbols as row names
+  counts_df_symbols <- add_column(counts_df, entrezID) %>%
+    drop_na(entrezID) %>% add_column(gene_symbols) %>%
+    dplyr::select(-entrezID) %>% drop_na(gene_symbols) %>%
+    distinct(gene_symbols, .keep_all = TRUE) %>%
+    remove_rownames %>% column_to_rownames(var="gene_symbols")
+  
+  return(counts_df_symbols)
+}
+```
+
+### Run camera
+
+Ibrutinib
+```{r}
+load("./DE/dds_IGHV_Ibrutinib_allbatches_STAR_scTransform_20220515.RData")
+
+# Extract design matrix
+designMat_Ibr <- design(dds)
+
+# Extract normalized counts
+dds_Ibr.norm <- vst(dds)
+counts_df_Ibr <- as.data.frame(assay(dds_Ibr.norm))
+
+# Create counts_df with gene symbols
+counts_dfSymb_Ibr <- convertIDs(counts_df_Ibr)
+
+# Run camera function with KEGG pathways
+cameraRes_Ibr_KEGG <- limma::camera(counts_dfSymb_Ibr, geneList_KEGG,
+                               designMat_Ibr, inter.gene.cor=0.01)
+cameraRes_Ibr_KEGG <- rownames_to_column(cameraRes_Ibr_KEGG,
+                                         var="Pathway")
+
+# Run camera function with Hallmark pathways
+cameraRes_Ibr_Hall <- limma::camera(counts_dfSymb_Ibr, geneList_Hallmark,
+                               designMat_Ibr, inter.gene.cor=0.01)
+cameraRes_Ibr_Hall <- rownames_to_column(cameraRes_Ibr_Hall,
+                                         var="Pathway")
+```
+
+Duvelisib
+```{r}
+load("./DE/dds_IGHV_Duvelisib_allbatches_STAR_scTransform_20220515.RData")
+
+# Extract design matrix
+designMat_Duv <- design(dds)
+
+# Extract normalized counts
+dds_Duv.norm <- vst(dds)
+counts_df_Duv <- as.data.frame(assay(dds_Duv.norm))
+
+# Create counts_df with gene symbols
+counts_dfSymb_Duv <- convertIDs(counts_df_Duv)
+
+# Run camera function with KEGG pathways
+cameraRes_Duv_KEGG <- limma::camera(counts_dfSymb_Duv, geneList_KEGG,
+                               designMat_Duv, inter.gene.cor=0.01)
+cameraRes_Duv_KEGG <- rownames_to_column(cameraRes_Duv_KEGG,
+                                         var="Pathway")
+
+# Run camera function with Hallmark pathways
+cameraRes_Duv_Hall <- limma::camera(counts_dfSymb_Duv, geneList_Hallmark,
+                               designMat_Duv, inter.gene.cor=0.01)
+cameraRes_Duv_Hall <- rownames_to_column(cameraRes_Duv_Hall,
+                                         var="Pathway")
+```
+
+Combine results of Ibrutinib and Duvelisib
+```{r}
+names_camRes <- c("Ibrutinib", "Duvelisib")
+cameraRes_KEGG <- list(cameraRes_Ibr_KEGG, cameraRes_Duv_KEGG)
+names(cameraRes_KEGG) <- names_camRes
+cameraRes_Hallmark <- list(cameraRes_Ibr_Hall, cameraRes_Duv_Hall)
+names(cameraRes_Hallmark) <- names_camRes
+```
+
+### Show results
+
+Plot most important pathways for every drug treatment as dotplot (KEGG pathways)
+```{r, fig.height=8, fig.width=18}
+plot_list <- lapply(cameraRes_KEGG, function(tr) {
+  ggplot(tr[head(order(tr$FDR), 10), ],
+         aes(x=Direction, y=reorder(Pathway, -FDR),
+             group=Direction, col=FDR)) +
+    geom_point(size=5) +
+    theme(axis.title=element_blank(),
+          axis.text=element_text(face="bold")) +
+    scale_colour_gradientn(colours=c("#FF0000", "#E90F97", "#0858FB"))
+    })
+
+plot_grid(plotlist=plot_list, ncol=2, labels=names_camRes)
+```
+
+Plot most important pathways for every drug treatment as dotplot (Hallmark pathways)
+```{r, fig.height=8, fig.width=18}
+plot_list <- lapply(cameraRes_Hallmark, function(tr) {
+  ggplot(tr[head(order(tr$FDR), 10), ],
+       aes(x=Direction, y=reorder(Pathway, -FDR),
+           group=Direction, col=FDR)) +
+    geom_point(size=5) +
+    theme(axis.title=element_blank(),
+          axis.text=element_text(face="bold")) +
+    scale_colour_gradientn(colours=c("#FF0000", "#E90F97", "#0858FB"))
+    })
+
+plot_grid(plotlist=plot_list, ncol=2, labels=names_camRes)
+```
+
+***Conclusion: Although "only" 806 DE genes are shared between Ibrutinib and Duvelisib U-CLL and 489 genes are unique for Ibrutinib and 1112 genes are unique for Duvelisib, this is not enough to see differences on the pathway level. Overall, the enriched pathways are similar for Ibrutinib and Duvelisib.***
+
+
+# Session Info Details
+```{r, echo=FALSE, eval=TRUE}
+sessionInfo()
+```
