@@ -1,7 +1,8 @@
-This is a workflowr repository for the project: The transcriptional landscape of drug effects in leukemia and lymphoma. This project is designed to assess the transcriptome landscape of drug effects in leukemia and lymphoma in a high-throughput manner. The study will expose different blood cancer entities to a panel of target-inhibiting drugs that abrogate signaling of important survival pathways in B cell leukemia and lymphoma. 
+This is a workflowr repository for the Masters Thesis "The transcriptomic signatures of drug perturbations in chronic lymphocytic leukemia (CLL)".
+This project is about a high-throughput gene expression perturbation screen with ten drugs and 116 patients. The transcriptomic changes were assessed using shallow 3'-end RNA sequencing. The study will expose different blood cancer entities to a panel of target-inhibiting drugs that abrogate signaling of important survival pathways in B cell leukemia and lymphoma. 
 
 
-### Related data directories on EMBL server:
+### The data is stored on the EMBL server:
 
 * Raw fastq files: /g/huber/projects/nct/cll/RawData/RNASeq/drugSeq 
 
