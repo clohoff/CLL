@@ -1,0 +1,460 @@
+---
+title: "FastQC analysis of all batches"
+author: "Caroline Lohoff"
+date: "February 01 2022"
+output:
+  BiocStyle::html_document:
+    toc_float: true
+---
+
+# What is FastQC
+Modern high throughput sequencers can generate hundreds of millions of sequences in a single run. Before analyzing these sequences to draw biological conclusions one should always perform some quality control to ensure that the raw data is homogeneous and there are no biases which may affect the usability.
+
+FastQC aims to provide a QC report which can detect problems that originate either in the sequencer or in the starting library material. One should keep in mind that FastQC is most reliable for whole genome shotgun DNA sequencing data and less reliable for mRNA-Seq. For more information, see [FastQC: a quality control tool for high throughput sequence data.](http://www.bioinformatics.babraham.ac.uk/projects/fastqc)
+
+## Running FastQC
+The FastQC output used in this analysis was generated with the non-interactive mode on the command line which is suitable for the systematic processing of large numbers of files (fastqc seqfile -o outputdir -f fastq|bam). FastQC version 0.11.5 was used. Another option would be to run FastQC as a stand alone interactive application.
+
+For the pilot batch and batches 2-4 the raw FASTQ files were used as input for FastQC, whereas for batch 1 combined .bam files were used as input.
+
+## Processing the fastqc.zip files
+
+For processing the FastQC output files (fastqc.zip) we use the [MultiQC](https://doi.org/10.1093/bioinformatics/btw354) package for Python (https://multiqc.info/docs/#using-multiqc) and run on the command line:  
+
+multiqc data/*_fastqc.zip --filename multiqc_report_batch4.html --data-format json --export plots --interactive 
+
+As output we get a report in interactive html format that summarizes the results for multiple samples, several plots and a multiqc_data.json file.
+
+## About this R Markdown file
+We use the R package [TidyMultiqc](https://cran.r-project.org/web/packages/TidyMultiqc/vignettes/TidyMultiqc.html) to gather the results of all batches. In this report we will display various plots which describe different quality features of the data. Most of the plots are already shown in the MultiQC html files but only for one batch at a time. Here we can combine the different batches and generate plots using all batches. Additionally, we can explore quality features stored in data frames of the FastQC output.
+
+The plot descriptions are taken from the [MultiQC handbook](https://www.bioinformatics.babraham.ac.uk/projects/fastqc/Help/3%20Analysis%20Modules/).
+
+# Load data and packages
+
+Set global options
+```{r setup, include=FALSE, cache = FALSE}
+knitr::opts_knit$set(root.dir = "~/Documents/drugSeq/fastQC")
+knitr::opts_chunk$set(warning = FALSE, message = FALSE)
+```
+
+Load packages
+```{r load-packages}
+library(TidyMultiqc)
+library(HistDat)
+library(tidyverse)
+```
+
+Set global ggplot variables
+```{r set-ggplot-options}
+theme_set(theme_bw() + theme(axis.text = element_text(size=12), 
+                             axis.title = element_text(size=14),
+                             plot.title = element_text(size = 15, hjust =0.5, face="bold")))
+cp <- c("#1B9E77", "#D95F02", "#7570B3", "#0137A4", "#E6AB02")
+# background: green "#D9EFCB", yellow "#F3F3B9", red "#F9E2E0"
+```
+
+
+## Load data
+First, we load the data for the pilot batch.
+```{r load-pilot}
+df_pilot = TidyMultiqc::load_multiqc("./pilot/multiqc_report_pilot_data/multiqc_data.json")
+df_pilot$batch <- "pilot"
+df_pilot$metadata.sample_id <- str_extract(df_pilot$metadata.sample_id, "(?<=lane1).*(?=_)")  # shorten names
+head(df_pilot, n=5)
+```
+
+Load batch 1 combined
+```{r load-batch1}
+# Load data frame
+df_batch1 <- TidyMultiqc::load_multiqc("./batch1_combined/multiqc_report_batch1c_data/multiqc_data.json")
+df_batch1$batch <- "batch1"
+
+# Shorten and rename sample ids
+df_batch1$metadata.sample_id <- paste("P0", str_extract(df_batch1$metadata.sample_id, "(?<=P0).*(?=_)"), sep="")
+Jurkat_rows <- which(df_batch1$metadata.sample_id == "P0NA", arr.ind = TRUE)
+Jurkat_names <- c("JurkatPlate1", "JurkatPlate2", "JurkatPlate3", "JurkatPlate4")
+
+for(row in 1:length(Jurkat_rows)) {
+  df_batch1$metadata.sample_id[row.names(df_batch1) == Jurkat_rows[row]] <- Jurkat_names[row]
+}
+
+# Show data frame
+head(df_batch1, n=5)
+```
+
+Load batch 2
+```{r load-batch2}
+df_batch2 <- TidyMultiqc::load_multiqc("./batch2/multiqc_report_batch2_data/multiqc_data.json")
+df_batch2$batch <- "batch2"
+df_batch2$metadata.sample_id <- paste("P", str_extract(df_batch2$metadata.sample_id, "(?<=P).*(?=_)"), sep="")
+
+for(row in 1:length(df_batch2$metadata.sample_id)) {
+  if(startsWith(df_batch2$metadata.sample_id[row], "Plate")) {
+    df_batch2$metadata.sample_id[row.names(df_batch2) == row] <- paste("Jurkat", df_batch2$metadata.sample_id[row], sep="")
+  }
+}
+```
+
+Load batch 3
+```{r load-batch3}
+df_batch3 <- TidyMultiqc::load_multiqc("./batch3/multiqc_report_batch3_data/multiqc_data.json")
+df_batch3$batch <- "batch3"
+df_batch3$metadata.sample_id <- paste("P", str_extract(df_batch3$metadata.sample_id, "(?<=P).*(?=_)"), sep="")
+for(row in 1:length(df_batch3$metadata.sample_id)) {
+  if(startsWith(df_batch3$metadata.sample_id[row], "Plate")) {
+    df_batch3$metadata.sample_id[row.names(df_batch3) == row] <- paste("Jurkat", df_batch3$metadata.sample_id[row], sep="")
+  }
+}
+```
+
+Load batch 4 and combine all batches
+```{r load-batch4}
+df_batch4 <- TidyMultiqc::load_multiqc("./batch4/multiqc_report_batch4_data/multiqc_data.json")
+df_batch4$batch <- "batch4"
+df_batch4$metadata.sample_id <- paste("P", str_extract(df_batch4$metadata.sample_id, "(?<=P).*(?=_)"), sep="")
+for(row in 1:length(df_batch4$metadata.sample_id)) {
+  if(startsWith(df_batch4$metadata.sample_id[row], "Plate")) {
+    df_batch4$metadata.sample_id[row.names(df_batch4) == row] <- paste("Jurkat", df_batch4$metadata.sample_id[row], sep="")
+  }
+}
+
+# Combine all batches into one large data frame
+df_all <- rbind(df_pilot, df_batch1, df_batch2, df_batch3, df_batch4)
+```
+
+# Visualize results
+
+## Average sequence length
+```{r fig-seqlength, fig.width=5, fig.height=3}
+df_all %>%
+  group_by(batch) %>%
+  summarise(general.avg_sequence_length = mean(general.avg_sequence_length)) %>%
+  ggplot(aes(x = batch, y = general.avg_sequence_length, fill=batch)) +
+  geom_bar(stat = "identity") +
+  ylab("Read length") +
+  theme(axis.title.x=element_blank()) +
+  scale_fill_manual(values=cp)
+```
+The read lengths of the batches are between 50 and 85 base pairs. This observed difference in read length should not be crucial for further analysis, especially not for differential expression. As long as the reads have a minimum of 50 bp, there is generally little difference for the detection of differential expression regardless of the read length. For further reading see [Chhangawala et al.](https://doi.org/10.1186/s13059-015-0697-y). 
+However, there can be a lack of consistency of DE results between different read lengths. One would hope that genes detected as differentially expressed at one read length would also be detected as DE at a different read length, since the experiment properly represented the expression of genes in the cell. This is not always the case and the lists of top DEGs between two read lengths can substantially vary. This is likely due to a combination of splice junction overlap and gene annotation (e.g., short genes), as well as the usual factors inherent to library preparation, such as library size, RNA fragmentation, and GC content biases.
+Furthermore, if the libraries were prepared with the same kit and sequenced on the same type of sequencer, the difference should not be large.
+
+## Sequence counts
+
+Plot the sequence counts per sample. 
+```{r fig-seqcounts, fig.width=15, fig.height=5}
+df_all %>%
+  ggplot(aes(x=metadata.sample_id, y=general.total_sequences, fill=batch)) +
+  geom_col() +
+  labs(x="Sample ID", y="Number of reads") +
+  ggtitle("Sequence counts ordered by sample ID") +
+  theme(axis.text.x=element_blank()) +
+  scale_fill_manual(values=cp)
+```
+As expected, we observe a huge difference between batch 1 and all other batches. Batch 1 has a much higher read depth than the other batches due to combining the old batch 1 with the new batch 1.
+
+## Duplication rate
+
+After plotting the sequence counts, we want to know how many reads are duplicates. Therefore, we visualize the duplication rate per sample for batch 4.
+```{r fig-duplrate-batch3, fig.width=15, fig.height=5}
+df_batch4 %>%
+  ggplot(aes(x=metadata.sample_id, y=general.percent_duplicates,
+             fill=factor(ifelse(startsWith(metadata.sample_id, "Jurkat"),"Jurkat","Normal")))) +
+  geom_col() + 
+  scale_fill_manual(name = "Sample type", values=c("blue","salmon")) +
+  labs(x="Sample ID", y="Percent duplicates") +
+  ggtitle("Duplication rate in batch 3") +
+  theme(axis.text.x = element_text(angle = 90))
+```
+This plot shows that the duplication rate for batch 4 is between 35% and 83%, with a mean of 62%.The Jurkat samples contain material from the Jurkat cell line and are technical controls on every plate. The plot demonstrates that these controls are around the mean duplication rate. 
+
+Mean duplication rates
+```{r}
+mean(df_pilot$general.percent_duplicates)
+mean(df_batch1$general.percent_duplicates)
+mean(df_batch2$general.percent_duplicates)
+mean(df_batch3$general.percent_duplicates)
+mean(df_batch4$general.percent_duplicates)
+```
+
+Visualize the duplication rate per sample for all batches ordered by patient ID.
+```{r fig-duplrate-all, fig.width=15, fig.height=5}
+df_all %>%
+  ggplot(aes(x=metadata.sample_id, y=general.percent_duplicates, fill=batch)) +
+  geom_col() +
+  labs(x="Sample ID", y="Percent duplicates") +
+  ggtitle("Duplication rate ordered by sample id") +
+  theme(axis.text.x=element_blank()) +
+  scale_fill_manual(values=cp)
+```
+This figure illustrates that the sample IDs and therefore the patients are well stratified across the five different batches.
+There are some minor differences between the batches: The pilot batch has the highest duplication rate. The duplication rate of batch 1 is quite homogeneous in comparison to batches 2, 3 and 4. 
+
+## GC content
+
+Visualize the per sequence GC content
+```{r fif-gc-box, fig.width=5, fig.height=3}
+df_all %>%
+  group_by(batch) %>%
+  ggplot(aes(x = batch, y = general.percent_gc, fill=batch)) +
+  geom_boxplot(outlier.shape=4,outlier.size=1,notch=FALSE) +
+  stat_summary(fun.y=mean, geom="point", shape=5, size=2) +
+  ylab("GC content") +
+  theme(axis.title.x=element_blank()) +
+  scale_fill_manual(values=cp)
+```
+Again we see some differences between the batches. Batch 1 has the highest GC content (49.52%), followed by batch 4, and then batches 2 and 3, whereas the pilot batch has a significantly lower mean GC value. For all batches the distribution of data is unsymmetrical. The boxplot of batch 1 points from a population which is skewed to the left, whereas the populations of batches 2 and 3 are skewed to the right.
+
+The mean GC contents for the different batches are:
+```{r gc-content, echo=FALSE}
+cat(sprintf("Batch 1: %s\n", round(mean(df_batch1$general.percent_gc), digits=2)))
+cat(sprintf("Batch 2: %s\n", round(mean(df_batch2$general.percent_gc), digits=2)))
+cat(sprintf("Batch 3: %s\n", round(mean(df_batch3$general.percent_gc), digits=2)))
+cat(sprintf("Batch 4: %s\n", round(mean(df_batch4$general.percent_gc), digits=2)))
+cat(sprintf("Pilot: %s\n", round(mean(df_pilot$general.percent_gc), digits=2)))
+```
+
+### Hypothesis Testing
+Due to the differences in GC content, we test the hypothesis that the mean GC content of all batches is the same as the mean GC content in the human genome (41%). If we assume that GC content is normally distributed, we can perform a one sample t-test:
+```{r gc-test}
+t.test(df_pilot$general.percent_gc, mu=41)
+#t.test(df_batch1$general.percent_gc, mu=41)
+#t.test(df_batch2$general.percent_gc, mu=41)
+#t.test(df_batch3$general.percent_gc, mu=41)
+t.test(df_batch4$general.percent_gc, mu=41)
+```
+As the p-values are very small for all batches, we reject the null hypothesis. The GC contents in the batches are significantly higher than usual. Thus, a [GC-content normalization approach](https://bmcbioinformatics.biomedcentral.com/articles/10.1186/1471-2105-12-480) could be applied to avoid bias in the differential expression analysis. 
+
+## Failed sequence counts
+
+```{r fig-seqfailed, fig.width=15, fig.height=5}
+df_all %>%
+  mutate(metadata.sample_id = fct_reorder(metadata.sample_id, batch)) %>%
+  ggplot(aes(x=metadata.sample_id, y=general.percent_fails, fill=batch)) +
+  geom_col() +
+  labs(x="Sample ID", y="Percentage of failed reads") +
+  ggtitle("Sequence reads considered as failed ordered by batch") +
+  theme(axis.text.x=element_blank()) +
+  scale_fill_manual(values=cp)
+```
+The percentage of failed sequence counts is lowest for the pilot batch, followed by batch 1.
+
+
+# Extracting data from plots in the MultiQC html files
+
+A big advantage of the TidyMultiqc package is the possibility to directly extract data from the plots shown in the MultiQC html files for the individual batches. 
+In that way we can rebuild the plots while accounting for all batches.
+
+First, we view the IDs of all plots.
+```{r extract-ids}
+TidyMultiqc::list_plots("batch4/multiqc_report_batch4_data/multiqc_data.json")
+```
+
+## Properly Handling Histogram Data
+The package HistDat is suitable for generating summary statistics from histogram-type data, such as the mean. First, we need to convert each of these data frames from the per sequence quality score plot into a HistDat object. Then, using HistDat, we can calculate summary statistics.
+Using the purrr method, we can map each data frame representing one plot to a row of summary statistics:
+```{r histogram-summary}
+per_seq_quality_scores_df_batch4 <- TidyMultiqc::load_multiqc(
+  "batch4/multiqc_report_batch4_data/multiqc_data.json", 
+  sections = 'plot',
+  plots = "fastqc_per_sequence_quality_scores_plot-1")
+
+df_summary <- per_seq_quality_scores_df_batch4 %>%
+  dplyr::mutate(
+    purrr::map_dfr(`plot.fastqc_per_sequence_quality_scores_plot-1`, function(plot_df){
+      hist = HistDat::HistDat(vals=plot_df$x, counts = plot_df$y)
+      list(
+        mean_coverage = mean(hist),
+        median_coverage = median(hist),
+        min_coverage = min(hist),
+        max_coverage = max(hist)
+      )
+    }),
+    `plot.fastqc_per_sequence_quality_scores_plot-1` = NULL
+  )
+
+head(df_summary, n=5)
+```
+
+We can show these summary statistics for the sequence quality of batch 4 in a plot.
+```{r fig-histogram-summary, fig.width=15, fig.height=5}
+df_summarylong <- df_summary %>%
+  pivot_longer(cols = c(mean_coverage, median_coverage,
+                        min_coverage, max_coverage),
+                           names_to = "Statistics")
+
+ggplot(df_summarylong,
+       aes(x = metadata.sample_id, y = value, 
+                     col = Statistics, group = Statistics, fill=Statistics)) +
+  geom_point(aes(shape = Statistics)) + 
+  labs(x="Sample ID", y="Sequence quality") +
+  ggtitle("Sequence quality summary statistics of batch 4") +
+  theme(axis.text.x=element_blank()) +
+  scale_fill_manual(values=cp)
+```
+
+## Function for handling data
+
+First, we define a function which we can use to create all plots in this chapter.
+This function extracts the plot data for all batches and then creates a line plot using all samples from all batches. 
+```{r function-create-lineplot}
+create_plotdf <- function(plotname, column, xtitle, ytitle, title) {
+  
+  path_batch_list <- list(c("batch1_combined/multiqc_report_batch1c_data/multiqc_data.json",
+                            "batch1"),
+                          c("batch2/multiqc_report_batch2_data/multiqc_data.json", "batch2"),
+                          c("batch3/multiqc_report_batch3_data/multiqc_data.json", "batch3"),
+                          c("batch4/multiqc_report_batch4_data/multiqc_data.json", "batch4"))
+
+  dfpilot <- TidyMultiqc::load_multiqc(
+    "pilot/multiqc_report_pilot_data/multiqc_data.json", sections='plot', plots=plotname) %>%
+    unnest(cols = column) %>% group_by(metadata.sample_id) %>% add_column(batch = "pilot")
+  
+  df_combined <- lapply(path_batch_list, function(n) {
+    df <- load_multiqc(n[1], sections='plot', plots=plotname) %>%
+      unnest(cols = column) %>% group_by(metadata.sample_id) %>% add_column(batch = n[2])
+    dfpilot <- rbind(dfpilot, df)
+    }) %>% bind_rows()
+  
+  plot_combined <- ggplot(df_combined,
+                          aes(x=x, y=y, col = batch, group = metadata.sample_id)) +
+    geom_line(size=0.5, alpha=0.6) +  #linetype="dashed" 
+    labs(x=xtitle, y=ytitle) +
+    ggtitle(title) +
+    scale_color_manual(values=cp)
+  
+  return(plot_combined)
+}
+```
+
+## Per base sequence quality
+
+This plot shows the mean quality value across all base positions in each read.
+The y-axis shows the quality score. The higher the score the better the base call. The background of the plot divides the y-axis into very good quality calls (green), calls of reasonable quality (yellow), and calls of poor quality (red). In general, sequencing chemistry degrades with increasing read length and thus, a decreasing quality over the duration of long runs can be seen in the plot.
+```{r plot-mean-quality-scores, fig.width=8, fig.height=4}
+plot_mean_quality_scores <- create_plotdf(
+  plotname = "fastqc_per_base_sequence_quality_plot-1",
+  column = "plot.fastqc_per_base_sequence_quality_plot-1",
+  xtitle = "Position in read (bp)",
+  ytitle = "Phred score",
+  title = "Mean quality scores")
+
+plot_mean_quality_scores +
+  expand_limits(x=c(0,85), y=c(14, 40.5)) +
+  geom_rect(aes(xmin=-Inf, xmax=Inf, ymin=14, ymax=20), fill="#F9E2E0", col="#F9E2E0", alpha=0.05) +
+  geom_rect(aes(xmin=-Inf, xmax=Inf, ymin=20.01, ymax=28), fill="#F3F3B9", col="#F3F3B9", alpha=0.4) +
+  geom_rect(aes(xmin=-Inf, xmax=Inf, ymin=28.01, ymax=Inf), fill="#D9EFCB", col="#D9EFCB", alpha=0.05) +
+  geom_line(size=0.5, alpha=0.6)
+```
+The overall quality of the reads is very good for all batches, even at the end of the run. Therefore, trimming of the batches is not necessary. Furthermore, batch 1 has the highest and the pilot batch the lowest quality score, respectively.
+For batch 3 we can see an outlier for the sequences P00671, P00673, P00675, P00676, P00678, P00679 (all on lane 4130), sequences P07471 and P07479 (both on lane 450), and sequence P00575 on lane 431. The female patient with the id P0067 was diagnosed with CLL in 2006 and first treated in 2008. The IGHV status is unmethylated. The IGHV status of the male patient with id P0747 is also unmethylated. At base pair 23 we can observe a short loss of quality, which then recovers quickly. This can happen if there is a transient problem with the run, i.e. bubbles passing through a flowcell. 
+
+## Per sequence quality scores
+
+Next, we plot the mean sequence quality score versus the read count. In this way we can figure out whether a subset of the sequences have universally poor quality. Every line in the plot represents the average quality per read. 
+```{r plot-per-seq-quality-scores, fig.width=8, fig.height=4}
+plot_per_sequence_quality_scores <- create_plotdf(
+  plotname = "fastqc_per_sequence_quality_scores_plot-1",
+  column = "plot.fastqc_per_sequence_quality_scores_plot-1",
+  xtitle = "Mean Sequence Quality (Phred Score)",
+  ytitle = "Count",
+  title = "Quality score distribution over all sequences")
+
+plot_per_sequence_quality_scores +
+  geom_rect(aes(xmin=10, xmax=20, ymin= -Inf, ymax=Inf), fill="#F9E2E0", col="#F9E2E0", alpha=0.05) +
+  geom_rect(aes(xmin=20.01, xmax=28, ymin= -Inf, ymax=Inf), fill="#F3F3B9", col="#F3F3B9", alpha=0.4) +
+  geom_rect(aes(xmin=28.01, xmax=Inf, ymin= -Inf, ymax=Inf), fill="#D9EFCB", col="#D9EFCB", alpha=0.05) +
+  geom_line(size=0.5, alpha=0.6)
+```
+For all batches we observe a uni-modal distribution with a peak around a quality score of 38. Thus, the overall quality can be considered as very good.
+The mean sequence quality for the pilot batch is shifted to the left in comparison to the other batches. The counts for batch 1 are much higher than for all other batches. 
+
+## Per base N content
+
+This plot illustrates the percentage of base calls at each position for which an "N" was called. An "N" is a replacement for a conventional base and is substituted when a sequencer is unable to make a base call with sufficient confidence.
+It is expected to see a very low proportion of "N"s appearing in a sequence.
+```{r plot-per-base-n-content, fig.width=8, fig.height=4}
+plot_per_base_n_content <- create_plotdf(
+  plotname = "fastqc_per_base_n_content_plot-1",
+  column = "plot.fastqc_per_base_n_content_plot-1",
+  xtitle = "Position in read (bp)",
+  ytitle = "Percentage N-count",
+  title = "Per base N content")
+
+plot_per_base_n_content +
+  geom_rect(aes(xmin=-Inf, xmax=Inf, ymin=0, ymax=5), fill="#D9EFCB", col="#D9EFCB", alpha=0.05) +
+  geom_rect(aes(xmin=-Inf, xmax=Inf, ymin=5.01, ymax=20), fill="#F3F3B9", col="#F3F3B9", alpha=0.4) +
+  geom_rect(aes(xmin=-Inf, xmax=Inf, ymin=20.01, ymax=Inf), fill="#F9E2E0", col="#F9E2E0", alpha=0.05) +
+  geom_line(size=0.5, alpha=0.6)
+```
+As expected, the overall percentage of "N"s is very low for all batches. 
+For batch 3 we see some sequences with more than 20% content of "N" at base 23. Again, these are the sequences from the patients P0067, P0057, and P00747, which have a low quality score at base 23. This observation is reasonable, as the most common reason for the inclusion of significant proportion of "N"s is a general loss of quality. Surprisingly, another sequence with a high "N" content is Jurkat plate 8.
+
+## Adapter content
+
+One class of sequences which might introduce a bias are adapter sequences. Knowing if the library contains a significant amount of adapter is important in order to assess whether adapter trimming is necessary or not. MultiQC does a specific search for a set of separately defined Kmers and will give a view of the total proportion of the library which contain these Kmers. A results trace will be generated for all of the sequences present in the adapter config file, such that the adapter content will be displayed even if it is low.
+
+The plot shows a cumulative percentage count of the proportion of the library which has seen each of the adapter sequences at each position. Once a sequence has been seen in a read it is counted as being present right through to the end of the read. Thus, the percentages in the plot will increase as the read length goes on.
+```{r plot-adapter-content, fig.width=10, fig.height=4}
+plot_adapter_content <- create_plotdf(
+  plotname = "fastqc_adapter_content_plot-1",
+  column = "plot.fastqc_adapter_content_plot-1",
+  xtitle = "Position (bp)",
+  ytitle = "% of sequences", title = "Adapter content")
+
+plot_adapter_content +
+  geom_rect(aes(xmin=-Inf, xmax=Inf, ymin=0, ymax=5), fill="#D9EFCB", col="#D9EFCB", alpha=0.05) +
+  geom_rect(aes(xmin=-Inf, xmax=Inf, ymin=5.01, ymax=Inf), fill="#F3F3B9", col="#F3F3B9", alpha=0.4) +
+  geom_line(size=0.5, alpha=0.6)
+```
+As it is shown in the plot, all sequences, except for sample ID P03598 (smp779 from patient P0359 from batch 3), are below the threshold of 5% and therefore have a low adapter content. Thus, adapter trimming is not necessary before proceeding with downstream analysis.
+
+## Over-represented sequences
+
+We can extract the data frame with the plot data from the multiqc_data.json files.
+```{r over-rep-sequences}
+path_batch_list <- list(c("batch2/multiqc_report_batch2_data/multiqc_data.json", "batch2"),
+                        c("batch3/multiqc_report_batch3_data/multiqc_data.json", "batch3"),
+                        c("batch4/multiqc_report_batch4_data/multiqc_data.json", "batch4"))
+
+dfpilot <- TidyMultiqc::load_multiqc(
+    "pilot/multiqc_report_pilot_data/multiqc_data.json", sections='plot',
+    plots="fastqc_overrepresented_sequences_plot-1") %>%
+    unnest(cols = "plot.fastqc_overrepresented_sequences_plot_1") %>%
+  group_by(metadata.sample_id) %>% add_column(batch = "pilot")
+  
+overrep_seq_df <- lapply(path_batch_list, function(n) {
+    df <- load_multiqc(n[1], sections='plot',
+                       plots="fastqc_overrepresented_sequences_plot-1") %>%
+      unnest(cols = "plot.fastqc_overrepresented_sequences_plot_1") %>%
+      group_by(metadata.sample_id) %>% add_column(batch = n[2])
+    dfpilot <- rbind(dfpilot, df)
+    }) %>% bind_rows()
+```
+Then, we can plot the over-represented sequences ordered by batch. 
+The plot depicts the total amount of over-represented sequences found in each library. The filled columns show the top over-represented sequences, whereas the transparent columns show the sum of remaining over-represented sequences. Since all 368 samples of batch 1 had less than 1% of reads made up of over-represented sequences, batch 1 is not depicted in the diagram. In this regard the quality of batch 1 combined is very good.
+```{r fig-over-rep-sequences, fig.width=15, fig.height=5}
+overrep_seq_df %>%
+  mutate(metadata.sample_id = fct_reorder(metadata.sample_id, batch)) %>%
+  ggplot(aes(x=metadata.sample_id)) +
+  geom_col(aes(y=sum_of_remaining_over_represented_sequences, fill=batch), alpha=0.5) +
+  geom_col(aes(y=top_over_represented_sequence, fill=batch)) +
+  labs(x="Sample ID", y="Percentage of total sequences", color="Legend") +
+  ggtitle("Over-represented sequences") +
+  theme(axis.text.x=element_blank()) +
+  scale_fill_manual(values=cp) +
+  geom_hline(yintercept=1, linetype="dashed", color="red", size=1.5)
+```
+We expect that a normal library will contain a diverse set of sequences, with no individual sequence making up a tiny fraction of the whole. Finding a single over-represented sequence in the set either means that it is highly biologically significant, or indicates that the library is contaminated, or not as diverse as expected.
+This plot shows all sequences which make up more than 0.1% of the total. For each over-represented sequence MultiQC will look for matches in a database of common contaminants and will report the best hit it finds (with a minimum of 20 bp in length). Finding a hit does not necessarily mean that this is the source of the contamination, but may give a hint. Furthermore, many adapter sequences are very similar to each other, so that a hit is reported which is not technically correct, but which has a similar sequence to the actual match.
+As the duplication detection requires an exact sequence match over the whole length of the sequence, any reads over 75 bp are truncated to 50 bp.
+A sequence is considered as failed, when it represents more than 1% of the total (red line).
+
+However, this plot often shows many failed sequences when used to analyse small RNA libraries where sequences are not subjected to random fragmentation, and the same sequence may naturally be present in a significant proportion of the library.
+
+# Session Info Details
+
+```{r, echo=FALSE, eval=TRUE}
+sessionInfo()
+```

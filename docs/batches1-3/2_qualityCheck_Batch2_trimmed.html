@@ -1,0 +1,1275 @@
+<!DOCTYPE html>
+
+<html>
+
+<head>
+
+<meta charset="utf-8" />
+<meta name="generator" content="pandoc" />
+<meta http-equiv="X-UA-Compatible" content="IE=EDGE" />
+
+
+<meta name="author" content="Caroline Lohoff" />
+
+
+<title>Quality assessment of drug perturbation RNAseq data (batch2 trimmed)</title>
+
+<script src="site_libs/header-attrs-2.11/header-attrs.js"></script>
+<script src="site_libs/jquery-3.6.0/jquery-3.6.0.min.js"></script>
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<link href="site_libs/bootstrap-3.3.5/css/cosmo.min.css" rel="stylesheet" />
+<script src="site_libs/bootstrap-3.3.5/js/bootstrap.min.js"></script>
+<script src="site_libs/bootstrap-3.3.5/shim/html5shiv.min.js"></script>
+<script src="site_libs/bootstrap-3.3.5/shim/respond.min.js"></script>
+<style>h1 {font-size: 34px;}
+       h1.title {font-size: 38px;}
+       h2 {font-size: 30px;}
+       h3 {font-size: 24px;}
+       h4 {font-size: 18px;}
+       h5 {font-size: 16px;}
+       h6 {font-size: 12px;}
+       code {color: inherit; background-color: rgba(0, 0, 0, 0.04);}
+       pre:not([class]) { background-color: white }</style>
+<script src="site_libs/jqueryui-1.11.4/jquery-ui.min.js"></script>
+<link href="site_libs/tocify-1.9.1/jquery.tocify.css" rel="stylesheet" />
+<script src="site_libs/tocify-1.9.1/jquery.tocify.js"></script>
+<script src="site_libs/navigation-1.1/tabsets.js"></script>
+<link href="site_libs/highlightjs-9.12.0/textmate.css" rel="stylesheet" />
+<script src="site_libs/highlightjs-9.12.0/highlight.js"></script>
+
+<link rel="icon" href="https://github.com/workflowr/workflowr-assets/raw/master/img/reproducible.png">
+<!-- Add a small amount of space between sections. -->
+<style type="text/css">
+div.section {
+  padding-top: 12px;
+}
+</style>
+
+
+
+<style type="text/css">
+  code{white-space: pre-wrap;}
+  span.smallcaps{font-variant: small-caps;}
+  span.underline{text-decoration: underline;}
+  div.column{display: inline-block; vertical-align: top; width: 50%;}
+  div.hanging-indent{margin-left: 1.5em; text-indent: -1.5em;}
+  ul.task-list{list-style: none;}
+    </style>
+
+<style type="text/css">code{white-space: pre;}</style>
+<script type="text/javascript">
+if (window.hljs) {
+  hljs.configure({languages: []});
+  hljs.initHighlightingOnLoad();
+  if (document.readyState && document.readyState === "complete") {
+    window.setTimeout(function() { hljs.initHighlighting(); }, 0);
+  }
+}
+</script>
+
+
+
+
+
+
+
+
+<style type = "text/css">
+.main-container {
+  max-width: 940px;
+  margin-left: auto;
+  margin-right: auto;
+}
+img {
+  max-width:100%;
+}
+.tabbed-pane {
+  padding-top: 12px;
+}
+.html-widget {
+  margin-bottom: 20px;
+}
+button.code-folding-btn:focus {
+  outline: none;
+}
+summary {
+  display: list-item;
+}
+pre code {
+  padding: 0;
+}
+</style>
+
+
+<style type="text/css">
+.dropdown-submenu {
+  position: relative;
+}
+.dropdown-submenu>.dropdown-menu {
+  top: 0;
+  left: 100%;
+  margin-top: -6px;
+  margin-left: -1px;
+  border-radius: 0 6px 6px 6px;
+}
+.dropdown-submenu:hover>.dropdown-menu {
+  display: block;
+}
+.dropdown-submenu>a:after {
+  display: block;
+  content: " ";
+  float: right;
+  width: 0;
+  height: 0;
+  border-color: transparent;
+  border-style: solid;
+  border-width: 5px 0 5px 5px;
+  border-left-color: #cccccc;
+  margin-top: 5px;
+  margin-right: -10px;
+}
+.dropdown-submenu:hover>a:after {
+  border-left-color: #adb5bd;
+}
+.dropdown-submenu.pull-left {
+  float: none;
+}
+.dropdown-submenu.pull-left>.dropdown-menu {
+  left: -100%;
+  margin-left: 10px;
+  border-radius: 6px 0 6px 6px;
+}
+</style>
+
+<script type="text/javascript">
+// manage active state of menu based on current page
+$(document).ready(function () {
+  // active menu anchor
+  href = window.location.pathname
+  href = href.substr(href.lastIndexOf('/') + 1)
+  if (href === "")
+    href = "index.html";
+  var menuAnchor = $('a[href="' + href + '"]');
+
+  // mark it active
+  menuAnchor.tab('show');
+
+  // if it's got a parent navbar menu mark it active as well
+  menuAnchor.closest('li.dropdown').addClass('active');
+
+  // Navbar adjustments
+  var navHeight = $(".navbar").first().height() + 15;
+  var style = document.createElement('style');
+  var pt = "padding-top: " + navHeight + "px; ";
+  var mt = "margin-top: -" + navHeight + "px; ";
+  var css = "";
+  // offset scroll position for anchor links (for fixed navbar)
+  for (var i = 1; i <= 6; i++) {
+    css += ".section h" + i + "{ " + pt + mt + "}\n";
+  }
+  style.innerHTML = "body {" + pt + "padding-bottom: 40px; }\n" + css;
+  document.head.appendChild(style);
+});
+</script>
+
+<!-- tabsets -->
+
+<style type="text/css">
+.tabset-dropdown > .nav-tabs {
+  display: inline-table;
+  max-height: 500px;
+  min-height: 44px;
+  overflow-y: auto;
+  border: 1px solid #ddd;
+  border-radius: 4px;
+}
+
+.tabset-dropdown > .nav-tabs > li.active:before {
+  content: "";
+  font-family: 'Glyphicons Halflings';
+  display: inline-block;
+  padding: 10px;
+  border-right: 1px solid #ddd;
+}
+
+.tabset-dropdown > .nav-tabs.nav-tabs-open > li.active:before {
+  content: "&#xe258;";
+  border: none;
+}
+
+.tabset-dropdown > .nav-tabs.nav-tabs-open:before {
+  content: "";
+  font-family: 'Glyphicons Halflings';
+  display: inline-block;
+  padding: 10px;
+  border-right: 1px solid #ddd;
+}
+
+.tabset-dropdown > .nav-tabs > li.active {
+  display: block;
+}
+
+.tabset-dropdown > .nav-tabs > li > a,
+.tabset-dropdown > .nav-tabs > li > a:focus,
+.tabset-dropdown > .nav-tabs > li > a:hover {
+  border: none;
+  display: inline-block;
+  border-radius: 4px;
+  background-color: transparent;
+}
+
+.tabset-dropdown > .nav-tabs.nav-tabs-open > li {
+  display: block;
+  float: none;
+}
+
+.tabset-dropdown > .nav-tabs > li {
+  display: none;
+}
+</style>
+
+<!-- code folding -->
+
+
+
+<style type="text/css">
+
+#TOC {
+  margin: 25px 0px 20px 0px;
+}
+@media (max-width: 768px) {
+#TOC {
+  position: relative;
+  width: 100%;
+}
+}
+
+@media print {
+.toc-content {
+  /* see https://github.com/w3c/csswg-drafts/issues/4434 */
+  float: right;
+}
+}
+
+.toc-content {
+  padding-left: 30px;
+  padding-right: 40px;
+}
+
+div.main-container {
+  max-width: 1200px;
+}
+
+div.tocify {
+  width: 20%;
+  max-width: 260px;
+  max-height: 85%;
+}
+
+@media (min-width: 768px) and (max-width: 991px) {
+  div.tocify {
+    width: 25%;
+  }
+}
+
+@media (max-width: 767px) {
+  div.tocify {
+    width: 100%;
+    max-width: none;
+  }
+}
+
+.tocify ul, .tocify li {
+  line-height: 20px;
+}
+
+.tocify-subheader .tocify-item {
+  font-size: 0.90em;
+}
+
+.tocify .list-group-item {
+  border-radius: 0px;
+}
+
+
+</style>
+
+
+
+</head>
+
+<body>
+
+
+<div class="container-fluid main-container">
+
+
+<!-- setup 3col/9col grid for toc_float and main content  -->
+<div class="row">
+<div class="col-xs-12 col-sm-4 col-md-3">
+<div id="TOC" class="tocify">
+</div>
+</div>
+
+<div class="toc-content col-xs-12 col-sm-8 col-md-9">
+
+
+
+
+<div class="navbar navbar-default  navbar-fixed-top" role="navigation">
+  <div class="container">
+    <div class="navbar-header">
+      <button type="button" class="navbar-toggle collapsed" data-toggle="collapse" data-target="#navbar">
+        <span class="icon-bar"></span>
+        <span class="icon-bar"></span>
+        <span class="icon-bar"></span>
+      </button>
+      <a class="navbar-brand" href="index.html">drugseq_test</a>
+    </div>
+    <div id="navbar" class="navbar-collapse collapse">
+      <ul class="nav navbar-nav">
+        <li>
+  <a href="index.html">Home</a>
+</li>
+<li>
+  <a href="about.html">About</a>
+</li>
+<li>
+  <a href="license.html">License</a>
+</li>
+      </ul>
+      <ul class="nav navbar-nav navbar-right">
+        
+      </ul>
+    </div><!--/.nav-collapse -->
+  </div><!--/.container -->
+</div><!--/.navbar -->
+
+<div id="header">
+
+
+
+<h1 class="title toc-ignore">Quality assessment of drug perturbation RNAseq data (batch2 trimmed)</h1>
+<h4 class="author">Caroline Lohoff</h4>
+<h4 class="date">December 13 2021</h4>
+
+</div>
+
+
+<p>
+<button type="button" class="btn btn-default btn-workflowr btn-workflowr-report" data-toggle="collapse" data-target="#workflowr-report">
+<span class="glyphicon glyphicon-list" aria-hidden="true"></span> workflowr <span class="glyphicon glyphicon-exclamation-sign text-danger" aria-hidden="true"></span>
+</button>
+</p>
+<div id="workflowr-report" class="collapse">
+<ul class="nav nav-tabs">
+<li class="active">
+<a data-toggle="tab" href="#summary">Summary</a>
+</li>
+<li>
+<a data-toggle="tab" href="#checks"> Checks <span class="glyphicon glyphicon-exclamation-sign text-danger" aria-hidden="true"></span> </a>
+</li>
+<li>
+<a data-toggle="tab" href="#versions">Past versions</a>
+</li>
+</ul>
+<div class="tab-content">
+<div id="summary" class="tab-pane fade in active">
+<p>
+<strong>Last updated:</strong> 2021-12-13
+</p>
+<p>
+<strong>Checks:</strong> <span class="glyphicon glyphicon-ok text-success" aria-hidden="true"></span> 5 <span class="glyphicon glyphicon-exclamation-sign text-danger" aria-hidden="true"></span> 2
+</p>
+<p>
+<strong>Knit directory:</strong> <code>drugseq_test/analysis/</code> <span class="glyphicon glyphicon-question-sign" aria-hidden="true" title="This is the local directory in which the code in this file was executed."> </span>
+</p>
+<p>
+This reproducible <a href="http://rmarkdown.rstudio.com">R Markdown</a> analysis was created with <a
+  href="https://github.com/jdblischak/workflowr">workflowr</a> (version 1.6.2). The <em>Checks</em> tab describes the reproducibility checks that were applied when the results were created. The <em>Past versions</em> tab lists the development history.
+</p>
+<hr>
+</div>
+<div id="checks" class="tab-pane fade">
+<div id="workflowr-checks" class="panel-group">
+<div class="panel panel-default">
+<div class="panel-heading">
+<p class="panel-title">
+<a data-toggle="collapse" data-parent="#workflowr-checks" href="#strongRMarkdownfilestronguncommittedchanges"> <span class="glyphicon glyphicon-exclamation-sign text-danger" aria-hidden="true"></span> <strong>R Markdown file:</strong> uncommitted changes </a>
+</p>
+</div>
+<div id="strongRMarkdownfilestronguncommittedchanges" class="panel-collapse collapse">
+<div class="panel-body">
+<p>The R Markdown is untracked by Git. To know which version of the R Markdown file created these results, you’ll want to first commit it to the Git repo. If you’re still working on the analysis, you can ignore this warning. When you’re finished, you can run <code>wflow_publish</code> to commit the R Markdown file and build the HTML.</p>
+</div>
+</div>
+</div>
+<div class="panel panel-default">
+<div class="panel-heading">
+<p class="panel-title">
+<a data-toggle="collapse" data-parent="#workflowr-checks" href="#strongEnvironmentstrongempty"> <span class="glyphicon glyphicon-ok text-success" aria-hidden="true"></span> <strong>Environment:</strong> empty </a>
+</p>
+</div>
+<div id="strongEnvironmentstrongempty" class="panel-collapse collapse">
+<div class="panel-body">
+<p>Great job! The global environment was empty. Objects defined in the global environment can affect the analysis in your R Markdown file in unknown ways. For reproduciblity it’s best to always run the code in an empty environment.</p>
+</div>
+</div>
+</div>
+<div class="panel panel-default">
+<div class="panel-heading">
+<p class="panel-title">
+<a data-toggle="collapse" data-parent="#workflowr-checks" href="#strongSeedstrongcodesetseed20211129code"> <span class="glyphicon glyphicon-ok text-success" aria-hidden="true"></span> <strong>Seed:</strong> <code>set.seed(20211129)</code> </a>
+</p>
+</div>
+<div id="strongSeedstrongcodesetseed20211129code" class="panel-collapse collapse">
+<div class="panel-body">
+<p>The command <code>set.seed(20211129)</code> was run prior to running the code in the R Markdown file. Setting a seed ensures that any results that rely on randomness, e.g. subsampling or permutations, are reproducible.</p>
+</div>
+</div>
+</div>
+<div class="panel panel-default">
+<div class="panel-heading">
+<p class="panel-title">
+<a data-toggle="collapse" data-parent="#workflowr-checks" href="#strongSessioninformationstrongrecorded"> <span class="glyphicon glyphicon-ok text-success" aria-hidden="true"></span> <strong>Session information:</strong> recorded </a>
+</p>
+</div>
+<div id="strongSessioninformationstrongrecorded" class="panel-collapse collapse">
+<div class="panel-body">
+<p>Great job! Recording the operating system, R version, and package versions is critical for reproducibility.</p>
+</div>
+</div>
+</div>
+<div class="panel panel-default">
+<div class="panel-heading">
+<p class="panel-title">
+<a data-toggle="collapse" data-parent="#workflowr-checks" href="#strongCachestrongnone"> <span class="glyphicon glyphicon-ok text-success" aria-hidden="true"></span> <strong>Cache:</strong> none </a>
+</p>
+</div>
+<div id="strongCachestrongnone" class="panel-collapse collapse">
+<div class="panel-body">
+<p>Nice! There were no cached chunks for this analysis, so you can be confident that you successfully produced the results during this run.</p>
+</div>
+</div>
+</div>
+<div class="panel panel-default">
+<div class="panel-heading">
+<p class="panel-title">
+<a data-toggle="collapse" data-parent="#workflowr-checks" href="#strongFilepathsstrongabsolute"> <span class="glyphicon glyphicon-exclamation-sign text-danger" aria-hidden="true"></span> <strong>File paths:</strong> absolute </a>
+</p>
+</div>
+<div id="strongFilepathsstrongabsolute" class="panel-collapse collapse">
+<div class="panel-body">
+<p>
+Using absolute paths to the files within your workflowr project makes it difficult for you and others to run your code on a different machine. Change the absolute path(s) below to the suggested relative path(s) to make your code more reproducible.
+</p>
+<table class="table table-condensed table-hover">
+<thead>
+<tr>
+<th style="text-align:left;">
+absolute
+</th>
+<th style="text-align:left;">
+relative
+</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td style="text-align:left;">
+~/Documents/R/drugseq_test/output/ddsDrug_trimmed_batch2_20211213.RData
+</td>
+<td style="text-align:left;">
+../output/ddsDrug_trimmed_batch2_20211213.RData
+</td>
+</tr>
+<tr>
+<td style="text-align:left;">
+~/Documents/R/drugseq_test/data/patmeta_210324.RData
+</td>
+<td style="text-align:left;">
+../data/patmeta_210324.RData
+</td>
+</tr>
+<tr>
+<td style="text-align:left;">
+~/Documents/R/drugseq_test/data/ddsCLL_Salmon_190702.RData
+</td>
+<td style="text-align:left;">
+../data/ddsCLL_Salmon_190702.RData
+</td>
+</tr>
+</tbody>
+</table>
+</div>
+</div>
+</div>
+<div class="panel panel-default">
+<div class="panel-heading">
+<p class="panel-title">
+<a data-toggle="collapse" data-parent="#workflowr-checks" href="#strongRepositoryversionstrongahrefhttpsgitembldejludrugseqtree4039c41558a49e9634df60a08e1bca8b2b112cdbtargetblank4039c41a"> <span class="glyphicon glyphicon-ok text-success" aria-hidden="true"></span> <strong>Repository version:</strong> <a href="https://git.embl.de/jlu/drugseq/tree/4039c41558a49e9634df60a08e1bca8b2b112cdb" target="_blank">4039c41</a> </a>
+</p>
+</div>
+<div id="strongRepositoryversionstrongahrefhttpsgitembldejludrugseqtree4039c41558a49e9634df60a08e1bca8b2b112cdbtargetblank4039c41a" class="panel-collapse collapse">
+<div class="panel-body">
+<p>
+Great! You are using Git for version control. Tracking code development and connecting the code version to the results is critical for reproducibility.
+</p>
+<p>
+The results in this page were generated with repository version <a href="https://git.embl.de/jlu/drugseq/tree/4039c41558a49e9634df60a08e1bca8b2b112cdb" target="_blank">4039c41</a>. See the <em>Past versions</em> tab to see a history of the changes made to the R Markdown and HTML files.
+</p>
+<p>
+Note that you need to be careful to ensure that all relevant files for the analysis have been committed to Git prior to generating the results (you can use <code>wflow_publish</code> or <code>wflow_git_commit</code>). workflowr only checks the R Markdown file, but you know if there are other scripts or data files that it depends on. Below is the status of the Git repository when the results were generated:
+</p>
+<pre><code>
+Ignored files:
+    Ignored:    .DS_Store
+    Ignored:    .Rhistory
+    Ignored:    .Rproj.user/
+    Ignored:    analysis/.DS_Store
+    Ignored:    code/.DS_Store
+    Ignored:    data/.DS_Store
+
+Untracked files:
+    Untracked:  analysis/1_process_batch1new_trimmed.Rmd
+    Untracked:  analysis/1_process_batch1new_untrimmed.Rmd
+    Untracked:  analysis/1_process_batch2_trimmed.Rmd
+    Untracked:  analysis/1_process_batch2_untrimmed.Rmd
+    Untracked:  analysis/1_process_htseq_batch1new.Rmd
+    Untracked:  analysis/1_process_htseq_batch2.Rmd
+    Untracked:  analysis/2_qualityCheck_Batch2_trimmed.Rmd
+    Untracked:  analysis/2_qualityCheck_Batch2_untrimmed.Rmd
+    Untracked:  analysis/2_qualityCheck_HTseq_batch1new.Rmd
+    Untracked:  analysis/2_qualityCheck_HTseq_batch2.Rmd
+    Untracked:  analysis/2_qualityCheck_bam_batch1new.Rmd
+    Untracked:  analysis/2_qualityCheck_bam_batch2.Rmd
+    Untracked:  analysis/2_qualityCheck_pilotAndBatch1new_trimmed.Rmd
+    Untracked:  analysis/2_qualityCheck_pilotAndBatch1new_untrimmed.Rmd
+    Untracked:  analysis/3_differentialExpression_batch1new_HTseq.Rmd
+    Untracked:  analysis/3_differentialExpression_batch1new_trimmed.Rmd
+    Untracked:  analysis/3_differentialExpression_batch1new_untrimmed.Rmd
+    Untracked:  analysis/3_differentialExpression_batch2_untrimmed.Rmd
+    Untracked:  analysis/4_fastQC_batch1new.Rmd
+    Untracked:  analysis/Camera_function_limma.R
+    Untracked:  code/Changes_in_RNAseq_samples_all.R
+    Untracked:  code/genAlign_salmon_QuantSeq_batch1new_trimmed.R
+    Untracked:  code/genAlign_salmon_QuantSeq_batch1new_untrimmed.R
+    Untracked:  code/genAlign_salmon_QuantSeq_batch2_trimmed.R
+    Untracked:  code/genAlign_salmon_QuantSeq_batch2_untrimmed.R
+    Untracked:  code/genAlign_star_QuantSeq_batch1new.R
+    Untracked:  code/genAlign_star_QuantSeq_batch2.R
+    Untracked:  code/genCount_batch1new.R
+    Untracked:  code/genCount_batch2.R
+    Untracked:  code/genFastQC_batch1new.R
+    Untracked:  code/genFastQC_batch2.R
+    Untracked:  data/4_differentialExpression.RData
+    Untracked:  data/RNAseq_samples_pilot_batch1new.xlsx
+    Untracked:  data/RNAseq_samples_pilot_batch1new_batch2.xlsx
+    Untracked:  data/RNAseq_samples_pilot_batch1old.xlsx
+    Untracked:  data/RNAseq_samples_pilot_batch1old_batch1new_batch2.xlsx
+    Untracked:  data/bamList_batch1.txt
+    Untracked:  data/bamList_batch1new.txt
+    Untracked:  data/bamList_batch1new_DMSO.txt
+    Untracked:  data/bamList_batch2.txt
+    Untracked:  data/bamList_pilot.txt
+    Untracked:  data/bamList_pilot_DMSO.txt
+    Untracked:  data/c2.cp.kegg.v6.2.symbols.gmt.txt
+    Untracked:  data/ddsCLL_Salmon_190702.RData
+    Untracked:  data/ddsrna_180717.RData
+    Untracked:  data/drosphila_example_de.csv
+    Untracked:  data/fastqFiles_batch1.txt
+    Untracked:  data/fastqFiles_batch1new.txt
+    Untracked:  data/fastqFiles_batch2.txt
+    Untracked:  data/fastqFiles_pilot.txt
+    Untracked:  data/h.all.v6.2.symbols.gmt.txt
+    Untracked:  data/human_c6_v5p2.rdata
+    Untracked:  data/patmeta_210324.RData
+    Untracked:  data/~$RNAseq_samples_all.xlsx
+    Untracked:  data/~$RNAseq_samples_all_batch1new.xlsx
+    Untracked:  differentialExpression.RData
+    Untracked:  drugseq_test.Rproj
+    Untracked:  output/
+
+Unstaged changes:
+    Modified:   _workflowr.yml
+    Modified:   analysis/_site.yml
+    Deleted:    analysis/bamQC.Rmd
+    Deleted:    analysis/bamQC_HAP1.Rmd
+    Deleted:    analysis/calcCoverage.Rmd
+    Deleted:    analysis/differentialExpression_batch1.Rmd
+    Deleted:    analysis/differentialExpression_batch1_HTseq.Rmd
+    Deleted:    analysis/process.Rmd
+    Deleted:    analysis/process_htseq.Rmd
+    Deleted:    analysis/qualityCheck_HTseq.Rmd
+    Deleted:    analysis/qualityCheck_pilotAndBatch1.Rmd
+    Deleted:    analysis/qualityCheck_pilotAndBatch1_trimmed.Rmd
+    Deleted:    code/fastqFiles.txt
+    Deleted:    code/genAlign_salmon_QuantSeq.R
+    Deleted:    code/genAlign_star_QuantSeq.R
+    Deleted:    code/genCount.R
+    Deleted:    code/genFastQC.R
+    Deleted:    data/RNAseq_samples_all.xlsx
+    Deleted:    drugseq.Rproj
+
+</code></pre>
+<p>
+Note that any generated files, e.g. HTML, png, CSS, etc., are not included in this status report because it is ok for generated content to have uncommitted changes.
+</p>
+</div>
+</div>
+</div>
+</div>
+<hr>
+</div>
+<div id="versions" class="tab-pane fade">
+<p>
+There are no past versions. Publish this analysis with <code>wflow_publish()</code> to start tracking its development.
+</p>
+<hr>
+</div>
+</div>
+</div>
+<div id="load-data-and-packages" class="section level1">
+<h1>Load data and packages</h1>
+<p>Packages</p>
+<pre class="r"><code>library(DESeq2)
+library(RColorBrewer)
+library(pheatmap)
+library(tidyverse)
+
+knitr::opts_chunk$set(warning = FALSE, message = FALSE)</code></pre>
+<p>Load data</p>
+<pre class="r"><code>load(&quot;~/Documents/R/drugseq_test/output/ddsDrug_trimmed_batch2_20211213.RData&quot;)
+load(&quot;~/Documents/R/drugseq_test/data/patmeta_210324.RData&quot;)</code></pre>
+<p>Global ggplot variables</p>
+<pre class="r"><code>#set the global ggplot theme
+theme_set(theme_bw() + theme(axis.text = element_text(size=12), 
+                             axis.title = element_text(size=14),
+                             plot.title = element_text(size = 15, hjust =0.5, face=&quot;bold&quot;)))</code></pre>
+</div>
+<div id="distribution-of-raw-counts" class="section level1">
+<h1>Distribution of raw counts</h1>
+<div id="before-normalization" class="section level2">
+<h2>Before normalization</h2>
+<pre class="r"><code>patAnno &lt;- colData(ddsDrug) %&gt;% as_tibble()
+plotTab &lt;- data.frame(counts(ddsDrug)) %&gt;% 
+  rownames_to_column(&quot;id&quot;) %&gt;%
+  gather(key= &quot;ID&quot;, value = &quot;count&quot;,-id) %&gt;%
+  dplyr::filter(count &gt; 0) %&gt;%
+  mutate(batch = patAnno[match(ID, patAnno$ID),]$batch)
+
+ggplot(plotTab, aes(x= ID, y= log10(count), fill = batch)) +
+  geom_boxplot() + theme_bw() + 
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1))</code></pre>
+<p><img src="figure/2_qualityCheck_Batch2_trimmed.Rmd/unnamed-chunk-4-1.png" width="1920" style="display: block; margin: auto;" /></p>
+</div>
+<div id="after-normalization" class="section level2">
+<h2>After normalization</h2>
+<pre class="r"><code>plotTab &lt;- data.frame(counts(ddsDrug, normalized = TRUE)) %&gt;% 
+  rownames_to_column(&quot;id&quot;) %&gt;%
+  gather(key= &quot;ID&quot;, value = &quot;count&quot;,-id) %&gt;%
+  dplyr::filter(count &gt; 0) %&gt;%
+  mutate(batch = patAnno[match(ID, patAnno$ID),]$batch)
+
+ggplot(plotTab, aes(x= ID, y= log10(count), fill = batch)) +
+  geom_boxplot() + theme_bw() + 
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1))</code></pre>
+<p><img src="figure/2_qualityCheck_Batch2_trimmed.Rmd/unnamed-chunk-5-1.png" width="1440" style="display: block; margin: auto;" /></p>
+</div>
+<div id="after-normalization-batch-1-old-and-new" class="section level2">
+<h2>After normalization (Batch 1 old and new)</h2>
+<pre class="r"><code>plotTab_batch1 &lt;- dplyr::filter(plotTab, batch == c(&quot;batch1&quot;, &quot;batch1old&quot;))
+
+ggplot(plotTab_batch1, aes(x= ID, y= log10(count), fill = batch)) +
+  geom_boxplot() + theme_bw() + 
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1))</code></pre>
+<p><img src="figure/2_qualityCheck_Batch2_trimmed.Rmd/unnamed-chunk-6-1.png" width="1440" style="display: block; margin: auto;" /></p>
+</div>
+<div id="after-normalization-pilot-and-batch-2" class="section level2">
+<h2>After normalization (Pilot and batch 2)</h2>
+<pre class="r"><code>plotTab_batch2 &lt;- dplyr::filter(plotTab, batch == c(&quot;pilot&quot;, &quot;batch2&quot;))
+
+ggplot(plotTab_batch2, aes(x= ID, y= log10(count), fill = batch)) +
+  geom_boxplot() + theme_bw() + 
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1))</code></pre>
+<p><img src="figure/2_qualityCheck_Batch2_trimmed.Rmd/unnamed-chunk-7-1.png" width="1440" style="display: block; margin: auto;" /></p>
+</div>
+</div>
+<div id="check-ecdfs" class="section level1">
+<h1>Check ECDFs</h1>
+<pre class="r"><code># Remove rows/genes with too few counts
+keep &lt;- apply(counts(ddsDrug), 1, function(x) any(x &gt;= 10))
+ddsAll &lt;- ddsDrug[keep,]
+# Only use protein coding genes
+ddsAll &lt;- ddsAll[rowData(ddsAll)$biotype %in% &quot;protein_coding&quot;,]
+# Remove sex chromosome genes
+ddsAll &lt;- ddsAll[!rowData(ddsAll)$chromosome %in% c(&quot;X&quot;,&quot;Y&quot;)]
+#Variance stabilization transformation of the raw data
+RNAnorm.all &lt;- vst(ddsAll)</code></pre>
+<pre class="r"><code># Successful normalization should lead to overlapped curves
+par(mfrow = c(1,2))
+geneplotter::multidensity(assay(RNAnorm.all), xlim = c(0,30), legend = F, xlab = &quot;mean counts&quot;)
+geneplotter::multiecdf(assay(RNAnorm.all), legend = F, xlab=&quot;mean counts&quot;)</code></pre>
+<img src="figure/2_qualityCheck_Batch2_trimmed.Rmd/unnamed-chunk-9-1.png" width="1440" style="display: block; margin: auto;" />
+<div class="alert alert-warning">
+<p>
+<strong>Warning:</strong> The above code chunk cached its results, but it won’t be re-run if previous chunks it depends on are updated. If you need to use caching, it is highly recommended to also set <code>knitr::opts_chunk$set(autodep = TRUE)</code> at the top of the file (in a chunk that is not cached). Alternatively, you can customize the option <code>dependson</code> for each individual chunk that is cached. Using either <code>autodep</code> or <code>dependson</code> will remove this warning. See the <a href="https://yihui.name/knitr/options/#cache"
+>knitr cache options</a> for more details.
+</p>
+</div>
+</div>
+<div id="clustering" class="section level1">
+<h1>Clustering</h1>
+<div id="pca" class="section level2">
+<h2>PCA</h2>
+<div id="calculate-pca" class="section level3">
+<h3>Calculate PCA</h3>
+<pre class="r"><code>#invariant filtering
+exprMat &lt;- assay(RNAnorm.all)
+sds &lt;- rowSds(exprMat)
+exprMat &lt;- exprMat[order(sds, decreasing  = T)[1:5000],]
+
+#calculate pca 
+pcaRes &lt;- prcomp(t(exprMat), scale. = TRUE, center=TRUE)
+varExp &lt;- (pcaRes$sdev^2 / sum(pcaRes$sdev^2))*100
+pcaTab &lt;- data.frame(pcaRes$x[,1:10]) %&gt;% rownames_to_column(&quot;ID&quot;) %&gt;%
+  left_join(patAnno)
+names(varExp) &lt;- colnames(pcaRes$x)</code></pre>
+</div>
+<div id="pca-colored-by-batch" class="section level3">
+<h3>PCA colored by batch</h3>
+<pre class="r"><code>ggplot(pcaTab, aes(x=PC1,y=PC2, col = batch)) + geom_point() + theme_bw() + 
+  xlab(sprintf(&quot;PC1 (%2.1f%%)&quot;,varExp[1])) + ylab(sprintf(&quot;PC2 (%2.1f%%)&quot;,varExp[2])) </code></pre>
+<p><img src="figure/2_qualityCheck_Batch2_trimmed.Rmd/unnamed-chunk-11-1.png" width="672" style="display: block; margin: auto;" /> The batches are not separated by PC1 or PC2.</p>
+</div>
+<div id="pca-colored-by-treatment" class="section level3">
+<h3>PCA colored by treatment</h3>
+<pre class="r"><code>ggplot(pcaTab, aes(x=PC1,y=PC2, col = treatment)) + geom_point() + theme_bw() + 
+  xlab(sprintf(&quot;PC1 (%2.1f%%)&quot;,varExp[1])) + ylab(sprintf(&quot;PC2 (%2.1f%%)&quot;,varExp[2])) </code></pre>
+<p><img src="figure/2_qualityCheck_Batch2_trimmed.Rmd/unnamed-chunk-12-1.png" width="672" style="display: block; margin: auto;" /> The treatments are not separated by the principal components. Only the baseline samples of batch1 and batch1old are separated by PC2.</p>
+</div>
+<div id="pca-colored-by-patientid" class="section level3">
+<h3>PCA colored by patientID</h3>
+<pre class="r"><code>ggplot(pcaTab, aes(x=PC1,y=PC2, col = patID)) + geom_point() + theme_bw() + 
+  xlab(sprintf(&quot;PC1 (%2.1f%%)&quot;,varExp[1])) + ylab(sprintf(&quot;PC2 (%2.1f%%)&quot;,varExp[2])) </code></pre>
+<p><img src="figure/2_qualityCheck_Batch2_trimmed.Rmd/unnamed-chunk-13-1.png" width="672" style="display: block; margin: auto;" /> ### PCA colored by sampleID</p>
+<pre class="r"><code>ggplot(pcaTab, aes(x=PC1,y=PC2, col = sampleID)) + geom_point() + theme_bw() + 
+  xlab(sprintf(&quot;PC1 (%2.1f%%)&quot;,varExp[1])) + ylab(sprintf(&quot;PC2 (%2.1f%%)&quot;,varExp[2])) </code></pre>
+<p><img src="figure/2_qualityCheck_Batch2_trimmed.Rmd/unnamed-chunk-14-1.png" width="672" style="display: block; margin: auto;" /></p>
+</div>
+</div>
+<div id="sample-distance" class="section level2">
+<h2>Sample distance</h2>
+<pre class="r"><code>sampleDists &lt;- dist(t(assay(RNAnorm.all)))
+sampleDistMat &lt;- as.matrix(sampleDists)
+annoCol &lt;- patAnno %&gt;% select(expID, expBatch, patID, FSC.SSC.norm, treatment, time, batch, ID) %&gt;%
+  data.frame() %&gt;% column_to_rownames(&quot;ID&quot;)
+#Plot heatmap
+colors &lt;- colorRampPalette( rev(brewer.pal(9,&quot;Blues&quot;)) )(255)
+pheatmap(sampleDistMat, color = colors, clustering_distance_rows = sampleDists, clustering_distance_cols = sampleDists, annotation_col = annoCol, clustering_method = &quot;ward.D2&quot;,
+         labels_col = paste0(patAnno[colnames(sampleDistMat),]$patID,&quot;_&quot;,
+                             patAnno[colnames(sampleDistMat),]$treatment))</code></pre>
+<p><img src="figure/2_qualityCheck_Batch2_trimmed.Rmd/unnamed-chunk-15-1.png" width="1920" style="display: block; margin: auto;" /></p>
+</div>
+<div id="sample-similarity" class="section level2">
+<h2>Sample similarity</h2>
+<pre class="r"><code>sampleSimMat &lt;- cor(assay(RNAnorm.all))
+pheatmap(sampleSimMat, annotation_col = annoCol,
+          clustering_method = &quot;ward.D2&quot;,
+         labels_col = paste0(patAnno[colnames(sampleSimMat),]$patID,&quot;_&quot;,
+                             patAnno[colnames(sampleSimMat),]$treatment))</code></pre>
+<p><img src="figure/2_qualityCheck_Batch2_trimmed.Rmd/unnamed-chunk-16-1.png" width="1920" style="display: block; margin: auto;" /></p>
+</div>
+</div>
+<div id="adjusting-for-patient-specific-effect" class="section level1">
+<h1>Adjusting for patient specific effect</h1>
+<p>The technical outliers should be dealt with before adjusting for patient-specific effect.</p>
+</div>
+<div id="compare-with-previous-rnaseq-data-samples-with-baseline-included" class="section level1">
+<h1>Compare with previous RNAseq data (samples with baseline included)</h1>
+<div id="processing-datasets" class="section level2">
+<h2>Processing datasets</h2>
+<pre class="r"><code>load(&quot;~/Documents/R/drugseq_test/data/ddsCLL_Salmon_190702.RData&quot;)
+ddsSub &lt;- ddsDrug[,ddsDrug$treatment %in% &quot;Baseline&quot;]   # 9 samples in new RNA seq data contain baseline
+overPat &lt;- intersect(ddsCLL$patientID, ddsSub$patID)    # 5 overlapping patient IDs
+ddsOld &lt;- ddsCLL[,overPat]  
+ddsNew &lt;- ddsDrug[,match(overPat, ddsDrug$patID)]  
+
+#only keep protein coding genes
+ddsOld &lt;- ddsOld[rowData(ddsOld)$gene_biotype %in% &quot;protein_coding&quot;,]  # dim 22028 rows x 5 columns
+ddsNew &lt;- ddsNew[rowData(ddsNew)$biotype %in% &quot;protein_coding&quot;,]       # dim 22028 rows x 5 columns
+colnames(ddsNew) &lt;- ddsNew$patID</code></pre>
+<p>5 overlapping patient IDs between old (2019) and new RNAseq (2021) data.</p>
+</div>
+<div id="summarise-detected-genes" class="section level2">
+<h2>Summarise detected genes</h2>
+<pre class="r"><code>sumCountTab &lt;- lapply(overPat, function(n) {
+  subOld &lt;- ddsOld[,n]
+  subNew &lt;- ddsNew[,n]
+  geneOld &lt;- rownames(subOld)[rowSums(assay(subOld)) &gt; 0]
+  geneNew &lt;- rownames(subNew)[rowSums(assay(subNew)) &gt; 0]
+  tibble(patID = n,
+         onlyNew = length(setdiff(geneNew, geneOld)),
+         onlyOld = length(setdiff(geneOld, geneNew)),
+         both = length(intersect(geneNew, geneOld)))
+}) %&gt;% bind_rows()
+sumCountTab</code></pre>
+<pre><code># A tibble: 5 × 4
+  patID onlyNew onlyOld  both
+  &lt;chr&gt;   &lt;int&gt;   &lt;int&gt; &lt;int&gt;
+1 P0369     100    3781 14726
+2 P0793     136    3773 14269
+3 P0024     149    3709 14532
+4 P0341     118    3747 14373
+5 P0646     122    3511 14464</code></pre>
+<pre class="r"><code>plotTab &lt;- sumCountTab %&gt;% pivot_longer(-patID, names_to = &quot;group&quot;, values_to = &quot;count&quot;) %&gt;%
+  mutate(group = factor(group, level = c(&quot;onlyNew&quot;,&quot;both&quot;,&quot;onlyOld&quot;)))
+ggplot(plotTab, aes(x=patID, y = count, fill = group)) + geom_bar(stat = &quot;identity&quot;) +
+    theme(axis.text.x = element_text(angle = 90, hjust=1, vjust=0.5))</code></pre>
+<p><img src="figure/2_qualityCheck_Batch2_trimmed.Rmd/unnamed-chunk-19-1.png" width="672" style="display: block; margin: auto;" /></p>
+</div>
+<div id="correlations-of-gene-counts" class="section level2">
+<h2>Correlations of gene counts</h2>
+<pre class="r"><code>plotList &lt;- lapply(overPat, function(n) {
+  subOld &lt;- ddsOld[,n]
+  subNew &lt;- ddsNew[,n]
+  overGene &lt;- intersect(rownames(subOld), rownames(subNew))
+  subOld &lt;- subOld[overGene,]
+  subNew &lt;- subNew[overGene,]
+  plotTab &lt;- tibble(geneID = overGene,
+                    countOld = assay(subOld)[,1],
+                    countNew = assay(subNew)[,1])
+  ggplot(plotTab, aes(x=log10(countOld), y=log10(countNew))) + scattermore::geom_scattermore() +
+     ggtitle(n)
+})
+cowplot::plot_grid(plotList[[1]], plotList[[2]], plotList[[3]], plotList[[4]], plotList[[5]], ncol=3, labels=&quot;AUTO&quot;)</code></pre>
+<p><img src="figure/2_qualityCheck_Batch2_trimmed.Rmd/unnamed-chunk-20-1.png" width="960" style="display: block; margin: auto;" /></p>
+</div>
+<div id="compare-the-similarity-of-expression-pattern" class="section level2">
+<h2>Compare the similarity of expression pattern</h2>
+<p>Assemble new combined DESeq object</p>
+<pre class="r"><code>oldMat &lt;- counts(ddsOld)
+newMat &lt;- counts(ddsNew)
+colnames(newMat) &lt;- paste0(colnames(newMat),&quot;_1&quot;)
+patBack &lt;- data.frame(row.names = c(colnames(oldMat), colnames(newMat)),
+                      patID = c(ddsOld$patientID,ddsNew$patID),
+                      set = rep(c(&quot;old&quot;,&quot;new&quot;), each = ncol(oldMat)))
+overGene &lt;- intersect(rownames(oldMat), rownames(newMat))
+comMat &lt;- cbind(oldMat[overGene,],newMat[overGene,])
+ddsCom &lt;- DESeqDataSetFromMatrix(comMat, patBack, design= ~1)
+ddsCom &lt;- estimateSizeFactors(ddsCom)  #estimate size factor</code></pre>
+<p>Distribution after normalization</p>
+<pre class="r"><code>plotTab &lt;- data.frame(counts(ddsCom, normalized = TRUE)) %&gt;% 
+  rownames_to_column(&quot;id&quot;) %&gt;%
+  gather(key= &quot;ID&quot;, value = &quot;count&quot;,-id) %&gt;%
+  dplyr::filter(count &gt; 0) %&gt;%
+  mutate(set = patBack[ID,]$set)
+
+ggplot(plotTab, aes(x= ID, y= log10(count))) +
+  geom_boxplot(aes(fill = set)) + theme_bw() + 
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1))</code></pre>
+<p><img src="figure/2_qualityCheck_Batch2_trimmed.Rmd/unnamed-chunk-22-1.png" width="1440" style="display: block; margin: auto;" /></p>
+<p>Variance stabilization transformation</p>
+<pre class="r"><code>ddsCom.vst &lt;- varianceStabilizingTransformation(ddsCom)</code></pre>
+<div id="pca-1" class="section level3">
+<h3>PCA</h3>
+<pre class="r"><code>patAnno &lt;- colData(ddsCom) %&gt;% data.frame() %&gt;% rownames_to_column(&quot;ID&quot;) %&gt;%
+  mutate(IGHV = patMeta[match(patID, patMeta$Patient.ID),]$IGHV.status,
+         trisomy12 = patMeta[match(patID, patMeta$Patient.ID),]$trisomy12)
+
+#invariant filtering
+exprMat &lt;- assay(ddsCom.vst)
+sds &lt;- rowSds(exprMat)
+exprMat &lt;- exprMat[order(sds, decreasing  = T)[1:10000],]
+
+#calculate pca 
+pcaRes &lt;- prcomp(t(exprMat), scale. = TRUE, center=TRUE)
+varExp &lt;- (pcaRes$sdev^2 / sum(pcaRes$sdev^2))*100
+pcaTab &lt;- data.frame(pcaRes$x[,1:10]) %&gt;% rownames_to_column(&quot;ID&quot;) %&gt;%
+  left_join(patAnno)
+names(varExp) &lt;- colnames(pcaRes$x)
+
+# create plot
+ggplot(pcaTab, aes(x=PC1,y=PC2, col = set, shape = IGHV)) + geom_point() + theme_bw() + 
+  xlab(sprintf(&quot;PC1 (%2.1f%%)&quot;,varExp[1])) + 
+  ylab(sprintf(&quot;PC2 (%2.1f%%)&quot;,varExp[2])) +
+  geom_line(aes(group = patID), col = &quot;grey50&quot;, linetype = &quot;dotted&quot;) +
+  ggrepel::geom_text_repel(aes(label = patID))</code></pre>
+<p><img src="figure/2_qualityCheck_Batch2_trimmed.Rmd/unnamed-chunk-24-1.png" width="768" style="display: block; margin: auto;" /> The batch (or sequencing platform) explains the major difference</p>
+</div>
+<div id="sample-similarity-1" class="section level3">
+<h3>Sample similarity</h3>
+<pre class="r"><code>sampleSimMat &lt;- cor(exprMat)
+annoCol &lt;- patAnno %&gt;% select(ID, patID, set, IGHV) %&gt;%
+  column_to_rownames(&quot;ID&quot;)
+
+pheatmap(sampleSimMat, annotation_col = annoCol, clustering_method = &quot;ward.D2&quot;)</code></pre>
+<p><img src="figure/2_qualityCheck_Batch2_trimmed.Rmd/unnamed-chunk-25-1.png" width="768" style="display: block; margin: auto;" /></p>
+</div>
+</div>
+<div id="compare-similarity-of-expression-pattern-after-adjusting-for-batch" class="section level2">
+<h2>Compare similarity of expression pattern after adjusting for batch</h2>
+<p>Adjust batch effect using limma</p>
+<pre class="r"><code>exprMat &lt;- assay(ddsCom.vst)
+exprMat &lt;- sva::ComBat(exprMat, batch = factor(ddsCom.vst$set))</code></pre>
+<pre><code>Found 5427 genes with uniform expression within a single batch (all zeros); these will not be adjusted for batch.</code></pre>
+<pre class="r"><code>ddsCom.adj &lt;- ddsCom.vst
+assay(ddsCom.adj) &lt;- exprMat</code></pre>
+<div id="pca-2" class="section level3">
+<h3>PCA</h3>
+<pre class="r"><code>patAnno &lt;- colData(ddsCom.adj) %&gt;% data.frame() %&gt;% rownames_to_column(&quot;ID&quot;) %&gt;%
+  mutate(IGHV = patMeta[match(patID, patMeta$Patient.ID),]$IGHV.status,
+         trisomy12 = patMeta[match(patID, patMeta$Patient.ID),]$trisomy12)
+
+#invariant filtering
+exprMat &lt;- assay(ddsCom.adj)
+sds &lt;- rowSds(exprMat)
+exprMat &lt;- exprMat[order(sds, decreasing  = T)[1:10000],]
+
+#calculate pca 
+pcaRes &lt;- prcomp(t(exprMat), scale. = TRUE, center=TRUE)
+varExp &lt;- (pcaRes$sdev^2 / sum(pcaRes$sdev^2))*100
+pcaTab &lt;- data.frame(pcaRes$x[,1:10]) %&gt;% rownames_to_column(&quot;ID&quot;) %&gt;%
+  left_join(patAnno)
+names(varExp) &lt;- colnames(pcaRes$x)
+
+#create plot
+ggplot(pcaTab, aes(x=PC1,y=PC2, col = set, shape = IGHV)) + geom_point() + theme_bw() + 
+  xlab(sprintf(&quot;PC1 (%2.1f%%)&quot;,varExp[1])) + 
+  ylab(sprintf(&quot;PC2 (%2.1f%%)&quot;,varExp[2])) +
+  geom_line(aes(group = patID), col = &quot;grey50&quot;, linetype = &quot;dotted&quot;) +
+  ggrepel::geom_text_repel(aes(label = patID))</code></pre>
+<p><img src="figure/2_qualityCheck_Batch2_trimmed.Rmd/unnamed-chunk-27-1.png" width="768" style="display: block; margin: auto;" /></p>
+</div>
+<div id="sample-similarity-2" class="section level3">
+<h3>Sample similarity</h3>
+<pre class="r"><code>sampleSimMat &lt;- cor(exprMat)
+annoCol &lt;- patAnno %&gt;% select(ID, patID, set, IGHV) %&gt;%
+  column_to_rownames(&quot;ID&quot;)
+
+pheatmap(sampleSimMat, annotation_col = annoCol, clustering_method = &quot;ward.D2&quot;)</code></pre>
+<p><img src="figure/2_qualityCheck_Batch2_trimmed.Rmd/unnamed-chunk-28-1.png" width="768" style="display: block; margin: auto;" /></p>
+</div>
+</div>
+</div>
+<div id="compare-with-previous-rnaseq-data-using-dmso-as-baseline" class="section level1">
+<h1>Compare with previous RNAseq data (using DMSO as baseline)</h1>
+<div id="processing-datasets-1" class="section level2">
+<h2>Processing datasets</h2>
+<pre class="r"><code>load(&quot;~/Documents/R/drugseq_test/data/ddsCLL_Salmon_190702.RData&quot;)
+ddsSub &lt;- ddsDrug[,ddsDrug$treatment %in% &quot;DMSO&quot;]    # 38 samples were treated with DMSO
+overPat &lt;- intersect(ddsCLL$patientID, ddsSub$patID) # 31 overlapping patient IDs
+ddsOld &lt;- ddsCLL[,overPat]  
+ddsNew &lt;- ddsDrug[,match(overPat, ddsDrug$patID)] 
+
+#only keep protein coding genes
+ddsOld &lt;- ddsOld[rowData(ddsOld)$gene_biotype %in% &quot;protein_coding&quot;,] # dim: 22028 rows x 31 columns
+ddsNew &lt;- ddsNew[rowData(ddsNew)$biotype %in% &quot;protein_coding&quot;,]      # dim: 22028 rows x 31 columns
+colnames(ddsNew) &lt;- ddsNew$patID</code></pre>
+<p>31 patient IDs treated with DMSO are shared between old (2019) and new RNAseq (2021) data.</p>
+</div>
+<div id="summarise-detected-genes-1" class="section level2">
+<h2>Summarise detected genes</h2>
+<pre class="r"><code>sumCountTab &lt;- lapply(overPat, function(n) {
+  subOld &lt;- ddsOld[,n]
+  subNew &lt;- ddsNew[,n]
+  geneOld &lt;- rownames(subOld)[rowSums(assay(subOld)) &gt; 0]
+  geneNew &lt;- rownames(subNew)[rowSums(assay(subNew)) &gt; 0]
+  tibble(patID = n,
+         onlyNew = length(setdiff(geneNew, geneOld)),
+         onlyOld = length(setdiff(geneOld, geneNew)),
+         both = length(intersect(geneNew, geneOld)))
+}) %&gt;% bind_rows()
+sumCountTab</code></pre>
+<pre><code># A tibble: 53 × 4
+   patID onlyNew onlyOld  both
+   &lt;chr&gt;   &lt;int&gt;   &lt;int&gt; &lt;int&gt;
+ 1 P0070     287    3866 13660
+ 2 P0016     589    3876 14681
+ 3 P0734     338    3857 14290
+ 4 P0031     417    3743 14775
+ 5 P0053     471    3917 14278
+ 6 P0100     445    3507 14645
+ 7 P0060     521    3644 14511
+ 8 P0995     281    4682 14370
+ 9 P0781     216    4666 14600
+10 P0603     354    4030 14381
+# … with 43 more rows</code></pre>
+<pre class="r"><code>plotTab &lt;- sumCountTab %&gt;% pivot_longer(-patID, names_to = &quot;group&quot;, values_to = &quot;count&quot;) %&gt;%
+  mutate(group = factor(group, level = c(&quot;onlyNew&quot;,&quot;both&quot;,&quot;onlyOld&quot;)))
+ggplot(plotTab, aes(x=patID, y = count, fill = group)) + geom_bar(stat = &quot;identity&quot;)</code></pre>
+<p><img src="figure/2_qualityCheck_Batch2_trimmed.Rmd/unnamed-chunk-31-1.png" width="672" style="display: block; margin: auto;" /> The overlap of the detected genes look good. <strong>both</strong>: genes have non-zero count in both datasets <strong>onlyNew</strong>: genes detected only in the current batch 1 new from 2021 (shallow sequencing) <strong>onlyOld</strong>: genes detected only in the previous batch from 2019 (full depth)</p>
+</div>
+<div id="compare-the-similarity-of-expression-pattern-1" class="section level2">
+<h2>Compare the similarity of expression pattern</h2>
+<p>Assemble new combined DESeq object</p>
+<pre class="r"><code>oldMat &lt;- counts(ddsOld)
+newMat &lt;- counts(ddsNew)
+colnames(newMat) &lt;- paste0(colnames(newMat),&quot;_1&quot;)
+patBack &lt;- data.frame(row.names = c(colnames(oldMat), colnames(newMat)),
+                      patID = c(ddsOld$patientID,ddsNew$patID),
+                      set = rep(c(&quot;old&quot;,&quot;new&quot;), each = ncol(oldMat)))
+overGene &lt;- intersect(rownames(oldMat), rownames(newMat))
+comMat &lt;- cbind(oldMat[overGene,],newMat[overGene,])
+ddsCom &lt;- DESeqDataSetFromMatrix(comMat, patBack, design= ~1)
+ddsCom &lt;- estimateSizeFactors(ddsCom)  #estimate size factor</code></pre>
+<p>Distribution after normalization</p>
+<pre class="r"><code>plotTab &lt;- data.frame(counts(ddsCom, normalized = TRUE)) %&gt;% 
+  rownames_to_column(&quot;id&quot;) %&gt;%
+  gather(key= &quot;ID&quot;, value = &quot;count&quot;,-id) %&gt;%
+  dplyr::filter(count &gt; 0) %&gt;%
+  mutate(set = patBack[ID,]$set)
+
+ggplot(plotTab, aes(x= ID, y= log10(count))) +
+  geom_boxplot(aes(fill = set)) + theme_bw() + 
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1))</code></pre>
+<p><img src="figure/2_qualityCheck_Batch2_trimmed.Rmd/unnamed-chunk-33-1.png" width="1440" style="display: block; margin: auto;" /></p>
+<p>Variance stabilization transformation</p>
+<pre class="r"><code>ddsCom.vst &lt;- varianceStabilizingTransformation(ddsCom)</code></pre>
+<div id="pca-3" class="section level3">
+<h3>PCA</h3>
+<pre class="r"><code>patAnno &lt;- colData(ddsCom) %&gt;% data.frame() %&gt;% rownames_to_column(&quot;ID&quot;) %&gt;%
+  mutate(IGHV = patMeta[match(patID, patMeta$Patient.ID),]$IGHV.status,
+         trisomy12 = patMeta[match(patID, patMeta$Patient.ID),]$trisomy12)
+
+#invariant filtering
+exprMat &lt;- assay(ddsCom.vst)
+sds &lt;- rowSds(exprMat)
+exprMat &lt;- exprMat[order(sds, decreasing  = T)[1:10000],]
+
+#calculate pca 
+pcaRes &lt;- prcomp(t(exprMat), scale. = TRUE, center=TRUE)
+varExp &lt;- (pcaRes$sdev^2 / sum(pcaRes$sdev^2))*100
+pcaTab &lt;- data.frame(pcaRes$x[,1:10]) %&gt;% rownames_to_column(&quot;ID&quot;) %&gt;%
+  left_join(patAnno)
+names(varExp) &lt;- colnames(pcaRes$x)
+
+#create plot
+ggplot(pcaTab, aes(x=PC1,y=PC2, col = set, shape = IGHV)) + geom_point() + theme_bw() + 
+  xlab(sprintf(&quot;PC1 (%2.1f%%)&quot;,varExp[1])) + 
+  ylab(sprintf(&quot;PC2 (%2.1f%%)&quot;,varExp[2])) +
+  geom_line(aes(group = patID), col = &quot;grey50&quot;, linetype = &quot;dotted&quot;) +
+  ggrepel::geom_text_repel(aes(label = patID))</code></pre>
+<p><img src="figure/2_qualityCheck_Batch2_trimmed.Rmd/unnamed-chunk-35-1.png" width="768" style="display: block; margin: auto;" /> The batch (or sequencing platform) explains the major difference.</p>
+</div>
+<div id="sample-similarity-3" class="section level3">
+<h3>Sample similarity</h3>
+<pre class="r"><code>sampleSimMat &lt;- cor(exprMat)
+annoCol &lt;- patAnno %&gt;% select(ID, patID, set, IGHV) %&gt;%
+  column_to_rownames(&quot;ID&quot;)
+
+pheatmap(sampleSimMat, annotation_col = annoCol,
+          clustering_method = &quot;ward.D2&quot;)</code></pre>
+<p><img src="figure/2_qualityCheck_Batch2_trimmed.Rmd/unnamed-chunk-36-1.png" width="768" style="display: block; margin: auto;" /></p>
+</div>
+</div>
+<div id="compare-similarity-of-expression-pattern-after-adjusting-for-batch-1" class="section level2">
+<h2>Compare similarity of expression pattern after adjusting for batch</h2>
+<p>Adjust batch effect using limma</p>
+<pre class="r"><code>exprMat &lt;- assay(ddsCom.vst)
+exprMat &lt;- limma::removeBatchEffect(exprMat, batch = factor(ddsCom.vst$set))
+ddsCom.adj &lt;- ddsCom.vst
+assay(ddsCom.adj) &lt;- exprMat</code></pre>
+<div id="pca-4" class="section level3">
+<h3>PCA</h3>
+<pre class="r"><code>patAnno &lt;- colData(ddsCom.adj) %&gt;% data.frame() %&gt;% rownames_to_column(&quot;ID&quot;) %&gt;%
+  mutate(IGHV = patMeta[match(patID, patMeta$Patient.ID),]$IGHV.status,
+         trisomy12 = patMeta[match(patID, patMeta$Patient.ID),]$trisomy12)
+
+#invariant filtering
+exprMat &lt;- assay(ddsCom.adj)
+sds &lt;- rowSds(exprMat)
+exprMat &lt;- exprMat[order(sds, decreasing  = T)[1:10000],]
+
+#calculate pca 
+pcaRes &lt;- prcomp(t(exprMat), scale. = TRUE, center=TRUE)
+varExp &lt;- (pcaRes$sdev^2 / sum(pcaRes$sdev^2))*100
+pcaTab &lt;- data.frame(pcaRes$x[,1:10]) %&gt;% rownames_to_column(&quot;ID&quot;) %&gt;%
+  left_join(patAnno)
+names(varExp) &lt;- colnames(pcaRes$x)
+
+#create plot
+ggplot(pcaTab, aes(x=PC1,y=PC2, col = set, shape = IGHV)) + geom_point() + theme_bw() + 
+  xlab(sprintf(&quot;PC1 (%2.1f%%)&quot;,varExp[1])) + 
+  ylab(sprintf(&quot;PC2 (%2.1f%%)&quot;,varExp[2])) +
+  geom_line(aes(group = patID), col = &quot;grey50&quot;, linetype = &quot;dotted&quot;) +
+  ggrepel::geom_text_repel(aes(label = patID))</code></pre>
+<p><img src="figure/2_qualityCheck_Batch2_trimmed.Rmd/unnamed-chunk-38-1.png" width="768" style="display: block; margin: auto;" /></p>
+</div>
+<div id="sample-similarity-4" class="section level3">
+<h3>Sample similarity</h3>
+<pre class="r"><code>sampleSimMat &lt;- cor(exprMat)
+annoCol &lt;- patAnno %&gt;% select(ID, patID, set, IGHV) %&gt;%
+  column_to_rownames(&quot;ID&quot;)
+
+pheatmap(sampleSimMat, annotation_col = annoCol,
+          clustering_method = &quot;ward.D2&quot;)</code></pre>
+<p><img src="figure/2_qualityCheck_Batch2_trimmed.Rmd/unnamed-chunk-39-1.png" width="768" style="display: block; margin: auto;" /></p>
+<br>
+<p>
+<button type="button" class="btn btn-default btn-workflowr btn-workflowr-sessioninfo" data-toggle="collapse" data-target="#workflowr-sessioninfo" style="display: block;">
+<span class="glyphicon glyphicon-wrench" aria-hidden="true"></span> Session information
+</button>
+</p>
+<div id="workflowr-sessioninfo" class="collapse">
+<pre class="r"><code>sessionInfo()</code></pre>
+<pre><code>R version 4.1.2 (2021-11-01)
+Platform: x86_64-apple-darwin17.0 (64-bit)
+Running under: macOS Big Sur 10.16
+
+Matrix products: default
+BLAS:   /Library/Frameworks/R.framework/Versions/4.1/Resources/lib/libRblas.0.dylib
+LAPACK: /Library/Frameworks/R.framework/Versions/4.1/Resources/lib/libRlapack.dylib
+
+locale:
+[1] en_US.UTF-8/en_US.UTF-8/en_US.UTF-8/C/en_US.UTF-8/en_US.UTF-8
+
+attached base packages:
+[1] stats4    stats     graphics  grDevices utils     datasets  methods  
+[8] base     
+
+other attached packages:
+ [1] forcats_0.5.1               stringr_1.4.0              
+ [3] dplyr_1.0.7                 purrr_0.3.4                
+ [5] readr_2.1.0                 tidyr_1.1.4                
+ [7] tibble_3.1.6                ggplot2_3.3.5              
+ [9] tidyverse_1.3.1             pheatmap_1.0.12            
+[11] RColorBrewer_1.1-2          DESeq2_1.34.0              
+[13] SummarizedExperiment_1.24.0 Biobase_2.54.0             
+[15] MatrixGenerics_1.6.0        matrixStats_0.61.0         
+[17] GenomicRanges_1.46.1        GenomeInfoDb_1.30.0        
+[19] IRanges_2.28.0              S4Vectors_0.32.3           
+[21] BiocGenerics_0.40.0        
+
+loaded via a namespace (and not attached):
+  [1] colorspace_2.0-2       ellipsis_0.3.2         rprojroot_2.0.2       
+  [4] XVector_0.34.0         fs_1.5.0               rstudioapi_0.13       
+  [7] farver_2.1.0           ggrepel_0.9.1          bit64_4.0.5           
+ [10] AnnotationDbi_1.56.2   fansi_0.5.0            lubridate_1.8.0       
+ [13] xml2_1.3.2             codetools_0.2-18       splines_4.1.2         
+ [16] cachem_1.0.6           geneplotter_1.72.0     knitr_1.36            
+ [19] jsonlite_1.7.2         workflowr_1.6.2        broom_0.7.10          
+ [22] annotate_1.72.0        dbplyr_2.1.1           png_0.1-7             
+ [25] compiler_4.1.2         httr_1.4.2             backports_1.4.0       
+ [28] assertthat_0.2.1       Matrix_1.3-4           fastmap_1.1.0         
+ [31] limma_3.50.0           cli_3.1.0              later_1.3.0           
+ [34] htmltools_0.5.2        tools_4.1.2            gtable_0.3.0          
+ [37] glue_1.5.1             GenomeInfoDbData_1.2.7 Rcpp_1.0.7            
+ [40] scattermore_0.7        cellranger_1.1.0       jquerylib_0.1.4       
+ [43] vctrs_0.3.8            Biostrings_2.62.0      nlme_3.1-153          
+ [46] xfun_0.28              rvest_1.0.2            lifecycle_1.0.1       
+ [49] XML_3.99-0.8           edgeR_3.36.0           zlibbioc_1.40.0       
+ [52] scales_1.1.1           hms_1.1.1              promises_1.2.0.1      
+ [55] parallel_4.1.2         yaml_2.2.1             memoise_2.0.1         
+ [58] sass_0.4.0             stringi_1.7.5          RSQLite_2.2.8         
+ [61] highr_0.9              genefilter_1.76.0      BiocParallel_1.28.2   
+ [64] rlang_0.4.12           pkgconfig_2.0.3        bitops_1.0-7          
+ [67] evaluate_0.14          lattice_0.20-45        labeling_0.4.2        
+ [70] cowplot_1.1.1          bit_4.0.4              tidyselect_1.1.1      
+ [73] magrittr_2.0.1         R6_2.5.1               generics_0.1.1        
+ [76] DelayedArray_0.20.0    DBI_1.1.1              mgcv_1.8-38           
+ [79] pillar_1.6.4           haven_2.4.3            withr_2.4.3           
+ [82] survival_3.2-13        KEGGREST_1.34.0        RCurl_1.98-1.5        
+ [85] modelr_0.1.8           crayon_1.4.2           utf8_1.2.2            
+ [88] tzdb_0.2.0             rmarkdown_2.11         locfit_1.5-9.4        
+ [91] grid_4.1.2             readxl_1.3.1           sva_3.42.0            
+ [94] blob_1.2.2             git2r_0.29.0           reprex_2.0.1          
+ [97] digest_0.6.29          xtable_1.8-4           httpuv_1.6.3          
+[100] munsell_0.5.0          bslib_0.3.1           </code></pre>
+</div>
+</div>
+</div>
+</div>
+
+
+<!-- Adjust MathJax settings so that all math formulae are shown using
+TeX fonts only; see
+http://docs.mathjax.org/en/latest/configuration.html.  This will make
+the presentation more consistent at the cost of the webpage sometimes
+taking slightly longer to load. Note that this only works because the
+footer is added to webpages before the MathJax javascript. -->
+<script type="text/x-mathjax-config">
+  MathJax.Hub.Config({
+    "HTML-CSS": { availableFonts: ["TeX"] }
+  });
+</script>
+
+
+
+
+</div>
+</div>
+
+</div>
+
+<script>
+
+// add bootstrap table styles to pandoc tables
+function bootstrapStylePandocTables() {
+  $('tr.odd').parent('tbody').parent('table').addClass('table table-condensed');
+}
+$(document).ready(function () {
+  bootstrapStylePandocTables();
+});
+
+
+</script>
+
+<!-- tabsets -->
+
+<script>
+$(document).ready(function () {
+  window.buildTabsets("TOC");
+});
+
+$(document).ready(function () {
+  $('.tabset-dropdown > .nav-tabs > li').click(function () {
+    $(this).parent().toggleClass('nav-tabs-open');
+  });
+});
+</script>
+
+<!-- code folding -->
+
+<script>
+$(document).ready(function ()  {
+
+    // temporarily add toc-ignore selector to headers for the consistency with Pandoc
+    $('.unlisted.unnumbered').addClass('toc-ignore')
+
+    // move toc-ignore selectors from section div to header
+    $('div.section.toc-ignore')
+        .removeClass('toc-ignore')
+        .children('h1,h2,h3,h4,h5').addClass('toc-ignore');
+
+    // establish options
+    var options = {
+      selectors: "h1,h2,h3",
+      theme: "bootstrap3",
+      context: '.toc-content',
+      hashGenerator: function (text) {
+        return text.replace(/[.\\/?&!#<>]/g, '').replace(/\s/g, '_');
+      },
+      ignoreSelector: ".toc-ignore",
+      scrollTo: 0
+    };
+    options.showAndHide = true;
+    options.smoothScroll = true;
+
+    // tocify
+    var toc = $("#TOC").tocify(options).data("toc-tocify");
+});
+</script>
+
+<!-- dynamically load mathjax for compatibility with self-contained -->
+<script>
+  (function () {
+    var script = document.createElement("script");
+    script.type = "text/javascript";
+    script.src  = "https://mathjax.rstudio.com/latest/MathJax.js?config=TeX-AMS-MML_HTMLorMML";
+    document.getElementsByTagName("head")[0].appendChild(script);
+  })();
+</script>
+
+</body>
+</html>

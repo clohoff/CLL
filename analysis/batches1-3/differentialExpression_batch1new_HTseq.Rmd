@@ -1,0 +1,339 @@
+---
+title: "Detect differential expressed genes of drug treatment HTSeq batch 1 new"
+author: "Caroline Lohoff"
+date: "November 25 2021"
+output:
+  BiocStyle::html_document:
+    toc_float: true
+---
+
+# Load libraries
+
+Libraries
+```{r, message=FALSE, warning=FALSE}
+library(DESeq2)
+library(piano)
+library(tidyverse)
+
+knitr::opts_chunk$set(warning = FALSE, message = FALSE)
+```
+
+Global variables
+```{r}
+#set the global ggplot theme
+theme_set(theme_bw() + theme(axis.text = element_text(size=12), 
+                             axis.title = element_text(size=14),
+                             plot.title = element_text(size = 15, hjust =0.5, face="bold")))
+```
+
+Load data
+```{r}
+load("~/Documents/R/drugseq_test/output/ddsDrug_htseq_batch1new_20211125.RData")
+load("~/Documents/R/drugseq_test/data/patmeta_210324.RData")
+ddsDrug <- ddsDrug[,ddsDrug$batch == "batch1"] #only batch1 samples
+ddsDrug$diagnosis <- patMeta[match(ddsDrug$patID, patMeta$Patient.ID),]$diagnosis
+```
+
+# Preprocessing
+
+Only CLL samples
+```{r}
+ddsAll <- ddsDrug[rowData(ddsDrug)$biotype %in% "protein_coding" & !rowData(ddsDrug)$symbol %in% c(NA, ""),
+                  ddsDrug$diagnosis %in% "CLL"] #only use one of the replicated sample
+keep <- apply(counts(ddsAll), 1, function(x) median(x) > 0)
+ddsAll <- ddsAll[keep,]
+dim(ddsAll)
+```
+
+# Differential expression test using DESeq
+
+## Created design matrix
+```{r}
+patAnno <- colData(ddsAll) %>% data.frame() %>% 
+  select(patID, treatment) %>%
+  mutate(treatment = str_replace_all(treatment,"[- ]","_")) %>%
+  mutate(treatment = factor(treatment,
+                          levels = c("DMSO",setdiff(unique(treatment),"DMSO"))))
+designMat <- model.matrix(~ 0 + treatment + patID, patAnno)
+```
+
+## Run DESeq
+```{r}
+ddsAll$condi <- factor(str_replace_all(ddsAll$treatment,"[- ]","_"))
+ddsAll$condi <- factor(ddsAll$condi,
+                       levels = c("DMSO",setdiff(levels(ddsAll$condi),c("DMSO"))))
+ddsAll$patID <- factor(ddsAll$patID)
+design(ddsAll) <- ~ patID + condi
+```
+
+```{r, eval=FALSE}
+DEres <- DESeq(ddsAll)
+save(DEres, file = "~/Documents/R/drugseq_test/output/DEres_batch1new_htseq_20211125.RData")
+```
+
+```{r}
+load("~/Documents/R/drugseq_test/output/DEres_batch1new_htseq_20211125.RData")
+```
+
+Get results
+```{r}
+allTreat <- patAnno %>% filter(! treatment %in% c("DMSO")) %>%
+  distinct(treatment) %>%
+  pull(treatment)
+
+allRes <- lapply(allTreat, function(tr) {
+  resTab <- results(DEres, 
+                    name = paste0("condi_",tr,"_vs_DMSO"),
+                    tidy = TRUE) %>% mutate(treatment = tr)
+}) %>% bind_rows() %>% mutate(symbol = rowData(ddsDrug)[row,]$symbol)
+```
+
+
+## P-value histogram
+
+```{r, fig.height=6, fig.width=10}
+ggplot(allRes, aes(x=pvalue)) + geom_histogram() +
+  facet_wrap(~treatment) +
+  xlim(0,1)
+```
+
+## Number of significant DE genes 
+
+10% FDR
+```{r,fig.height=5, fig.width=6}
+sumTab <- filter(allRes, padj < 0.1) %>%
+  group_by(treatment) %>% summarise(n=length(row)) %>%
+  arrange(desc(n)) %>% mutate(treatment = factor(treatment, levels = treatment))
+ggplot(sumTab, aes(x=treatment, y=n)) +
+  geom_bar(stat = "identity") +
+  theme(axis.text.x = element_text(angle = 90, vjust=0.5, hjust=1))
+```
+
+
+25% FDR
+```{r,fig.height=5, fig.width=6}
+sumTab <- filter(allRes, padj < 0.25) %>%
+  group_by(treatment) %>% summarise(n=length(row)) %>%
+  arrange(desc(n)) %>% mutate(treatment = factor(treatment, levels = treatment))
+ggplot(sumTab, aes(x=treatment, y=n)) +
+  geom_bar(stat = "identity") +
+  theme(axis.text.x = element_text(angle = 90, vjust=0.5, hjust=1))
+```
+
+## Table of significant associations
+```{r}
+allRes %>% filter(padj <0.10) %>% select(row, symbol, log2FoldChange, pvalue, padj, treatment) %>%
+  mutate_if(is.numeric, formatC, digits=2) %>%
+  DT::datatable()
+```
+
+## Overlap of differentially expressed genes
+```{r, fig.height=10, fig.width=15}
+allRes.sig <- filter(allRes, padj < 0.25)
+geneList <- lapply(unique(allRes.sig$treatment), function(tr) {
+  filter(allRes.sig, treatment == tr)$row
+})
+names(geneList) <- unique(allRes.sig$treatment)
+UpSetR::upset(UpSetR::fromList(geneList), nsets = 50)
+```
+There is not much overlap. Ibrutinib has larger overlap with Duvelisib than with other drugs. 
+
+# Pathway enrichment analysis
+
+```{r, echo=FALSE}
+plotEnrichmentBar <- function(resTab, pCut = 0.05, ifFDR = FALSE, setName = "", title="",
+                              removePrefix = NULL, insideLegend = FALSE) {
+
+    plotTab <- resTab
+
+    if (ifFDR) {
+      plotTab <- dplyr::filter(plotTab, `p adj (dist.dir.up)` <= pCut | `p adj (dist.dir.dn)` <= pCut)
+    } else {
+      plotTab <- dplyr::filter(plotTab, `p (dist.dir.up)` <= pCut | `p (dist.dir.dn)` <= pCut)
+    }
+
+    if (nrow(plotTab) == 0) {
+      print("No sets passed the criteria")
+      return(NULL)
+
+    } else {
+      #firstly, process the result table
+      plotTab <- lapply(seq(nrow(plotTab)), function(i) {
+        x <- plotTab[i,]
+        statSign <- as.numeric(x[3])
+        data.frame(Name = x[[1]], p = as.numeric(ifelse(statSign >= 0, x[[4]], x[[6]])),
+                   geneNum = ifelse(statSign >= 0, x[[8]], x[[9]]),
+                   Direction = ifelse(statSign > 0, "Up", "Down"), stringsAsFactors = FALSE)
+      }) %>% bind_rows()
+
+      if (!is.null(removePrefix)) plotTab <- mutate(plotTab, Name = str_remove(Name, removePrefix))
+
+      plotTab$Name <- sprintf("%s (%s)",plotTab$Name,plotTab$geneNum)
+      plotTab <- plotTab[with(plotTab,order(Direction, p, decreasing=TRUE)),]
+      plotTab$Direction <- factor(plotTab$Direction, levels = c("Up","Down"))
+      plotTab$Name <- factor(plotTab$Name, levels = plotTab$Name)
+      #plot the barplot
+      p <- ggplot(data=plotTab, aes(x=Name, y= -log10(p), fill=Direction)) +
+        geom_bar(position="dodge",stat="identity", width = 0.5) +
+        scale_fill_manual(values=c(Up = "red", Down = "blue")) +
+        coord_flip() + xlab(setName) +
+        ylab(expression(-log[10]*'('*p*')')) +
+        ggtitle(title) + theme_bw() + theme(plot.title = element_text(face = "bold", hjust =0.5),
+                                        axis.title = element_text(size=15))
+
+      if (insideLegend) {
+        p <- p + theme(legend.position = c(0.8,0.1))
+      } else {
+        p <- p + theme(legend.position = "right")
+      }
+    }
+
+
+  return(p)
+}
+```
+
+## ToDo: Use any enrichment method (GSEA)
+
+
+
+## Hallmark
+```{r, fig.height=40, fig.width=8}
+gmts = list(H= "~/Documents/R/drugseq_test/data/h.all.v6.2.symbols.gmt",
+            KEGG = "~/Documents/R/drugseq_test/data/c2.cp.kegg.v6.2.symbols.gmt")
+
+enrichPlot <- lapply(unique(allRes$treatment), function(tr) {
+  inputTab <- allRes %>% filter(pvalue <= 0.05, treatment == tr) %>%
+    arrange(pvalue) %>% distinct(symbol, .keep_all = TRUE) %>%  
+    select(symbol, stat) %>%
+    data.frame() %>% column_to_rownames("symbol")
+  res <- jyluMisc::runGSEA(inputTab, gmts$H, "page")
+  p <- plotEnrichmentBar(res, pCut =0.1, ifFDR= TRUE, setName = "Hallmark", 
+                       title = tr, removePrefix = "HALLMARK_")
+  p
+})
+
+noNULL <- sapply(enrichPlot, is.null)
+cowplot::plot_grid(plotlist= enrichPlot[!noNULL], ncol=1)
+
+```
+
+## KEGG
+```{r, fig.height=50, fig.width=8}
+gmts = list(H= "~/Documents/R/drugseq_test/data/h.all.v6.2.symbols.gmt",
+            KEGG = "~/Documents/R/drugseq_test/data/c2.cp.kegg.v6.2.symbols.gmt")
+
+enrichPlot <- lapply(unique(allRes$treatment), function(tr) {
+  inputTab <- allRes %>% filter(pvalue <= 0.05, treatment == tr) %>%
+    arrange(pvalue) %>% distinct(symbol, .keep_all = TRUE) %>%  
+    select(symbol, stat) %>%
+    data.frame() %>% column_to_rownames("symbol")
+  res <- jyluMisc::runGSEA(inputTab, gmts$KEGG, "page")
+  p <- plotEnrichmentBar(res, pCut =0.1, ifFDR= TRUE, setName = "Hallmark", 
+                       title = tr, removePrefix = "HALLMARK_")
+  p
+})
+noNULL <- sapply(enrichPlot, is.null)
+cowplot::plot_grid(plotlist= enrichPlot[!noNULL], ncol=1)
+
+```
+
+#######################################################################################################
+# Differential expression using camera function from limma package
+
+```{r}
+
+y <- matrix(rnorm(1000*6),1000,6)
+design <- cbind(Intercept=1,Group=c(0,0,0,1,1,1))
+
+# First set of 20 genes are genuinely differentially expressed
+index1 <- 1:20
+y[index1,4:6] <- y[index1,4:6]+1
+
+# Second set of 20 genes are not DE
+index2 <- 21:40
+ 
+res1 <- camera(y, index1, design)
+res2 <- camera(y, index2, design)
+
+res3 <- camera(y, list(set1=index1,set2=index2), design, inter.gene.cor=NA)
+res4 <- camera(y, list(set1=index1,set2=index2), design, inter.gene.cor=0.01)
+
+```
+
+
+
+
+
+
+
+
+
+
+################################################################################################################
+
+# Compare with the RNAseq data from cytokine screen
+
+## Process 
+Preprocessing RNAseq
+```{r}
+drugSeq <- readRDS("../../var/IbrIbetSeq_190807.rds")  # GET FILES
+drugSeq <- estimateSizeFactors(drugSeq)
+drugSeq <- drugSeq[rowSums(counts(drugSeq, normalized = TRUE))> 100,] #filter out genes with low count
+drugSeq.vst <- vst(drugSeq)
+```
+
+
+## Differential expression with DE-Seq
+```{r}
+design(drugSeq) <- ~ patID + treatment
+drugSeq <- DESeq(drugSeq)
+```
+
+### Ibrutinib
+
+Get test results for Ibrutinib
+```{r}
+ibrRes_deseq <- results(drugSeq, contrast = c("treatment", "Ibrutinib","Control"), tidy = TRUE) %>%
+  dplyr::rename(Symbol = "row") %>% arrange(pvalue)
+
+```
+
+### I-BET 762
+
+Get test results for I-BET 762
+```{r}
+ibetRes_deseq <- results(drugSeq, contrast = c("treatment","IBET762","Control"), tidy = TRUE) %>%
+  dplyr::rename(Symbol = "row") %>% arrange(pvalue)
+```
+
+
+## Compare
+
+### Up-regulated (10% FDR)
+
+```{r}
+comList <- list()
+comList[["Ibr_shallow"]] <- unique(filter(allRes, stat >0, treatment =="Ibrutinib", padj < 0.1)$symbol)
+comList[["Ibet_shallow"]] <- unique(filter(allRes, stat >0, treatment =="IBET762", padj < 0.1)$symbol)
+comList[["Ibr_full"]] <- unique(filter(ibrRes_deseq, stat >0, padj < 0.1)$Symbol)
+comList[["Ibet_full"]] <- unique(filter(ibetRes_deseq, stat >0, padj < 0.1)$Symbol)
+```
+
+```{r}
+UpSetR::upset(UpSetR::fromList(comList), nsets = 50)
+```
+
+### Down-regulated (10% FDR)
+
+```{r}
+comList <- list()
+comList[["Ibr_shallow"]] <- unique(filter(allRes, stat <0, treatment =="Ibrutinib", padj < 0.1)$symbol)
+comList[["Ibet_shallow"]] <- unique(filter(allRes, stat <0, treatment =="IBET762", padj < 0.1)$symbol)
+comList[["Ibr_full"]] <- unique(filter(ibrRes_deseq, stat <0, padj < 0.1)$Symbol)
+comList[["Ibet_full"]] <- unique(filter(ibetRes_deseq, stat <0, padj < 0.1)$Symbol)
+```
+
+```{r}
+UpSetR::upset(UpSetR::fromList(comList), nsets = 50)
+```

@@ -1,0 +1,105 @@
+---
+title: "Quality assessment of Salmon untrimmed RNA-Seq data using MatrixQCvis"
+author: "Caroline Lohoff"
+date: "January 28 2022"
+output:
+  BiocStyle::html_document:
+    toc_float: true
+---
+
+Set global options
+```{r setup, include=FALSE, cache = FALSE}
+#knitr::opts_knit$set(root.dir = rprojroot::find_rstudio_root_file())
+knitr::opts_knit$set(root.dir = "~/Documents/R/drugseq_test")
+knitr::opts_chunk$set(warning = FALSE, message = FALSE)
+```
+
+Load packages
+```{r}
+suppressPackageStartupMessages({
+  library(MatrixQCvis)
+  library(DESeq2)
+  library(tidyverse)
+  library(sjmisc)
+})
+```
+
+
+1. Generate SummarizedExperiment object and name it se
+
+2. Start shiny application using shinyQC(se)
+
+# Generate synthetic data
+```{r}
+## create synthetic assay using the generate_synthetic_data function from the proDA package
+library(proDA)
+n_samples <- 40
+n_feat <- 1000
+data <- generate_synthetic_data(n_feat, n_conditions = n_samples / 10, 
+    n_replicates = n_samples / 4, frac_changed = 0.1)
+a <- data$Y
+colnames(a) <- gsub(colnames(a), pattern = "Condition", replacement = "Sample")
+
+## add some treatment-specific effects
+set.seed(1)
+a[, 1:5] <- a[, 1:5] + rnorm(5000, mean = 1.0, sd = 0.5)
+a[, 11:15] <- a[, 11:15] + rnorm(5000, mean = 0.8, sd = 0.5)
+a[, 21:25] <- a[, 21:25] + rnorm(5000, mean = 1.2, sd = 0.5)
+a[, 31:35] <- a[, 31:35] + rnorm(5000, mean = 0.7, sd = 0.5)
+
+## create information on the samples
+type_sample <- gsub(data$groups, pattern = "Condition", replacement = "Type")
+trmt_sample <- paste(
+   c(rep("1", 10), rep("2", 10), rep("3", 10), rep("4", 10)),
+   c(rep("A", 5), rep("B", 5)), sep = "_")
+cD <- data.frame(name = colnames(a), type = type_sample, 
+                     treatment = trmt_sample)
+
+## create information on the proteins
+rD <- data.frame(spectra = rownames(a))
+
+## create se
+se <- SummarizedExperiment(assay = a, rowData = rD, colData = cD)
+```
+
+Start shiny application
+```{r}
+qc <- shinyQC(se)
+```
+
+# Use CLL RNA-Seq data
+
+Load data
+```{r}
+load("./output/ddsDrug_untrimmed_batchPilot1c234_20220131.RData")
+load("./data/patmeta_210324.RData")
+
+# Add columns to DESeq object using patient meta data
+col_vec <- c("diagnosis", "Methylation_Cluster", "trisomy12", "NOTCH1", "TP53",
+             "ATM", "FBXW7", "MED12", "BRAF", "SF3B1", "del11q", "del17p", "del13q")
+ddsDrug@colData@listData <- lapply(col_vec, function(n) {
+  ddsDrug[[n]] <- patMeta[match(ddsDrug$patID, patMeta$Patient.ID), n]
+}) %>% bind_cols() %>% sjmisc::add_columns(ddsDrug@colData@listData)
+
+ddsDrug$IGHVpat <- patMeta[match(ddsDrug$patID, patMeta$Patient.ID),]$IGHV.status
+ddsDrug$IGHV <- ifelse(is.na(ddsDrug$IGHV), ddsDrug$IGHVpat, ddsDrug$IGHV)
+ddsDrug$IGHVpat <- NULL
+names(ddsDrug@colData@listData)[names(ddsDrug@colData@listData) == "Methylation_Cluster"] <- "Methylation"
+```
+
+Create SummarizedExperiment object
+```{r}
+cd <- as.data.frame(ddsDrug@colData@listData)
+colnames(cd)[colnames(cd) == "ID"] <- "name"
+assays <- as.matrix(ddsDrug@assays@data@listData$counts)
+#assays <- replace(assays, assays == 127742, NA)  # find max values of a matrix
+rd <- data.frame(spectra = rownames(assays))
+seCLL <- SummarizedExperiment(assay = assays, rowData = rd, colData = cd)
+saveRDS(seCLL, file = "seCLL.RDS")
+```
+
+Start shiny application
+```{r}
+qcdrug <- shinyQC(seDrug)
+```
+

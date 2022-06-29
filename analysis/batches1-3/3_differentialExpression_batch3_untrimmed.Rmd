@@ -1,0 +1,712 @@
+---
+title: "Detect differential expressed genes of drug treatment of batch 3 untrimmed"
+author: "Caroline Lohoff"
+date: "December 22 2021"
+output:
+  BiocStyle::html_document:
+    toc_float: true
+---
+
+# Load libraries and set options
+
+Set global options
+```{r setup, include=FALSE, cache = FALSE}
+#knitr::opts_knit$set(root.dir = rprojroot::find_rstudio_root_file())
+knitr::opts_knit$set(root.dir = "~/Documents/R/drugseq_test")
+knitr::opts_chunk$set(warning = FALSE, message = FALSE)
+```
+
+Load libraries
+```{r}
+library(DESeq2)
+library(piano)
+library(tidyverse)
+library(clusterProfiler)
+library(enrichplot)
+library(RColorBrewer)
+library(pheatmap)
+```
+
+Set the global ggplot theme
+```{r}
+theme_set(theme_bw() + theme(axis.text = element_text(size=12), 
+                             axis.title = element_text(size=14),
+                             plot.title = element_text(size = 15, hjust =0.5, face="bold")))
+```
+
+# Load data and use only batch 3
+
+```{r}
+load("output/ddsDrug_untrimmed_batch3_andPrevious_20211220.RData")
+load("data/patmeta_210324.RData")
+ddsDrug <- ddsDrug[,ddsDrug$batch == "batch3"]
+```
+
+Add informative columns to the data frame
+```{r}
+col_vec <- c("diagnosis", "trisomy12", "NOTCH1")
+ddsDrug@colData@listData <- lapply(col_vec, function(n) {
+  ddsDrug[[n]] <- patMeta[match(ddsDrug$patID, patMeta$Patient.ID), n]
+}) %>% bind_cols() %>% sjmisc::add_columns(ddsDrug@colData@listData)
+```
+
+Include only CLL samples in analysis
+```{r}
+ddsAll <- ddsDrug[rowData(ddsDrug)$biotype %in% "protein_coding" & !rowData(ddsDrug)$symbol %in% c(NA, ""),
+                  ddsDrug$diagnosis %in% "CLL"] # 201 samples
+
+# Keep only genes with a minimum of 10 counts in any sample
+keep_counts <- apply(counts(ddsAll), 1, function(x) any(x >= 10))  # 22028 genes before filtering
+ddsAll <- ddsAll[keep_counts,]
+dim(ddsAll)  # genes / samples
+```
+
+## Plot gene expression level
+For many samples a boxplot can be created to directly compare the mean expression level.
+```{r plot-expr-level, fig.width=6, fig.height=3}
+# Reshape the df for gene 5010
+as.data.frame(ddsAll@assays@data@listData$counts["ENSG00000141510",]) %>%
+  rownames_to_column() %>%
+  left_join(select(as.data.frame(ddsAll@colData@listData), treatment, ID), by=c("rowname" = "ID")) %>%
+  group_by(treatment) %>%
+  ggplot(aes(x=treatment, y=ddsAll@assays@data@listData$counts["ENSG00000141510",], col=treatment)) +
+  geom_boxplot() +
+  ylab("Raw counts") +
+  ggtitle("Differential gene expression overview of TP53") 
+
+#  geom_boxplot(outlier.shape=4,outlier.size=1,notch=FALSE) +
+#  stat_summary(fun.y=mean, geom="point", shape=5, size=2) +
+#  scale_fill_manual(values=cp)
+```
+Cells treated with Selinexor have a higher median expresion level of TP53 than the other cells.
+
+
+## RNA-Seq count distribution
+To test whether the expression of genes between two or more groups is significantly different, we need an appropriate statistical model which is determined by the count distribution. 
+When we plot the distribution of counts for a single sample, we can visualize key features of RNA-Seq count data, including a large proportion of genes with low raw counts and many genes with zero counts. In comparison, a few genes have a high expression, as there is no maximum limit for reads per gene in RNA-Seq data. If there is no expression variation between biological replicates, a frequently used count distribution known as the Poisson distribution would be an appropriate model. 
+However, there is always biological variation present in RNA-Seq data because the cells from which the RNA is from have been in different steps of the cell cycle or had to deal with different nutrient uptakes. Thus, there is more variation in the data than can be modeled by the Poisson distribution, at least for small numbers of replicates. Therefore, a negative binomial model can serve as a good model choice for DESeq2.
+
+```{r plot-count-distr, fig.width=4, fig.height=2}
+ggplot(as.data.frame(ddsAll@assays@data@listData$counts)) +
+  geom_histogram(aes(x=smp840), stat="bin", bins=200) +
+  labs(x="Raw expression counts", y="Number of genes")
+  #scale_x_continuous(breaks = seq(0, 10, by = 1))
+```
+
+
+## Quality control
+
+### Normalization
+For calculating the normalized counts with DESeq2 we use the function estimateSizeFactors which uses so called size factors. Normalizing means that the raw counts for each sample are divided by the associated sample-specific size factor.
+Once the size factors have been calculated and added to the DESeq2 object, the normalized counts can be extracted from it. Now, the counts are normalized for library size, which is the total number of gene counts per sample, while accounting for library composition. These normalized counts can be used to accurately compare gene expression between samples.
+```{r normalization}
+#ddsAll_norm <- estimateSizeFactors(ddsAll)
+#sizeFactors(ddsAll_norm)
+#normalized_counts <- counts(ddsAll_norm, normalized=TRUE)
+#head(normalized_counts)
+```
+
+### Unsupervised clustering analyses
+We will be using the normalized counts to explore similarities in gene expression between each of our samples, with the expectation that the biological replicates are more similar to each other than the different treatments. We will explore how similar the samples are to each other with regard to gene expression to assess the quality of our experiment. We look for outlier samples and major sources of variation in the data set.
+
+Before using the clustering methods, we should first log transform the normalized counts to improve the visualization of the clustering. Variance stabilization transformation is a good choice for RNA-Seq and already implemented in DESeq2. Vst is a logarithmic transformation that moderates the variance across the mean. 
+```{r vst}
+#ddsAll_vst <- vst(ddsAll_norm, blind=TRUE)
+ddsAll_vst <- vst(ddsAll, blind=TRUE)
+```
+
+With heatmaps we can assess the similarities of the different samples. Can we see different clusters? Are the biological replicates similar to each other? A heatmap is created by using the gene expression correlation values for all pairwise combinations of samples in the dataset, with 1 being a perfect correlation. Generally, samples have a high corelation to each other, since we expect that only a few genes are differentially expressed. Thus, correlation values below 0.8 should be investigated further.
+```{r heatmap, fig.width=4, fig.height=3}
+ddsAll_vst %>% assay() %>% # Extract the vst normalized counts
+  cor() %>% # Compute pairwise correlation values between each pair of samples
+  #pheatmap()
+  pheatmap(annotation = as.data.frame(ddsAll_vst@colData@listData$treatment))
+  #pheatmap(annotation = select(as.data.frame(ddsAll_vst@colData@listData), treatment)) # header: add the condition column (or several columns as a vector))
+```
+Based on the clustering, it is likely that the differentially expressed genes between the two conditions drive the separation. If this is not the case, the heatmap could be plotted with all other metadata to find the factors that are responsible for the separation of the biological replicates.
+
+With the PCA we should get similar results than with the heatmap. An outlier sample should be detectable with both methods. PCA is a method to emphasize the variance in a dataset and to explore the quality of the data. Biological replicates should cluster together, whereas conditions should be separated. With PCA it is easy to identidy sample outliers and major sources of variation.
+DESeq2 has an implemented method for plotting a PCA and takes as input the vst dds object. The intgroup argument specifies which groups should be colored.
+
+```{r pca, fig.width=4, fig.height=3}
+plotPCA(ddsAll_vst, intgroup="condition")
+```
+
+
+# Differential expression using DESeq
+
+Differential expression analysis of genomic data types uses linear models to determine the size and direction of the changes in gene expression. DESeq2 performs a differential gene expression analysis based on the negative binomial distribution to model the raw count data. DESeq2 is very stringent and has a good balance between sensitivity and specificity. Thus, it is still sensitive and robust when it comes to small samples sizes. 
+
+As input for DESeq2 unnormalized counts are used that were not adjusted for library size, which is the total number of reads counted per sample. DESeq2 assumes the input is raw counts and will internally correct for the library size when performing analysis.
+
+## Create design matrix
+
+```{r}
+patAnno <- data.frame(colData(ddsAll)) %>%
+  dplyr::select(patID, treatment) %>%
+  mutate(treatment = str_replace_all(treatment,"[- ]","_")) %>%
+  mutate(treatment = factor(treatment,
+                          levels = c("DMSO",setdiff(unique(treatment),"DMSO"))))
+designMat <- model.matrix(~ 0 + treatment + patID, patAnno)
+```
+
+```{r}
+ddsAll$condi <- factor(str_replace_all(ddsAll$treatment,"[- ]","_"))
+ddsAll$condi <- factor(ddsAll$condi,
+                       levels = c("DMSO",setdiff(levels(ddsAll$condi),c("DMSO"))))
+ddsAll$patID <- factor(ddsAll$patID)
+design(ddsAll) <- ~ patID + condi
+```
+
+## Modelling raw counts for each gene
+
+First, we might have to create the dds object again in case we found any outlier samples in the PCA or heatmap plots. These outlier samples are excluded from further analysis. Furthermore, if other sources of variation than treatment have been found in the QC, we should add them to the design formula.
+
+Then, we fit the raw counts (not vst normalized) to the negative binomial model. The DESeq function fills in the empty slots in the dds object. The final dds object contains all the information needed for performing DE testing between specific sample groups. New information such as shrunken dispersions, model coefficients, Wald test results, and gene-wise dispersions will be added to the dds object. 
+```{r, eval=FALSE}
+DEres <- DESeq(ddsAll)
+save(DEres, file = "output/DEres_batch3_untrimmed_20211221.RData")
+```
+
+Get results
+```{r}
+load("output/DEres_batch3_untrimmed_20211221.RData")
+```
+
+
+### Statistics (Variance and mean)
+Now, we should explore how well our data fit the model.
+The goal of the DE analysis is to determine whether a gene's mean expression between sample groups is different given the variation within groups. This is determined by testing the probability of the log2 fold changes between groups being significantly different from zero:
+Log2(mean(treatment)/mean(control)) =/ 0
+Therefore, to model the counts requires information about the mean and variation in the data. To explore the variation in the data, we will observe the variance in gene expression relative to the mean. Variance is the square of the standard deviation, representing how far away the expression of the individual samples are from the means. For RNA-Seq data the variance is expected to increase with the genes mean expression.
+To observe this relationship, we can calculate the means and variances for every gene of the normal samples using the apply function: 
+```{r plot-variance-mean, fig.width=4, fig.height=3}
+# Calculating mean for each gene (=each row) of normal samples
+mean_counts <- apply(rawcounts_df[, 1:3], 1, mean)
+# Calculating variance for each gene (=each row) of normal samples
+variance_counts <- apply(rawcounts_df[, 1:3], 1, var)
+# Creating a data frame
+statistics_df <- data.frame(mean_counts, variance_counts)
+# Plotting the statistics
+ggplot(statistics_df) +
+  geom_point(aes(x=mean_counts, y=variance_counts)) +
+               scale_y_log10() +
+               scale_y_log10() +
+               labs(x="Mean counts per gene", y="Variance per gene") +
+               ggtitle("Statistics for normal samples")
+```
+Usually, this plot should show a diagonal for RNA-Seq data. Also, the range and values for variance is greater for lower mean counts than for higher mean counts.
+
+
+
+
+```{r}
+allTreat <- patAnno %>% filter(! treatment %in% c("DMSO")) %>%
+  distinct(treatment) %>%
+  pull(treatment)
+
+allRes <- lapply(allTreat, function(tr) {
+  resTab <- results(DEres, 
+                    name = paste0("condi_",tr,"_vs_DMSO"),
+                    tidy = TRUE) %>% mutate(treatment = tr)
+}) %>% bind_rows() %>%
+  mutate(Symbol = rowData(ddsDrug)[row,]$symbol, .before="baseMean") %>%
+  rename(Ensembl = row)
+```
+
+## P-value histogram
+
+What do we see in this plot?
+The histograms are showing the distribution of p-values versus the number of counted genes per drug treatment.
+
+```{r, fig.height=6, fig.width=10}
+ggplot(allRes, aes(x=pvalue)) + geom_histogram() +
+  facet_wrap(~treatment) + xlim(0,1)
+```
+
+## Number of significant DE genes
+
+10% FDR
+```{r,fig.height=5, fig.width=6}
+sumTab <- filter(allRes, padj < 0.1) %>%
+  group_by(treatment) %>% summarise(n=length(row)) %>%
+  arrange(desc(n)) %>% mutate(treatment = factor(treatment, levels = treatment))
+ggplot(sumTab, aes(x=treatment, y=n)) +
+  geom_bar(stat = "identity") +
+  theme(axis.text.x = element_text(angle = 90, vjust=0.5, hjust=1))
+```
+
+25% FDR
+```{r,fig.height=5, fig.width=6}
+sumTab <- filter(allRes, padj < 0.25) %>%
+  group_by(treatment) %>% summarise(n=length(row)) %>%
+  arrange(desc(n)) %>% mutate(treatment = factor(treatment, levels = treatment))
+ggplot(sumTab, aes(x=treatment, y=n)) +
+  geom_bar(stat = "identity") +
+  theme(axis.text.x = element_text(angle = 90, vjust=0.5, hjust=1))
+```
+
+## Table of significant associations
+
+```{r, warning=FALSE}
+allRes %>% filter(padj <0.10) %>% select(row, symbol, log2FoldChange, pvalue, padj, treatment) %>%
+  mutate_if(is.numeric, formatC, digits=2) %>%
+  DT::datatable()
+```
+
+## Overlap of differentially expressed genes
+
+Prepare gene lists with all significant genes per treatment
+
+```{r}
+allRes.sig <- filter(allRes, padj < 0.25)
+geneList <- lapply(unique(allRes.sig$treatment), function(tr) {
+  filter(allRes.sig, treatment == tr)$row
+  })
+names(geneList) <- unique(allRes.sig$treatment)
+```
+
+```{r, fig.height=10, fig.width=15}
+UpSetR::upset(UpSetR::fromList(geneList), nsets = 50)
+```
+There is not much overlap. Ibrutinib has a larger overlap with Duvelisib than with other drugs.
+
+
+
+
+
+# Pathway enrichment analysis
+
+## Gene Set Enrichment Analysis with the Camera function from limma
+
+This method was proposed by Wu and Smyth in 2012. 'camera' performs a competitive test in the sense defined by Goeman and Buhlmann (2007). It tests whether the genes in the set are highly ranked in terms of differential expression relative to genes not in the set. It has similar aims to 'geneSetTest' but accounts for inter-gene correlation.
+
+Prepare gene lists
+```{r}
+#Define function for converting dataframe into list
+geneList <- function(source) {
+  pathwayNames <- levels(source$term)
+  newList<- vector("list")
+
+  for (pathway in pathwayNames) {
+    genes <- source$gene[source$term == pathway]
+    newList[[length(newList) + 1]] <- genes 
+    # alternative would be list.append function from rlist
+  }
+  names(newList) <- pathwayNames
+  
+  return(newList)
+}
+```
+
+```{r}
+#Load gene lists
+gmt_hallmark_entrez <- read.gmt("data/h.all.v7.4.entrez.gmt.txt")
+gmt_hallmark_symbols <- read.gmt("data/h.all.v7.4.symbols.gmt.txt")
+gmt_KEGG <- read.gmt("data/c2.cp.kegg.v7.4.symbols.gmt.txt")
+
+#Convert df into list of character vectors
+geneList_entrez <- geneList(gmt_hallmark_entrez)
+geneList_symbols <- geneList(gmt_hallmark_symbols)
+geneList_kegg <- geneList(gmt_KEGG)
+```
+
+Get count matrix and translate Ensembl gene IDs to Entrez IDs or gene symbols
+```{r}
+library(org.Hs.eg.db)
+library(annotate)
+
+#Get count matrix
+counts_df <- as.data.frame(ddsAll@assays@data@listData$counts)
+dim(counts_df)
+
+# Create new df with Entrez IDs as row names
+entrezID = mapIds(org.Hs.eg.db,
+                    keys=row.names(counts_df), #Column containing Ensembl gene ids
+                    column="ENTREZID",
+                    keytype="ENSEMBL",
+                    multiVals="first")
+
+counts_df_entrez <- add_column(counts_df, entrezID, .before = "smp856") %>%
+  drop_na(entrezID) %>%
+  distinct(entrezID, .keep_all = TRUE) %>%
+  remove_rownames %>% column_to_rownames(var="entrezID")
+
+dim(counts_df_entrez)  # 1441 genes were lost during translation or due to duplicates
+
+# Create new df with gene symbols as row names
+gene_symbols <- getSYMBOL(na.omit(as.vector(entrezID)), data='org.Hs.eg')
+
+counts_df_symbols <- add_column(counts_df_na, gene_symbols, .before = "smp856") %>%
+  dplyr::select(-entrezID) %>%
+  drop_na(gene_symbols) %>%
+  distinct(gene_symbols, .keep_all = TRUE) %>%
+  remove_rownames %>% column_to_rownames(var="gene_symbols")
+
+dim(counts_df_symbols)  # 1441 genes were lost in total
+```
+
+Run camera function
+```{r}
+limmaRes_entrez <- limma::camera(counts_df_entrez, geneList_entrez, designMat, inter.gene.cor=0.01)
+limmaRes_symbols <- limma::camera(counts_df_symbols, geneList_symbols, designMat, inter.gene.cor=0.01)
+limmaRes_KEGG <- limma::camera(counts_df_symbols, geneList_kegg, designMat, inter.gene.cor=0.01)
+```
+
+The problem is that the results is a data frame combining all treatments and patients. In order to account for the different treatments, the count matrix should only contain the samples treated with the same drug. After that, camera function has to be used for every of the 10 count matrices individually. The resulting 10 data frames can be combined in a list. 
+
+Use camera function on every treatment individually
+```{r}
+treatment_names <- c("Nutlin3a", "Ibrutinib", "MK2206", "Trametinib", "C26", "Ibr_x_C26", "Selinexor", "Duvelisib", "Everolimus")
+rows_subset <- list(c(3:32), c(2, 4:32), c(2:3, 5:32), c(2:4, 6:32), c(2:5, 7:32),
+                 c(2:6, 8:32), c(2:7, 9:32), c(2:8, 10:32), c(2:9, 11:32))
+
+#Function
+subsetTreatment <- function(countsDF, geneList) {
+  cameraList <- vector("list")
+  
+  for (drug in rows_subset) {
+    designMat_subset <- as.data.frame(designMat[, -drug])
+    designMat_subset <- dplyr::filter_at(designMat_subset, vars(starts_with("treatment")), any_vars(. != 0))
+    designMat_subset <- cbind(Intercept = 1, designMat_subset)
+    designMat_subset <- designMat_subset[, -2]
+
+    counts_df_subset <- countsDF[, names(countsDF)[(names(countsDF) %in% row.names(designMat_subset))]]
+
+    cameraRes <- limma::camera(counts_df_subset, geneList, designMat_subset, inter.gene.cor=0.01)
+  
+    cameraList[[length(cameraList) + 1]] <- cameraRes
+  }
+  names(cameraList) <- treatment_names
+  return(cameraList)
+}
+```
+
+```{r}
+cameraRes_symbols <- subsetTreatment(counts_df_symbols, geneList_symbols)
+cameraRes_entrez <- subsetTreatment(counts_df_entrez, geneList_entrez)
+cameraRes_kegg <- subsetTreatment(counts_df_symbols, geneList_kegg)
+```
+
+Table of results
+```{r}
+head(limmaRes_entrez)
+```
+
+```{r}
+head(limmaRes_symbols)
+```
+As we can see in the table of results, it makes no difference if we use ENTREZ IDs or gene symbols. As gene symbols are better readable for humans, gene symbols will be preferred in future analyses.
+
+```{r}
+head(limmaRes_KEGG)
+```
+
+Create plots
+
+
+
+## Gene Set Enrichment Analysis with ClusterProfiler
+
+ClusterProfiler is a universal enrichment tool for interpreting omics data and supports several ontology and pathway annotations (https://doi.org/10.1016/j.xinn.2021.100141). Both over-representation analysis and gene set enrichment analysis are supported. 
+The advantage is that datasets obtained from multiple treatments can be analyzed and compared in a single run, easily revealing functional consensus and differences among distinct conditions.
+
+```{r, warning=FALSE}
+# Load the annotation for homo sapiens
+organism = "org.Hs.eg.db"
+BiocManager::install(organism, character.only = TRUE)
+library(organism, character.only = TRUE)
+
+# Check which source of annotations (gene ids) are available 
+keytypes(org.Hs.eg.db) 
+
+# Prepare the input for ClusterProfiler
+geneList_LFC <- lapply(unique(allRes$treatment), function(tr) {
+  filter(allRes, treatment == tr)$log2FoldChange
+  })
+names(geneList_LFC) <- unique(allRes$treatment)
+
+gseGO_results <- vector("list", length(geneList_LFC))
+j <- 1
+
+for(tr in names(geneList_LFC)) {
+  names(geneList_LFC[[tr]]) <- filter(allRes, treatment == tr)$row  # or $symbol
+  geneList_LFC[[tr]] <- na.omit(geneList_LFC[[tr]]) 
+  geneList_LFC[[tr]] <- sort(geneList_LFC[[tr]], decreasing = TRUE) 
+  
+  # Run ClusterProfiler on every treatment
+  gseGO_results[[j]] <- gseGO(geneList=geneList_LFC[[tr]], 
+             ont ="ALL", 
+             keyType = "ENSEMBL", 
+             minGSSize = 3,      # minimal size of each geneSet
+             maxGSSize = 800,    # maximal size of each geneSet
+             pvalueCutoff = 0.1, 
+             verbose = TRUE, 
+             OrgDb = organism, 
+             pAdjustMethod = "BH")
+  names(gseGO_results)[j] <- tr
+  j <- j + 1
+}
+
+# Check first and last elements of treatment list for one drug
+head(geneList_LFC$Duvelisib, 10)
+tail(geneList_LFC$Duvelisib, 10)
+```
+
+## Results with ClusterProfiler
+
+Table of results
+```{r}
+head(gseGO_results$Duvelisib@result)
+```
+
+### Barplot
+
+```{r fig.width=15, fig.height=8}
+# Define function for barplot
+plot_significant_pathways <- function(enrichmentDF, score, title){
+
+  ## Filter interesting pathways by using the enrichment score
+  top_pathways <- enrichmentDF[enrichmentDF$NES <= -score | enrichmentDF$NES >= score, ]
+
+  plot <- ggplot(top_pathways,
+                 aes(x = reorder(Description,-NES), y = NES, fill = p.adjust)) +
+          geom_bar(stat = "identity") +
+          coord_flip() +
+          ggtitle(title) +
+          xlab("Pathway") +
+          scale_colour_gradient2(low="indianred", mid="whitesmoke", high="darkblue",
+                                 midpoint = 0.02, aesthetics="fill") +
+          theme(plot.title.position = "plot",
+                axis.title.x=element_text(size=14,face="bold"),
+                axis.title.y=element_text(size=14,face="bold"),
+                axis.text.y=element_text(size=10,face="bold"))
+
+  return(plot)
+}
+
+# Plot most important pathways of every drug treatment as barplot
+j <- 1
+for(i in gseGO_results) {
+  print(head(i@result))
+  if (nrow(i@result)) {
+    barplot <- plot_significant_pathways(i@result, score = 1.0, title=paste("Barplot", names(gseGO_results)[j],sep=" "))
+    print(barplot)
+  }
+  j <- j+1
+}
+```
+
+### Dotplot
+
+```{r echo=TRUE, fig.width=15, fig.height=8}
+j <- 1
+for(i in gseGO_results) {
+  if (nrow(i@result)) {
+    print(dotplot(i, showCategory=10, split=".sign") + facet_grid(.~.sign) +
+            ggtitle(paste("Most significant pathways after", names(gseGO_results)[j], "treatment")))
+  }
+  j <- j+1
+}
+```
+
+### Encrichment plot map
+
+Enrichment map organizes enriched terms into a network with edges connecting overlapping gene sets. In this way, mutually overlapping gene sets are tend to cluster together, making it easy to identify functional modules.
+
+Params: **showCategory** Select the displayed terms. It can be a number of a vector of terms. **layout** change the layout of map, e.g. layout = 'star', 'circle', 'gem', 'dh', 'graphopt', 'grid', 'mds', 'randomly', 'fr', 'kk', 'drl' or 'lgl'.
+
+```{r echo=TRUE}
+j <- 1
+for(i in gseGO_results) {
+  if (nrow(i@result)) {
+    map <- pairwise_termsim(i)
+    print(emapplot(map, showCategory=10) + 
+            ggtitle(paste("Overlapping gene sets after", names(gseGO_results)[j], "treatment")))
+  }
+  j <- j+1
+}
+```
+
+### Category Netplot
+
+The cnetplot depicts the linkages of genes and biological concepts (e.g. GO terms or KEGG pathways) as a network. This might be helpful to identify genes which are involved in enriched pathways or may belong to multiple annotation categories.
+
+```{r fig.width=18}
+library(ggnewscale)
+cnetplot1 <- cnetplot(gseGO_results$Selinexor, categorySize="pvalue", foldChange=geneList_LFC$Selinexor, showCategory = 3) +
+  ggtitle(names(gseGO_results$Selinexor))
+cnetplot2 <- cnetplot(gseGO_results$Duvelisib, categorySize="pvalue", foldChange=geneList_LFC$Duvelisib, showCategory = 3)
+
+cowplot::plot_grid(cnetplot1, cnetplot2, ncol=2, labels="AUTO")
+```
+
+### Ridgeplot
+
+Helpful to interpret up/down-regulated pathways.
+
+```{r fig.width=15, fig.height=10, message=FALSE, warning=FALSE}
+library(ggridges)
+j <- 1
+for(i in gseGO_results) {
+  if (nrow(i@result)) {
+    print(ridgeplot(i) + labs(x = "enrichment distribution") +
+            ggtitle(names(gseGO_results)[j]) + theme(plot.title = element_text(size = 20)))
+  }
+  j <- j+1
+}
+```
+
+### GSEA Plot
+
+Traditional method for visualizing GSEA result.\
+Plot of the Running Enrichment Score (green line) for a gene set as the analysis walks down the ranked gene list, including the location of the maximum enrichment score (the red line). The black lines in the Running Enrichment Score show where the members of the gene set appear in the ranked list of genes, indicating the leading edge subset.
+
+The Ranked list metric shows the value of the ranking metric (log2 fold change) as you move down the list of ranked genes. The ranking metric measures a gene's correlation with a phenotype.
+
+```{r fig.height=6}
+gseaplot(gseGO_results$Duvelisib, by = "all", title = gseGO_results$Duvelisib$Description[1], geneSetID = 1)
+```
+
+### PubMed trend of enriched terms
+
+Plots the number of publications trend based on the query result from PubMed Central.
+
+```{r fig.width=10}
+library("europepmc")
+terms <- gseGO_results$Duvelisib$Description[1:3]
+pmcplot(terms, 2010:2020, proportion=FALSE)
+```
+
+## KEGG Gene Set Enrichment Analysis
+
+For KEGG pathway enrichment using the `gseKEGG()` function, the id types need to be converted by using the `bitr` function (included in clusterProfiler). In the `bitr` function, the parameter `fromType` should be the same as `keyType` from the `gseGO` function above (the annotation source). `toType` in the `bitr` function has to be one of the available options from `keyTypes(org.Dm.eg.db)` and must map to one of 'kegg', 'ncbi-geneid', 'ncib-proteinid' or 'uniprot' because `gseKEGG()` only accepts one of these 4 options as it's `keytype` parameter. In the case of org.Dm.eg.db, none of those 4 types are available, but 'ENTREZID' are the same as ncbi-geneid for org.Dm.eg.db so we use this for `toType`.
+
+* organism: KEGG Organism Code (<https://www.genome.jp/kegg/catalog/org_list.html> (need the 3 letter code)).
+* minGSSize: minimal size of each geneSet for analyzing.\
+* maxGSSize: maximal size of genes annotated for testing.\
+* pvalueCutoff: pvalue Cutoff.\
+* pAdjustMethod: one of "holm", "hochberg", "hommel", "bonferroni", "BH", "BY", "fdr", "none".\
+* keyType: one of 'kegg', 'ncbi-geneid', 'ncib-proteinid' or 'uniprot'.
+
+Prepare input and run gene set enrichment
+```{r, warning=FALSE, message=FALSE}
+### ID table will be the same for every drug. Thus, it is sufficient to do the following 2 operations for only one drug.
+
+# Convert gene IDs for gseKEGG function (some genes will get lost as not all IDs will be converted)
+id_table <- bitr(names(geneList_LFC$Ibrutinib), fromType = "ENSEMBL", toType = "ENTREZID", OrgDb=organism)
+id_table_dup <- id_table[!duplicated(id_table[c("ENSEMBL")]),]   # remove duplicate IDS
+
+### Create a new dataframe containing only genes and corresponding ENTREZ IDs which were successfully mapped
+kegg_df <- lapply(names(geneList_LFC), function(tr) {
+  allRes %>%
+    filter(treatment == tr, row %in% id_table_dup$ENSEMBL) %>%
+    add_column(ENTREZID = id_table_dup$ENTREZID)
+})
+names(kegg_df) <- names(geneList_LFC)
+
+### Create a vector of the gene universe for every drug
+geneList_KEGG <- lapply(names(geneList_LFC), function(tr) {
+  kegg_df[[tr]]$log2FoldChange
+})
+names(geneList_KEGG) <- names(geneList_LFC)
+
+### Prepare KEGG results list
+gseKEGG_results <- vector("list", length(geneList_KEGG))
+j <- 1
+
+for(tr in names(geneList_KEGG)) {
+  names(geneList_KEGG[[tr]]) <- kegg_df[[tr]]$ENTREZID    # name vector with ENTREZ ids
+  geneList_KEGG[[tr]] <- na.omit(geneList_KEGG[[tr]])    # omit any NA values 
+  geneList_KEGG[[tr]] <- sort(geneList_KEGG[[tr]], decreasing = TRUE)  # sort list in decreasing order
+  
+  ### Create gseKEGG object
+  gseKEGG_results[[j]] <- gseKEGG(geneList = geneList_KEGG[[tr]],
+               organism     = "hsa",  # Homo sapiens
+               minGSSize    = 3,
+               maxGSSize    = 800,
+               pvalueCutoff = 0.3,
+               pAdjustMethod = "BH",
+               keyType       = "kegg")
+  names(gseKEGG_results)[j] <- tr
+  j <- j + 1
+}
+
+```
+
+## Results with KEGG
+
+```{r}
+head(dplyr::arrange(gseKEGG_results$Duvelisib, p.adjust), 10)
+```
+
+### Barplots of most important pathways per drug treatment
+
+```{r echo=TRUE}
+j <- 1
+for(i in gseKEGG_results) {
+  if (nrow(i@result)) {
+    barplot <- plot_significant_pathways(i@result, score = 1.0,
+                                         title=paste("Barplot", names(gseKEGG_results)[j],sep=" "))
+    print(barplot)
+  }
+  j <- j+1
+}
+```
+
+### Dotplot
+
+```{r echo=TRUE}
+dotplot(gseKEGG_results$Duvelisib, showCategory = 10, title = "Enriched Pathways Duvelisib" , split=".sign") + facet_grid(.~.sign)
+```
+
+### Encrichment plot map
+
+The enrichment map organizes enriched terms into a network with edges connecting overlapping gene sets. In this way, mutually overlapping gene sets tend to cluster together, making it easy to identify functional modules.
+
+```{r echo=TRUE}
+Duvelisib_mod <- pairwise_termsim(gseKEGG_results$Duvelisib)
+emapplot(Duvelisib_mod, showCategory = 10, layout='star')
+```
+
+### Category Netplot
+
+```{r fig.width=12}
+cnetplot(gseKEGG_results$Duvelisib, categorySize="pvalue", foldChange=geneList_KEGG$Duvelisib)
+```
+
+### Ridgeplot
+
+Helpful to interpret up/down-regulated pathways.
+
+```{r fig.width=18, fig.height=12, message=FALSE, warning=FALSE}
+ridgeplot(gseKEGG_results$Duvelisib) + labs(x = "enrichment distribution") + ggtitle("Ridgeplot Duvelisib")
+```
+
+### GSEA Plot
+
+**Gene Set** Integer. Corresponds to gene set in the gse object. The first gene set is 1, second gene set is 2, etc. Default: 1
+
+```{r fig.height=6}
+gseaplot(gseKEGG_results$Duvelisib, by = "all", title = gseKEGG_results$Duvelisib$Description[1], geneSetID = 1)
+```
+
+### Pathview
+
+This will create a PNG of the enriched KEGG pathway. The enriched pathways & the pathway ID are provided in the kegg_results output table (above). Here, we have chosen the fourth most enriched pathway after treatment with Duvelisib, the graft-versus-host disease (id: hsa05332).
+
+```{r, message=F, warning=F, echo = TRUE}
+library(pathview)
+# Produce the native KEGG plot (PNG)
+dme <- pathview(gene.data=geneList_KEGG$Duvelisib, pathway.id="hsa05332", species = "hsa")
+```
+
+```{r pressure, echo=TRUE, fig.cap="KEGG Native Enriched Pathway Plot", out.width = '100%'}
+knitr::include_graphics("hsa05332.pathview.png")
+```
+
+# Session Info Details
+
+```{r, echo=FALSE, eval=TRUE}
+sessionInfo()
+```

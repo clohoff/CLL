@@ -1,0 +1,176 @@
+---
+title: "Quality assessment of drug perturbation RNAseq data (batch 1 combined Salmon untrimmed)"
+author: "Caroline Lohoff"
+date: "December 21 2021"
+output:
+  BiocStyle::html_document:
+    toc_float: true
+---
+
+# Load data and packages
+
+Packages
+```{r, message=FALSE, warning=FALSE}
+library(DESeq2)
+library(RColorBrewer)
+library(pheatmap)
+library(tidyverse)
+
+knitr::opts_chunk$set(warning = FALSE, message = FALSE)
+```
+
+Load data
+```{r}
+load("~/Documents/R/drugseq_test/output/ddsDrug_untrimmed_batch1combined_20211221.RData")
+load("~/Documents/R/drugseq_test/data/patmeta_210324.RData")
+```
+
+Global ggplot variables
+```{r}
+#set the global ggplot theme
+theme_set(theme_bw() + theme(axis.text = element_text(size=12), 
+                             axis.title = element_text(size=14),
+                             plot.title = element_text(size = 15, hjust =0.5, face="bold")))
+```
+
+# Distribution of raw counts
+
+## Before normalization
+```{r, fig.width=20, fig.height=5}
+patAnno <- colData(ddsDrug) %>% as_tibble()
+plotTab <- data.frame(counts(ddsDrug)) %>% 
+  rownames_to_column("id") %>%
+  gather(key= "ID", value = "count",-id) %>%
+  dplyr::filter(count > 0) %>%
+  mutate(batch = patAnno[match(ID, patAnno$ID),]$batch)
+
+ggplot(plotTab, aes(x= ID, y= log10(count), fill = batch)) +
+  geom_boxplot() + theme_bw() + 
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1))
+
+```
+
+## After normalization
+```{r,fig.width=15, fig.height=5}
+plotTab <- data.frame(counts(ddsDrug, normalized = TRUE)) %>% 
+  rownames_to_column("id") %>%
+  gather(key= "ID", value = "count",-id) %>%
+  dplyr::filter(count > 0) %>%
+  mutate(batch = patAnno[match(ID, patAnno$ID),]$batch)
+
+ggplot(plotTab, aes(x= ID, y= log10(count), fill = batch)) +
+  geom_boxplot() + theme_bw() + 
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1))
+```
+
+## After normalization (Pilot and batch 1 combined)
+```{r,fig.width=15, fig.height=5}
+plotTab_batch1c <- dplyr::filter(plotTab, batch == c("pilot", "batch1combined"))
+
+ggplot(plotTab_batch1c, aes(x= ID, y= log10(count), fill = batch)) +
+  geom_boxplot() + theme_bw() + 
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1))
+```
+
+## After normalization (Batch 1 combined & Batch 1 new)
+```{r,fig.width=15, fig.height=5}
+plotTab_batch1n <- dplyr::filter(plotTab, batch == c("batch1", "batch1combined"))
+
+ggplot(plotTab_batch1n, aes(x= ID, y= log10(count), fill = batch)) +
+  geom_boxplot() + theme_bw() + 
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1))
+```
+
+## After normalization (Batch 1 combined & Batch 1 old)
+```{r,fig.width=15, fig.height=5}
+plotTab_batch1o <- dplyr::filter(plotTab, batch == c("batch1old", "batch1combined"))
+
+ggplot(plotTab_batch1o, aes(x= ID, y= log10(count), fill = batch)) +
+  geom_boxplot() + theme_bw() + 
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1))
+```
+
+# Check ECDFs
+
+```{r}
+# Remove rows/genes with too few counts
+keep <- apply(counts(ddsDrug), 1, function(x) any(x >= 10))
+ddsAll <- ddsDrug[keep,]
+# Only use protein coding genes
+ddsAll <- ddsAll[rowData(ddsAll)$biotype %in% "protein_coding",]
+# Remove sex chromosome genes
+ddsAll <- ddsAll[!rowData(ddsAll)$chromosome %in% c("X","Y")]
+#Variance stabilization transformation of the raw data
+RNAnorm.all <- vst(ddsAll)
+```
+
+```{r, fig.width=15, fig.height=7, cache=TRUE}
+# Successful normalization should lead to overlapped curves
+par(mfrow = c(1,2))
+geneplotter::multidensity(assay(RNAnorm.all), xlim = c(0,30), legend = F, xlab = "mean counts")
+geneplotter::multiecdf(assay(RNAnorm.all), legend = F, xlab="mean counts")
+```
+
+
+# Clustering
+
+## PCA
+
+### Calculate PCA
+```{r, fig.height=6, fig.width=8}
+#invariant filtering
+exprMat <- assay(RNAnorm.all)
+sds <- rowSds(exprMat)
+exprMat <- exprMat[order(sds, decreasing  = T)[1:5000],]
+
+#calculate pca 
+pcaRes <- prcomp(t(exprMat), scale. = TRUE, center=TRUE)
+varExp <- (pcaRes$sdev^2 / sum(pcaRes$sdev^2))*100
+pcaTab <- data.frame(pcaRes$x[,1:10]) %>% rownames_to_column("ID") %>%
+  left_join(patAnno)
+names(varExp) <- colnames(pcaRes$x)
+```
+
+### PCA colored by batch
+```{r}
+ggplot(pcaTab, aes(x=PC1,y=PC2, col = batch)) + geom_point() + theme_bw() + 
+  xlab(sprintf("PC1 (%2.1f%%)",varExp[1])) + ylab(sprintf("PC2 (%2.1f%%)",varExp[2])) 
+```
+The batches are not separated by PC1 or PC2.
+
+
+### PCA colored by treatment
+```{r}
+ggplot(pcaTab, aes(x=PC1,y=PC2, col = treatment)) + geom_point() + theme_bw() + 
+  xlab(sprintf("PC1 (%2.1f%%)",varExp[1])) + ylab(sprintf("PC2 (%2.1f%%)",varExp[2])) 
+```
+The treatments are not separated by the principal components. Only the baseline samples of batch1 and batch1old are separated by PC2. 
+
+### PCA colored by patientID
+```{r}
+ggplot(pcaTab, aes(x=PC1,y=PC2, col = patID)) + geom_point() + theme_bw() + 
+  xlab(sprintf("PC1 (%2.1f%%)",varExp[1])) + ylab(sprintf("PC2 (%2.1f%%)",varExp[2])) 
+```
+
+## Sample distance
+```{r, fig.width=20, fig.height=20}
+sampleDists <- dist(t(assay(RNAnorm.all)))
+sampleDistMat <- as.matrix(sampleDists)
+annoCol <- patAnno %>% select(expID, expBatch, patID, FSC.SSC.norm, treatment, time, batch, ID) %>%
+  data.frame() %>% column_to_rownames("ID")
+#Plot heatmap
+colors <- colorRampPalette( rev(brewer.pal(9,"Blues")) )(255)
+pheatmap(sampleDistMat, color = colors, clustering_distance_rows = sampleDists, clustering_distance_cols = sampleDists, annotation_col = annoCol, clustering_method = "ward.D2",
+         labels_col = paste0(patAnno[colnames(sampleDistMat),]$patID,"_",
+                             patAnno[colnames(sampleDistMat),]$treatment))
+```
+
+
+## Sample similarity
+```{r, fig.width=20, fig.height=20}
+sampleSimMat <- cor(assay(RNAnorm.all))
+pheatmap(sampleSimMat, annotation_col = annoCol,
+          clustering_method = "ward.D2",
+         labels_col = paste0(patAnno[colnames(sampleSimMat),]$patID,"_",
+                             patAnno[colnames(sampleSimMat),]$treatment))
+```

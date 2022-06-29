@@ -1,0 +1,81 @@
+---
+title: "Check alignment quality by STAR of batch 1 new, old, and combined"
+author: "Caroline Lohoff (based on code from Junyan Lu)"
+date: "December 22 2021"
+output:
+  BiocStyle::html_document:
+    toc_float: true
+---
+
+# Set options and load packages and data
+
+Set global options
+```{r setup, include=FALSE, cache = FALSE}
+#knitr::opts_knit$set(root.dir = rprojroot::find_rstudio_root_file())
+knitr::opts_knit$set(root.dir = "~/Documents/R/drugseq_test")
+knitr::opts_chunk$set(warning = FALSE, message = FALSE)
+```
+
+Load packages
+```{r}
+library(tidyverse)
+```
+
+Load patient annotation information into data frame
+```{r}
+patAnno <- readxl::read_xlsx("./data/RNAseq_samples_pilot_batch1old_new_combined.xlsx") %>%
+  mutate(fileName = str_replace(fileName, ".txt.gz","")) %>%
+  mutate(Replicate = as.factor(Replicate)) %>%
+  select(-sequence) %>%
+  mutate(cell = ifelse(patID == "Jurkat","Jurkat","Primary")) %>%
+  select(fileName, expBatch, patID, sampleID, batch, cell)
+```
+
+
+# Quality information from STAR alignment (genome mapping)
+
+Define function
+```{r}
+processLog <- function(fileName) {
+    outTab <- tibble(allLine = read_lines(fileName)) %>%
+      separate(allLine, c("entry","value"),"[|]", remove = FALSE) %>%
+      mutate(value = str_remove_all(value, "[\t%]"),
+             entry = str_trim(entry,"both")) %>%
+      mutate(value = as.numeric(value)) %>%
+      filter(!is.na(value)) %>% select(-allLine)
+    
+    outTab
+}
+```
+
+Load bam files from pilot batch, batch 1 old, batch 1 new, and batch 1 combined
+```{r, warning=FALSE, error=FALSE}
+allFiles <- list.files("~/Documents/drugSeq/bam/pilot_batch1old_new_combined/",
+                       recursive = TRUE, full.names = TRUE)
+allRecord <- lapply(allFiles, function(fileName){
+  baseName <- basename(fileName)
+  processLog(fileName) %>%
+    mutate(filename = str_remove(baseName, "Log.final.out"))
+}) %>% bind_rows()
+```
+
+Check that all samples have patient annotations
+```{r}
+all(allRecord$filename %in% patAnno$fileName)
+all(patAnno$fileName %in% allRecord$filename) 
+
+allRecord <- left_join(allRecord, patAnno, by = c(filename = "fileName")) %>% arrange(entry)
+```
+
+Create multiple box plots
+```{r, fig.width=15, fig.height=25}
+diagBoxPlots <- lapply(unique(allRecord$entry), function(n) {
+  plotTab <- filter(allRecord, entry == n)
+  ggplot(plotTab, aes(x=batch, y=value)) +
+    geom_boxplot(outlier.shape = NA) +
+    ggbeeswarm::geom_quasirandom(aes(col=cell), groupOnX=TRUE) +
+    theme_bw() + theme(legend.position = "none") +
+    ggtitle(n)
+})
+cowplot::plot_grid(plotlist = diagBoxPlots, ncol=3)
+```

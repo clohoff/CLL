@@ -1,0 +1,198 @@
+---
+title: "Check alignment quality by STAR of batch 1 new"
+author: "Caroline Lohoff"
+date: "November 25 2021"
+output:
+  BiocStyle::html_document:
+    toc_float: true
+---
+
+```{r}
+library(tidyverse)
+```
+
+
+# Quality information from STAR alignment (genome mapping)
+
+```{r}
+processLog <- function(fileName) {
+    outTab <- tibble(allLine = read_lines(fileName)) %>%
+      separate(allLine, c("entry","value"),"[|]", remove = FALSE) %>%
+      mutate(value = str_remove_all(value, "[\t%]"),
+             entry = str_trim(entry,"both")) %>%
+      mutate(value = as.numeric(value)) %>%
+      filter(!is.na(value)) %>% select(-allLine)
+    
+    outTab
+}
+```
+
+# Load bam files from pilot and batch 1 new
+```{r, warning=FALSE, error=FALSE}
+allFiles <- list.files("~/Documents/drugSeq/bam/pilot_and_batch1new/log/",recursive = TRUE, full.names = TRUE)
+allRecord <- lapply(allFiles, function(fileName){
+  baseName <- basename(fileName)
+  processLog(fileName) %>%
+    mutate(filename = str_remove(baseName, "Log.final.out"))
+}) %>% bind_rows()
+```
+
+Annotate patients
+```{r}
+patAnno <- readxl::read_xlsx("~/Documents/R/drugseq_test/data/RNAseq_samples_pilot_batch1new.xlsx") %>%
+  #mutate(fileName = str_replace(fileName, ".txt.gz","")) %>%
+  mutate(Replicate = as.factor(Replicate)) %>%
+  select(-sequence) %>%
+  mutate(cell = ifelse(patID == "Jurkat","Jurkat","Primary")) %>%
+  select(fileName, expBatch, patID, sampleID, batch, cell)
+
+#check all samples have annotations
+all(allRecord$filename %in% patAnno$fileName)
+all(patAnno$fileName %in% allRecord$filename) 
+
+allRecord <- left_join(allRecord, patAnno, by = c(filename = "fileName")) %>% arrange(entry)
+```
+
+
+```{r, fig.width=15, fig.height=25}
+diagBoxPlots <- lapply(unique(allRecord$entry), function(n) {
+  plotTab <- filter(allRecord, entry == n)
+  ggplot(plotTab, aes(x=batch, y=value)) +
+    geom_boxplot(outlier.shape = NA) +
+    ggbeeswarm::geom_quasirandom(aes(col=cell), groupOnX=TRUE) +
+    theme_bw() + theme(legend.position = "none") +
+    ggtitle(n)
+})
+cowplot::plot_grid(plotlist = diagBoxPlots, ncol=3)
+```
+
+
+# Quality information from HTseq (gene counting)
+
+```{r}
+htTab <- read_tsv("~/Documents/R/drugseq_test/output/htseq_process_batch1new_20211125.tsv")
+htTab <- htTab %>% mutate(batch = patAnno[match(fileName, patAnno$fileName),]$batch,
+                          cell = patAnno[match(fileName, patAnno$fileName),]$cell) %>%
+  mutate(percent = percent*100)
+```
+
+```{r, fig.width=10, fig.height=8}
+diagBoxPlots <- lapply(unique(htTab$feature), function(n) {
+  plotTab <- filter(htTab, feature == n)
+  ggplot(plotTab, aes(x=batch, y=percent)) +
+    geom_boxplot(outlier.shape = NA) +
+    ggbeeswarm::geom_quasirandom(aes(col = cell), groupOnX=TRUE) +
+    ylab("Percentage") +
+    theme_bw() + theme(legend.position = "none") +
+    ggtitle(n)
+})
+cowplot::plot_grid(plotlist = diagBoxPlots, ncol=3)
+```
+
+
+Combine and save
+```{r}
+htTabReformated <- select(htTab, feature, count, percent, fileName) %>%
+  pivot_longer(c(count, percent), names_to = "type", values_to = "value") %>%
+  mutate(entry = ifelse(type == "count", feature, paste0(feature," %"))) %>%
+  select(value, entry, fileName) %>%
+  left_join(select(patAnno, fileName, expBatch, patID, sampleID, batch), by = "fileName") %>%
+  mutate(source = "HTseq") %>%
+  dplyr::rename(filename  = fileName)
+
+allRecordOut <- bind_rows(allRecord %>% mutate(source = "STAR"),
+                          htTabReformated)
+
+write_csv2(allRecordOut, file = "~/Documents/R/drugseq_test/output/STAR_HTseq_batch1new_summary_20211130.csv")
+```
+
+
+# Salmon results
+
+Pilot batch
+```{r}
+allDir <- list.dirs("~/Documents/drugSeq/salmon/pilot/", recursive = FALSE)
+salmonOut.pilot <- lapply(allDir, function(n) {
+  filename <- basename(n)
+  allLines <- read_lines(paste0(n,"/logs/salmon_quant.log"))
+  allLines <- allLines[str_detect(allLines, "Mapping rate =")]
+  mapRate <- str_split(allLines, "=")[[1]][2] %>% str_remove_all("[ %]") %>% as.numeric()
+  tibble(filename = filename, value = mapRate)
+}) %>% bind_rows() %>%
+  left_join(patAnno, by = c(filename = "fileName"))
+```
+
+Batch 1 new
+```{r}
+allDir <- list.dirs("~/Documents/drugSeq/salmon/batch1_new/", recursive = FALSE)
+salmonOut.batch1 <- lapply(allDir, function(n) {
+  filename <- basename(n)
+  allLines <- read_lines(paste0(n,"/logs/salmon_quant.log"))
+  allLines <- allLines[str_detect(allLines, "Mapping rate =")]
+  mapRate <- str_split(allLines, "=")[[1]][2] %>% str_remove_all("[ %]") %>% as.numeric()
+  tibble(filename = filename, value = mapRate)
+}) %>% bind_rows() %>%
+  left_join(patAnno, by = c(filename = "fileName"))
+```
+
+```{r, fig.height=4, fig.width=6}
+salmonOut <- bind_rows(salmonOut.pilot, salmonOut.batch1)
+ggplot(salmonOut, aes(x=batch, y=value)) +
+  geom_boxplot(outlier.shape = NA) +
+  ggbeeswarm::geom_quasirandom(aes(col = cell)) +
+  ylab("Percentage")  +
+  theme_bw() + theme(legend.position = "none") +
+  ggtitle("Salmon map rate")
+```
+
+
+# Correlation quality features with cell viability
+
+```{r}
+load("~/Documents/R/drugseq_test/data/patmeta_210324.RData")
+
+allRecordOut <- read_csv2("~/Documents/R/drugseq_test/output/STAR_HTseq_batch1new_summary_20211130.csv") %>%
+  filter(str_detect(entry,"%"), batch == "batch1") %>%
+  select(entry, value, filename)
+
+patAnno <- readxl::read_xlsx("~/Documents/R/drugseq_test/data/RNAseq_samples_pilot_batch1new.xlsx") %>%
+  mutate(fileName = str_replace(fileName, ".txt.gz","")) %>%
+  mutate(diagnosis = patMeta[match(patID, patMeta$Patient.ID),]$diagnosis) %>%
+  mutate(diagnosis = ifelse(patID == "Jurkat","Jurkat",diagnosis))
+
+patTest <- patAnno %>%
+  select(fileName, FSC.SSC.d0, FSC.SSC, FSC.SSC.norm) %>%
+  pivot_longer(-fileName, names_to = "metaVar", values_to = "metaValue")
+```
+
+```{r}
+testTab <- full_join(allRecordOut, patTest, by = c(filename= "fileName")) %>%
+  filter(!is.na(value), !is.na(metaValue))
+  
+resTab <- group_by(testTab, entry, metaVar) %>% nest() %>%
+  mutate(m=map(data, ~cor.test(~value + metaValue, .,
+                              method = "spearman", use = "pairwise.complete.obs"))) %>%
+  mutate(res = map(m, broom::tidy)) %>% 
+  unnest(res) %>%
+  select(entry, metaVar, p.value, estimate) %>%
+  arrange(p.value)
+
+resTab %>% mutate_if(is.numeric, formatC) %>%
+  DT::datatable()
+```
+
+
+# Top 9 associations as scatter plot
+```{r, fig.height=9, fig.width=12, warning=FALSE, message=FALSE}
+pList <- lapply(seq(12), function(i) {
+  rec <- resTab[i,]
+  plotTab <- filter(testTab, entry == rec$entry, metaVar == rec$metaVar) %>%
+    mutate(diagnosis = patAnno[match(filename, patAnno$fileName),]$diagnosis)
+  ggplot(plotTab, aes(x=metaValue, y=value)) +
+    geom_point(aes(col = diagnosis)) + geom_smooth(method = "lm") +
+    theme_bw() +
+    xlab(rec$metaVar) + ylab(rec$entry)
+})
+cowplot::plot_grid(plotlist = pList, ncol=3)
+```
+

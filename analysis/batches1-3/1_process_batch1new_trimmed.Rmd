@@ -1,0 +1,80 @@
+---
+title: "Processing the trimmed Salmon counted RNAseq of batch 1 new"
+author: "Caroline Lohoff"
+date: "November 25 2021"
+output:
+  BiocStyle::html_document:
+    toc_float: true
+---
+
+# Load libraries
+
+Libraries
+```{r, message=FALSE, warning=FALSE}
+library(DESeq2)
+library(tximport)
+library(EnsDb.Hsapiens.v86)
+library(RColorBrewer)
+library(pheatmap)
+library(geneplotter)
+library(tidyverse)
+```
+
+# Assemble Salmon results at gene level
+
+Get transcript annotation using EnsDb
+```{r}
+geneAnno <- transcripts(EnsDb.Hsapiens.v86, columns = c("tx_name","gene_id", "seq_name",
+                                                        "gene_name","gene_biotype"), return.type = "DataFrame") %>% as_tibble()
+geneAnno$tx_id <- NULL
+```
+
+Read in count tables of pilot batch and batch 1 new (aligned by Salmon)
+```{r}
+rawFolder = "~/Documents/drugSeq/salmon_trimmed/pilot_batch1new/"
+files <- list.files(rawFolder, recursive = TRUE, pattern = "quant.sf")
+fileName <-  str_split(files, "[/]", simplify = TRUE)[,1]   # IMPORTANT CHANGE [,2] -> [,1]
+names(files) = fileName
+txi.salmon <- tximport(paste0(rawFolder,files), type = "salmon", tx2gene = geneAnno, ignoreTxVersion = TRUE)
+```
+
+
+Annotate patients
+```{r}
+patAnno <- readxl::read_xlsx("~/Documents/R/drugseq_test/data/RNAseq_samples_pilot_batch1new.xlsx") %>%
+  #mutate(fileName = str_replace(fileName, ".txt.gz","")) %>%  # not necessary for batch 1 new
+  mutate(ID = paste0("smp",seq(nrow(.)))) %>%   # add new column "ID" which contains "smp1" - "smpn"
+  mutate(Replicate = as.factor(Replicate)) %>%  # replicate numbers should be factors
+  select(-sequence) %>%                         # remove column "sequence"
+  data.frame(stringsAsFactors = FALSE) %>%
+  column_to_rownames("fileName")                # make column "fileName" to rownames column
+
+#check all samples have annotations
+all(fileName %in% rownames(patAnno))  
+all(rownames(patAnno) %in% fileName)  
+
+#reorder 
+patAnno <- patAnno[fileName,]
+```
+
+
+Assemble DEseq object
+```{r}
+ddsDrug <- DESeqDataSetFromTximport(txi.salmon, patAnno, design = ~1)
+colnames(ddsDrug) <- ddsDrug$ID
+
+#annotate transcripts
+rowAnno <- geneAnno %>% distinct(gene_id, seq_name, gene_name, gene_biotype) %>%
+  dplyr::rename(chromosome = seq_name, symbol = gene_name, biotype = gene_biotype) %>%
+  data.frame(stringsAsFactors = FALSE) %>% column_to_rownames("gene_id")
+rowData(ddsDrug) <- rowAnno[rownames(ddsDrug),]
+
+ddsDrug <- estimateSizeFactors(ddsDrug)
+```
+
+
+# Save results
+```{r}
+save(ddsDrug,  file = "~/Documents/R/drugseq_test/output/ddsDrug_trimmed_batch1new_20211125.RData")
+```
+

@@ -1,0 +1,471 @@
+---
+title: "Detect differential expressed genes of drug treatment of batch 1 new trimmed"
+author: "Caroline Lohoff"
+date: "November 25 2021"
+output:
+  BiocStyle::html_document:
+    toc_float: true
+---
+
+
+# Load libraries
+
+Libraries
+```{r, message=FALSE, warning=FALSE}
+library(DESeq2)
+library(piano)
+library(tidyverse)
+library(clusterProfiler)
+library(enrichplot)
+library(ggplot2)
+
+setwd("~/Documents/R/drugseq_test")
+
+knitr::opts_chunk$set(warning = FALSE, message = FALSE)
+```
+
+Set the global ggplot theme
+```{r}
+theme_set(theme_bw() + theme(axis.text = element_text(size=12), 
+                             axis.title = element_text(size=14),
+                             plot.title = element_text(size = 15, hjust =0.5, face="bold")))
+```
+
+# Load data
+```{r}
+load("~/Documents/R/drugseq_test/output/ddsDrug_trimmed_batch1new_20211125.RData")
+load("~/Documents/R/drugseq_test/data/patmeta_210324.RData")
+ddsDrug <- ddsDrug[,ddsDrug$batch == "batch1"] #only batch1 samples
+ddsDrug$diagnosis <- patMeta[match(ddsDrug$patID, patMeta$Patient.ID),]$diagnosis
+```
+
+Include only CLL samples in analysis
+```{r}
+ddsAll <- ddsDrug[rowData(ddsDrug)$biotype %in% "protein_coding" & !rowData(ddsDrug)$symbol %in% c(NA, ""),
+                  ddsDrug$diagnosis %in% "CLL"] #only use one of the replicated sample
+keep <- apply(counts(ddsAll), 1, function(x) any(x >= 10))  # min 10 counts
+ddsAll <- ddsAll[keep,]
+dim(ddsAll)
+```
+
+# Differential expression test using DESeq
+
+## Created design matrix
+```{r}
+patAnno <- colData(ddsAll) %>% data.frame() %>% 
+  select(patID, treatment) %>%
+  mutate(treatment = str_replace_all(treatment,"[- ]","_")) %>%
+  mutate(treatment = factor(treatment,
+                          levels = c("DMSO",setdiff(unique(treatment),"DMSO"))))
+designMat <- model.matrix(~ 0 + treatment + patID, patAnno)
+```
+
+## Run DESeq
+```{r}
+ddsAll$condi <- factor(str_replace_all(ddsAll$treatment,"[- ]","_"))
+ddsAll$condi <- factor(ddsAll$condi,
+                       levels = c("DMSO",setdiff(levels(ddsAll$condi),c("DMSO"))))
+ddsAll$patID <- factor(ddsAll$patID)
+design(ddsAll) <- ~ patID + condi
+```
+
+```{r, eval=FALSE}
+DEres <- DESeq(ddsAll)
+save(DEres, file = "~/Documents/R/drugseq_test/output/DEres_batch1new_trimmed_20211126.RData")
+```
+
+```{r}
+load("~/Documents/R/drugseq_test/output/DEres_batch1new_trimmed_20211126.RData")
+```
+
+Get results
+```{r}
+allTreat <- patAnno %>% filter(! treatment %in% c("DMSO")) %>%
+  distinct(treatment) %>%
+  pull(treatment)
+
+allRes <- lapply(allTreat, function(tr) {
+  resTab <- results(DEres, 
+                    name = paste0("condi_",tr,"_vs_DMSO"),
+                    tidy = TRUE) %>% mutate(treatment = tr)
+}) %>% bind_rows() %>% mutate(symbol = rowData(ddsDrug)[row,]$symbol)
+```
+
+
+## P-value histogram
+
+```{r, fig.height=6, fig.width=10}
+ggplot(allRes, aes(x=pvalue)) + geom_histogram() +
+  facet_wrap(~treatment) +
+  xlim(0,1)
+```
+
+## Number of significant DE genes 
+
+10% FDR
+```{r,fig.height=5, fig.width=6}
+sumTab <- filter(allRes, padj < 0.1) %>%
+  group_by(treatment) %>% summarise(n=length(row)) %>%
+  arrange(desc(n)) %>% mutate(treatment = factor(treatment, levels = treatment))
+ggplot(sumTab, aes(x=treatment, y=n)) +
+  geom_bar(stat = "identity") +
+  theme(axis.text.x = element_text(angle = 90, vjust=0.5, hjust=1))
+```
+
+
+25% FDR
+```{r,fig.height=5, fig.width=6}
+sumTab <- filter(allRes, padj < 0.25) %>%
+  group_by(treatment) %>% summarise(n=length(row)) %>%
+  arrange(desc(n)) %>% mutate(treatment = factor(treatment, levels = treatment))
+ggplot(sumTab, aes(x=treatment, y=n)) +
+  geom_bar(stat = "identity") +
+  theme(axis.text.x = element_text(angle = 90, vjust=0.5, hjust=1))
+```
+
+## Table of significant associations
+```{r}
+allRes %>% filter(padj <0.10) %>% select(row, symbol, log2FoldChange, pvalue, padj, treatment) %>%
+  mutate_if(is.numeric, formatC, digits=2) %>%
+  DT::datatable()
+```
+## Prepare gene lists
+```{r}
+geneList_all <- unique(allRes$row)  # all genes included in data
+
+# Gene list with significant genes per treatment
+allRes.sig <- filter(allRes, padj < 0.25)
+geneList <- lapply(unique(allRes.sig$treatment), function(tr) {
+  filter(allRes.sig, treatment == tr)$row
+})
+names(geneList) <- unique(allRes.sig$treatment)
+
+```
+
+## Overlap of differentially expressed genes
+```{r, fig.height=10, fig.width=15}
+UpSetR::upset(UpSetR::fromList(geneList), nsets = 50)
+```
+There is not much overlap. Ibrutinib has larger overlap with Duvelisib than with other drugs. 
+
+# Pathway enrichment analysis
+
+## Gene Set Enrichment Analysis with ClusterProfiler
+
+```{r}
+# Load the annotation for homo sapiens
+organism = "org.Hs.eg.db"
+BiocManager::install(organism, character.only = TRUE)
+library(organism, character.only = TRUE)
+
+# Check which source of annotations (gene ids) are available 
+keytypes(org.Hs.eg.db) 
+
+# Prepare the input for ClusterProfiler
+geneList_LFC <- lapply(unique(allRes$treatment), function(tr) {
+  filter(allRes, treatment == tr)$log2FoldChange
+  })
+names(geneList_LFC) <- unique(allRes$treatment)
+
+gse_results <- vector("list", length(geneList_LFC))
+i <- 1
+
+for(tr in names(geneList_LFC)) {
+  names(geneList_LFC[[tr]]) <- filter(allRes, treatment == tr)$row  # or $symbol
+  geneList_LFC[[tr]] <- na.omit(geneList_LFC[[tr]]) 
+  geneList_LFC[[tr]] <- sort(geneList_LFC[[tr]], decreasing = TRUE) 
+  
+  # Run ClusterProfiler on every treatment
+  gse_results[[i]] <- gseGO(geneList=geneList_LFC[[tr]], 
+             ont ="ALL", 
+             keyType = "ENSEMBL", 
+             minGSSize = 3,      # minimal size of each geneSet
+             maxGSSize = 800,    # maximal size of each geneSet
+             pvalueCutoff = 0.05, 
+             verbose = TRUE, 
+             OrgDb = organism, 
+             pAdjustMethod = "BH")
+  #assign(var, gse)
+  var <- paste("gse", tr, sep = "_")
+  names(gse_results)[i] <- var
+  
+  i <- i + 1
+}
+
+# Check first and last elements of treatment list for one drug
+head(geneList_LFC$Duvelisib, 10)
+tail(geneList_LFC$Duvelisib, 10)
+
+```
+
+# Output
+##Table of results
+```{r}
+head(gse_Duvelisib)
+```
+
+##Barplot
+```{r echo=TRUE, fig.width=15, fig.height=8}
+plot_significant_pathways <- function(enrichmentDF, score, title){
+
+  ##Filter interesting pathways by using the enrichment score
+  top_pathways <- enrichmentDF[enrichmentDF$NES <= -score | enrichmentDF$NES >= score, ]
+
+  plot <- ggplot(top_pathways,
+                 aes(x = Description, y = `NES`, fill = `p.adjust`)) +
+          geom_bar(stat = "identity") +
+          coord_flip() +
+          ggtitle(title) +
+          scale_colour_gradient2(low="darkblue", mid="whitesmoke", high="indianred",
+                                 midpoint = 0.05, aesthetics="fill") +
+          theme(plot.title.position = "plot",
+                axis.title.x=element_text(size=14,face="bold"),
+                axis.title.y=element_text(size=14,face="bold"),
+                axis.text.y=element_text(size=10,face="bold"))
+
+  return(plot)
+}
+
+tr_names <- c()
+
+for(i in tr_names) {
+  print(i)
+  print(i@result)
+  barplot = plot_significant_pathways(gse_Duvelisib@result,
+                                                   score = 1, title="Barplot Duvelisib")
+  barplot
+}
+```
+
+
+
+##Dotplot
+```{r echo=TRUE, fig.width=15, fig.height=8}
+dotplot(gse_Duvelisib, showCategory=10, split=".sign") + facet_grid(.~.sign) + ggtitle("Most significant pathways after Duvelisib treatment")
+```
+
+##Encrichment plot map:
+Enrichment map organizes enriched terms into a network with edges connecting overlapping gene sets. In this way, mutually overlapping gene sets are tend to cluster together, making it easy to identify functional modules.
+
+Params:
+**showCategory** Select the displayed terms. It can be a number of a vector of terms.
+**layout** change the layout of map, e.g. layout = 'star', 'circle', 'gem', 'dh', 'graphopt', 'grid', 'mds', 'randomly', 'fr', 'kk', 'drl' or 'lgl'.
+
+```{r echo=TRUE}
+gse_Duvelisib2 <- pairwise_termsim(gse_Duvelisib)
+emapplot(gse_Duvelisib2, showCategory = 10)
+```
+
+##Category Netplot
+The cnetplot depicts the linkages of genes and biological concepts (e.g. GO terms or KEGG pathways) as a network (helpful to see which genes are involved in enriched pathways and genes that may belong to multiple annotation categories).
+```{r fig.width=18}
+library(ggnewscale)
+cnetplot(gse_Duvelisib, categorySize="pvalue", foldChange=gene_list, showCategory = 3)
+```
+
+## Ridgeplot
+Helpful to interpret up/down-regulated pathways.
+```{r fig.width=18, fig.height=12}
+library(ggridges)
+ridgeplot(gse_Duvelisib) + labs(x = "enrichment distribution")
+```
+
+## GSEA Plot  
+Traditional method for visualizing GSEA result.  
+Plot of the Running Enrichment Score (green line) for a gene set as the analysis walks down the ranked gene list, including the location of the maximum enrichment score (the red line). The black lines in the Running Enrichment Score show where the members of the gene set appear in the ranked list of genes, indicating the leading edge subset.
+
+The Ranked list metric shows the value of the ranking metric (log2 fold change) as you move down the list of ranked genes. The ranking metric measures a gene’s correlation with a phenotype.
+  
+```{r fig.height=6}
+gseaplot(gse_Duvelisib, by = "all", title = gse_Duvelisib$Description[1], geneSetID = 1)
+```
+
+## PubMed trend of enriched terms
+Plots the number of publications trend based on the query result from PubMed Central.
+```{r fig.width=10}
+library("europepmc")
+terms <- gse_Duvelisib$Description[1:3]
+pmcplot(terms, 2010:2020, proportion=FALSE)
+```
+
+# ToDo: include KEGG Gene Set Enrichment Analysis
+
+
+
+
+
+## Plot most relevant pathways per treatment as enrichment bars
+
+```{r, echo=FALSE}
+plotEnrichmentBar <- function(resTab, pCut = 0.05, ifFDR = FALSE, setName = "", title="",
+                              removePrefix = NULL, insideLegend = FALSE) {
+
+    plotTab <- resTab
+
+    if (ifFDR) {
+      plotTab <- dplyr::filter(plotTab, `p.adjust (dist.dir.up)` <= pCut | `p.adjust (dist.dir.dn)` <= pCut)
+    } else {
+      plotTab <- dplyr::filter(plotTab, `pvalue (dist.dir.up)` <= pCut | `pvalue (dist.dir.dn)` <= pCut)
+    }
+
+    if (nrow(plotTab) == 0) {
+      print("No sets passed the criteria")
+      return(NULL)
+
+    } else {
+      #firstly, process the result table
+      plotTab <- lapply(seq(nrow(plotTab)), function(i) {
+        x <- plotTab[i,]
+        statSign <- as.numeric(x[3])
+        data.frame(Name = x[[1]], p = as.numeric(ifelse(statSign >= 0, x[[4]], x[[6]])),
+                   geneNum = ifelse(statSign >= 0, x[[8]], x[[9]]),
+                   Direction = ifelse(statSign > 0, "Up", "Down"), stringsAsFactors = FALSE)
+      }) %>% bind_rows()
+
+      if (!is.null(removePrefix)) plotTab <- mutate(plotTab, Name = str_remove(Name, removePrefix))
+
+      plotTab$Name <- sprintf("%s (%s)",plotTab$Name,plotTab$geneNum)
+      plotTab <- plotTab[with(plotTab,order(Direction, p, decreasing=TRUE)),]
+      plotTab$Direction <- factor(plotTab$Direction, levels = c("Up","Down"))
+      plotTab$Name <- factor(plotTab$Name, levels = plotTab$Name)
+      #plot the barplot
+      p <- ggplot(data=plotTab, aes(x=Name, y= -log10(p), fill=Direction)) +
+        geom_bar(position="dodge",stat="identity", width = 0.5) +
+        scale_fill_manual(values=c(Up = "red", Down = "blue")) +
+        coord_flip() + xlab(setName) +
+        ylab(expression(-log[10]*'('*p*')')) +
+        ggtitle(title) + theme_bw() + theme(plot.title = element_text(face = "bold", hjust =0.5),
+                                        axis.title = element_text(size=15))
+
+      if (insideLegend) {
+        p <- p + theme(legend.position = c(0.8,0.1))
+      } else {
+        p <- p + theme(legend.position = "right")
+      }
+    }
+
+
+  return(p)
+}
+```
+
+
+## Hallmark
+```{r, fig.height=40, fig.width=8}
+#gmts = list(H= "~/Documents/R/drugseq_test/data/h.all.v6.2.symbols.gmt",
+#            KEGG = "~/Documents/R/drugseq_test/data/c2.cp.kegg.v6.2.symbols.gmt")
+
+enrichPlot <- lapply(unique(allRes$treatment), function(tr) {
+  
+  res <- gseGO(geneList=geneList_LFC[[tr]], 
+             ont ="ALL", 
+             keyType = "ENSEMBL", 
+             minGSSize = 3, 
+             maxGSSize = 800, 
+             pvalueCutoff = 0.05, 
+             verbose = TRUE, 
+             OrgDb = organism, 
+             pAdjustMethod = "BH")
+  
+  # Camera function can't be used here, as we have only treatment (no comparison treated vs untreated)
+  #res <- limma::camera(y=inputTab, index=gmts$H, design=design)  
+  #res <- jyluMisc::runGSEA(inputTab, gmts$H, "page") # jyluMisc is Junyans package
+  #res <- runGSAhyper(genes = geneList$tr, universe = geneList_all, gsc = loadGSC(pathways_H))
+  p <- plotEnrichmentBar(res@result, pCut =0.1, ifFDR= TRUE, setName = "Hallmark", 
+                       title = tr, removePrefix = "HALLMARK_")
+  p
+})
+
+noNULL <- sapply(enrichPlot, is.null)
+cowplot::plot_grid(plotlist= enrichPlot[!noNULL], ncol=1)
+
+```
+
+## KEGG
+```{r, fig.height=50, fig.width=8}
+gmts = list(H= "~/Documents/R/drugseq_test/data/h.all.v6.2.symbols.gmt",
+            KEGG = "~/Documents/R/drugseq_test/data/c2.cp.kegg.v6.2.symbols.gmt")
+
+enrichPlot <- lapply(unique(allRes$treatment), function(tr) {
+  inputTab <- allRes %>% filter(pvalue <= 0.05, treatment == tr) %>%
+    arrange(pvalue) %>% distinct(symbol, .keep_all = TRUE) %>%  
+    select(symbol, stat) %>%
+    data.frame() %>% column_to_rownames("symbol")
+  res <- jyluMisc::runGSEA(inputTab, gmts$KEGG, "page")                           # ToDo
+  p <- plotEnrichmentBar(res, pCut =0.1, ifFDR= TRUE, setName = "Hallmark", 
+                       title = tr, removePrefix = "HALLMARK_")
+  p
+})
+noNULL <- sapply(enrichPlot, is.null)
+cowplot::plot_grid(plotlist= enrichPlot[!noNULL], ncol=1)
+
+```
+
+
+################################################################################################################
+
+# Compare with the RNAseq data from cytokine screen
+
+## Process 
+Preprocessing RNAseq
+```{r}
+drugSeq <- readRDS("../../var/IbrIbetSeq_190807.rds")  # GET FILE
+drugSeq <- estimateSizeFactors(drugSeq)
+drugSeq <- drugSeq[rowSums(counts(drugSeq, normalized = TRUE))> 100,] #filter out genes with low count
+drugSeq.vst <- vst(drugSeq)
+```
+
+
+## Differential expression with DE-Seq
+```{r}
+design(drugSeq) <- ~ patID + treatment
+drugSeq <- DESeq(drugSeq)
+```
+
+### Ibrutinib
+
+Get test results for Ibrutinib
+```{r}
+ibrRes_deseq <- results(drugSeq, contrast = c("treatment", "Ibrutinib","Control"), tidy = TRUE) %>%
+  dplyr::rename(Symbol = "row") %>% arrange(pvalue)
+
+```
+
+### I-BET 762
+
+Get test results for I-BET 762
+```{r}
+ibetRes_deseq <- results(drugSeq, contrast = c("treatment","IBET762","Control"), tidy = TRUE) %>%
+  dplyr::rename(Symbol = "row") %>% arrange(pvalue)
+```
+
+
+## Compare
+
+### Up-regulated (10% FDR)
+
+```{r}
+comList <- list()
+comList[["Ibr_shallow"]] <- unique(filter(allRes, stat >0, treatment =="Ibrutinib", padj < 0.1)$symbol)
+comList[["Ibet_shallow"]] <- unique(filter(allRes, stat >0, treatment =="IBET762", padj < 0.1)$symbol)
+comList[["Ibr_full"]] <- unique(filter(ibrRes_deseq, stat >0, padj < 0.1)$Symbol)
+comList[["Ibet_full"]] <- unique(filter(ibetRes_deseq, stat >0, padj < 0.1)$Symbol)
+```
+
+```{r}
+UpSetR::upset(UpSetR::fromList(comList), nsets = 50)
+```
+
+### Down-regulated (10% FDR)
+
+```{r}
+comList <- list()
+comList[["Ibr_shallow"]] <- unique(filter(allRes, stat <0, treatment =="Ibrutinib", padj < 0.1)$symbol)
+comList[["Ibet_shallow"]] <- unique(filter(allRes, stat <0, treatment =="IBET762", padj < 0.1)$symbol)
+comList[["Ibr_full"]] <- unique(filter(ibrRes_deseq, stat <0, padj < 0.1)$Symbol)
+comList[["Ibet_full"]] <- unique(filter(ibetRes_deseq, stat <0, padj < 0.1)$Symbol)
+```
+
+```{r}
+UpSetR::upset(UpSetR::fromList(comList), nsets = 50)
+```

@@ -1,0 +1,1408 @@
+---
+title: "MOFA analysis"
+author: "Caroline Lohoff (based on code from Junyan Lu)"
+date: "5/29/2022"
+output:
+  BiocStyle::html_document:
+    toc_float: true
+---
+
+# Description
+In this script different normalization methods for count matrices are tested and used as input for PCA and MOFA. 
+After using scTransform, the gene counts are less correlated with the size factors, leading to a better distinction of the treatments. 
+
+# Preparations
+Set global options
+```{r setup, include=FALSE, cache = FALSE}
+knitr::opts_knit$set(root.dir = "~/Documents/R/drugseq_test")
+knitr::opts_chunk$set(warning = FALSE, message = FALSE)
+```
+
+Load packages
+```{r}
+suppressPackageStartupMessages({
+  library(MOFA2)
+  library(DESeq2)
+  library(limma)
+  library(tidyverse)
+  library(corrplot)
+  library(pheatmap)
+})
+```
+
+Load data
+```{r}
+load("./data/patmeta_210324.RData")
+load("./output/ddsDrug_htseq_batchPilot1c234_20220426.RData")
+```
+
+Add patient information to dds object
+```{r}
+col_vec <- c("diagnosis", "gender", "Methylation_Cluster", "trisomy12", "NOTCH1", "TP53",
+             "ATM", "FBXW7", "MED12", "BRAF", "KRAS", "SF3B1", "del11q", "del17p", "del13q")
+ddsDrug@colData@listData <- lapply(col_vec, function(n) {
+  ddsDrug[[n]] <- patMeta[match(ddsDrug$patID, patMeta$Patient.ID), n]
+}) %>% bind_cols() %>% sjmisc::add_columns(ddsDrug@colData@listData)
+
+names(ddsDrug@colData@listData)[names(ddsDrug@colData@listData) == "Methylation_Cluster"] <- "Methylation"
+ddsDrug$IGHVpat <- patMeta[match(ddsDrug$patID,patMeta$Patient.ID),]$IGHV.status
+ddsDrug$IGHV <- ifelse(is.na(ddsDrug$IGHV), ddsDrug$IGHVpat, ddsDrug$IGHV)
+ddsDrug$IGHVpat <- NULL
+
+# Add meta data to the samples from the pilot batch
+ddsDrug$diagnosis[ddsDrug$batch == "pilot"] <- "CLL" 
+ddsDrug$trisomy12[ddsDrug$batch == "pilot"] <- 0
+ddsDrug$TP53[ddsDrug$batch == "pilot"] <- 0
+ddsDrug$NOTCH1[ddsDrug$batch == "pilot"] <- 0
+ddsDrug$del13q[ddsDrug$batch == "pilot"] <- 1
+ddsDrug$IGHV[ddsDrug$batch == "pilot" & ddsDrug$patID %in% c("PID1095", "PID1222")] <- "U"
+ddsDrug$IGHV[ddsDrug$batch == "pilot" & ddsDrug$patID %in% c("PID1177", "PID1210")] <- "M"
+ddsDrug$gender[ddsDrug$batch == "pilot" & ddsDrug$patID %in% c("PID1095", "PID1222")] <- "f"
+ddsDrug$gender[ddsDrug$batch == "pilot" & ddsDrug$patID %in% c("PID1177", "PID1210")] <- "m"
+```
+
+Subset conditions
+```{r}
+ddsDrug <- ddsDrug[,ddsDrug$diagnosis == "CLL" & 
+                    ddsDrug$treatment != "Baseline" &
+                    #ddsDrug$treatment %in% c("DMSO","Nutlin-3a","Ibrutinib","Duvelisib") & 
+                    #ddsDrug$batch!="pilot" &
+                    ddsDrug$Replicate == 1]
+
+# Remove not expressed genes
+ddsDrug <- ddsDrug[rowSums(counts(ddsDrug)) > 0, ]
+```
+
+# Abundance of different types of genes
+```{r}
+ddsDMSO <- ddsDrug[,ddsDrug$treatment=="DMSO"]
+sumTab <- counts(ddsDMSO) %>% as_tibble(rownames = "id") %>%
+  pivot_longer(-id) %>%
+  mutate(patID = colData(ddsDMSO)[name,]$patID,
+         treatment = colData(ddsDMSO)[name,]$treatment,
+         biotype = rowData(ddsDMSO)[id,]$biotype,
+         chr = rowData(ddsDMSO)[id,]$chromosome)
+sumType <- group_by(sumTab, biotype, patID) %>%
+  summarise(medVal = median(value), meanVal = mean(value))
+
+ggplot(sumType, aes(x=biotype, y=log(medVal))) + geom_boxplot() + geom_point() +
+  theme(axis.text.x = element_text(angle = 90, hjust=1, vjust=0.5))
+ggplot(sumType, aes(x=biotype, y=log(meanVal))) + geom_boxplot() + geom_point() +
+  theme(axis.text.x = element_text(angle = 90, hjust=1, vjust=0.5))
+```
+A lot of mitochondrial genes have a high abundance. In comparison the abundance of mitochondrial genes is higher than the abundance of genes from the chromosomes. One explanation, why mt_rRNA is so abundant could be that mitochondrial RNA is associated with viability. This could be hint that a lot of cells are dying, as the cellular mitochondrial content determines the apoptotic fate and modulates the time to death. Cells with higher mitochondrial content are more prone to die [see paper "Mitochondrial levels determine variability in cell death by modulating apoptotic gene expression" by Márquez-Jurado et al. ](https://www.nature.com/articles/s41467-017-02787-4). In this paper they confer mitochondria a powerful discriminatory capacity of apoptotic fate. The results reveal a different role of mitochondria in apoptosis as the global regulator of apoptotic protein expression. 
+
+Show number of genes per category
+```{r, fig.height=6, fig.width=12}
+geneType <- as.data.frame(table(sumTab$biotype))
+ggplot(geneType, aes(x=Var1, y=Freq)) +
+  geom_bar(stat="identity", fill="steelblue") +
+  geom_text(aes(label=Freq), vjust=-0.3, size=2.5) +
+  theme_minimal() +
+  theme(axis.title.x=element_blank(),
+        axis.text.x = element_text(angle=90, vjust=0.5, hjust=1))
+```
+For further analysis we only use protein_coding genes. 
+
+Show log mean expression of genes per chromosome
+```{r}
+sumType <- group_by(sumTab, chr, patID) %>%
+  summarise(medVal = median(value), meanVal = mean(value))
+
+ggplot(sumType, aes(x=chr, y=log(medVal))) + geom_boxplot() + geom_point() +
+  theme(axis.text.x = element_text(angle = 90, hjust=1, vjust=0.5))
+ggplot(sumType, aes(x=chr, y=log(meanVal))) + geom_boxplot() + geom_point() +
+  theme(axis.text.x = element_text(angle = 90, hjust=1, vjust=0.5))
+```
+The mean expression value of genes from chromosome X is very similar to genes on the chromosomes 1-22. Genes on chromosome Y show a different expression pattern. Hence, we only consider chromosomes 1-22 and X for further analysis and remove all mitochondrial and artificial chromosomes. 
+
+Filter the genes by removing rows (genes) with too few counts (less than ten)
+```{r}
+keep <- apply(counts(ddsDrug), 1, function(x) any(x >= 10))
+ddsAll <- ddsDrug[keep,]
+
+dim(ddsDrug)
+```
+
+Keep only protein-coding genes as well as genes on chromosomes 1-22 and X
+```{r}
+ddsDrug <- ddsDrug[rowData(ddsDrug)$chromosome %in% c(1:22,"X"),]
+ddsDrug <- ddsDrug[rowData(ddsDrug)$biotype %in% "protein_coding" & !rowData(ddsDrug)$symbol %in% c(NA, ""),]
+
+dim(ddsDrug)
+```
+
+Add mapping rate to dds object
+```{r}
+# Load mapping rate data
+htTab <- read_tsv("./output/htseq_process_batchPilot1c234_20220203.tsv",
+                  show_col_types = FALSE)
+htTab <- htTab %>% mutate(percent = percent*100)
+
+# Only select mapping rate
+htTab_mapRate <- htTab[htTab$feature == "total mapped",]
+
+# Add mapping rate to dds object
+ddsDrug$mapping_rate <- htTab_mapRate[match(ddsDrug$fileName,htTab_mapRate$fileName),]$percent
+```
+
+
+# Correlation between size factors and viability
+```{r}
+ddsDrug <- estimateSizeFactors(ddsDrug)  # DESeq method
+countMat <- counts(ddsDrug)
+tCount <- colSums(countMat)
+aCount <- colMeans(countMat)
+
+countMat.norm <- counts(ddsDrug,
+                        normalize = TRUE) # DESeq method
+tCount.norm <- colSums(countMat.norm)
+aCount.norm <- colMeans(countMat.norm)
+
+sizeTab <- tibble(smpID = colnames(ddsDrug),
+                  sizeFactor = ddsDrug$sizeFactor,
+                  mapRate = ddsDrug$mapping_rate,
+                  viab = ddsDrug$FSC.SSC,
+                  condition = ddsDrug$treatment,
+                  viab0 = ddsDrug$FSC.SSC.d0,
+                  viabDiff = viab0-viab,
+                  totalCount = tCount,
+                  totalCount.norm = tCount.norm,
+                  avgCount = aCount,
+                  avgCount.norm = aCount.norm) 
+
+ddsDrug$viabDiff <- sizeTab$viabDiff
+```
+
+Correlation plot
+```{r, fig.height=16, fig.width=16}
+corTab <- sizeTab %>% dplyr::select(-condition) %>%
+  data.frame() %>% column_to_rownames("smpID")
+corrplot.mixed(cor(corTab, use = "pairwise.complete.obs"))
+```
+After library size correction using DESeq2, the size factors are correlated with the total counts and the average counts. 
+
+Correlation of size factors and normalized average counts
+```{r}
+ggplot(sizeTab, aes(x=avgCount.norm, y=sizeFactor)) +
+  geom_point() + geom_smooth()
+```
+There is a weak correlation between size factors and normalized average counts. Thus, DESeq2's estimateSizeFactors function can not handle the sparse counts matrix and the large differences between the patients. The low sparsity in the count matrix may likely result from the shallow sequencing. Although shallow sequencing captures almost all genes that deep sequencing detects (see quality control script), the overall gene expression is much lower. In shallow sequencing the vst normalized counts have values between 5 and 11, whereas in deep sequencing the normalized counts are around 20. A sparse count matrix is an attribute of a single cell data set, to which our shallow sequencing data set is similar. The strong inter-patient heterogeneity can be compared to different cell types and the samples per patients would be the single cells. 
+
+In order to deal with the low sparsity and the strong inter-patient heterogeneity, another correction method needs to be applied. In the next chapter two normalization methods are compared two each other. On the one hand we test the deconvolution method from Marioni lab and on the other hand the scTransform method from Satija lab. Both methods calculate size factors and normalize the counts in the gene expression matrix. The resulting counts matrix contains integers and can be used as input for DESeq2.
+
+```{r, fig.width=16, fig.height=4}
+plotTab <- tibble(counts=log(colSums(counts(ddsDrug))),
+                  counts.norm=log(colSums(countMat.norm)),
+                  sizeFac = log(ddsDrug$sizeFactor))
+
+p1 <- ggplot(plotTab, aes(x=sizeFac, y=counts)) +
+  geom_point() + geom_smooth() +
+  ggtitle("Correlation between size factors and counts")
+
+p2 <- ggplot(plotTab, aes(x=sizeFac, y=counts.norm)) +
+  geom_point() + geom_smooth() +
+  ggtitle("Correlation between size factors and normalized counts")
+
+p3 <- ggplot(plotTab, aes(x=counts, y=counts.norm)) +
+  geom_point() + geom_smooth() +
+  ggtitle("Correlation between counts and DESeq2 normalized counts")
+
+cowplot::plot_grid(p1, p2, p3, ncol=3)
+```
+
+
+# Using deconvolution for normalization
+
+Cell-specific biases are normalized using the computeSumFactors method, which implements the deconvolution strategy for scaling normalization (Lun, Bach, and Marioni 2016, see [GitHub](https://github.com/MarioniLab/Deconvolution2016)).
+```{r}
+library(scran)
+
+# Create new ddsAll object
+ddsAll.deconv <- ddsDrug
+
+# Reset size factors so that they can be calculated again
+# (excluding this step has no consequences)
+ddsAll.deconv$sizeFactor <- 1
+
+# Determine clusters and use them to calculate size factors
+clusters <- scran::quickCluster(ddsAll.deconv)
+ddsAll.deconv <- scran::computeSumFactors(ddsAll.deconv,
+                                   clusters=clusters)
+# Show summary of size factors
+summary(sizeFactors(ddsAll.deconv))
+
+# Use size factors to normalize the counts
+ddsAll.deconv <- scuttle::logNormCounts(ddsAll.deconv)
+countMat.deconv <- counts(ddsAll.deconv)
+```
+
+Plot standard deviation and rank mean on deconvoluted counts
+```{r}
+vsn::meanSdPlot(countMat.deconv)
+```
+he resulting counts matrix contains integers and thus can be used as input for DESeq2. 
+The integers are a bit higher than the ones received with scTransform.
+
+## Variance modelling
+This analysis is based on the [vignette](https://bioconductor.org/packages/release/bioc/vignettes/scran/inst/doc/scran.html#1_Introduction).
+
+We identify genes that drive biological heterogeneity in the data set by modelling the per-gene variance. By only using a subset of highly variable genes in downstream analyses like clustering, we improve resolution of biological structure by removing uninteresting genes driven by technical noise. We decompose the total variance of each gene into its biological and technical components by fitting a trend to the endogenous variances (Lun, McCarthy, and Marioni 2016). The fitted value of the trend is used as an estimate of the technical component, and we subtract the fitted value from the total variance to obtain the biological component for each gene.
+```{r}
+dec <- scran::modelGeneVar(ddsAll.deconv)
+plot(dec$mean, dec$total, xlab="Mean log-expression", ylab="Variance")
+curve(metadata(dec)$trend(x), col="blue", add=TRUE) 
+```
+
+If we have some uninteresting factors of variation, we can block these. This will perform the trend fitting and decomposition within each block before combining the statistics across blocks for output. Statistics for each individual block can also be extracted for further inspection. Modelling the per-gene variance is still very fast (< 5 Min). Blocking the patients leads to less variance. 
+```{r}
+# Blocking for patient ID to remove these factor of variation. 
+# Additionally, we turn off weighting to avoid over-fitting for each patient
+dec2 <- scran::modelGeneVar(ddsAll.deconv,
+                     block=ddsAll.deconv$patID,
+                     density.weights=FALSE)
+
+plot(dec2$mean, dec2$total,
+     xlab="Mean log-expression", ylab="Variance")
+```
+
+Extract some top genes for use in downstream procedures using the getTopHVGs() function.
+A variety of different strategies can be used to define a subset of interesting genes:
+```{r, eval=FALSE}
+# Get the top 10% of genes
+top.hvgs <- scran::getTopHVGs(dec, prop=0.1)
+head(top.hvgs, n=10)
+
+# Get the top 2000 genes
+top.hvgs2 <- scran::getTopHVGs(dec, n=2000)
+head(top.hvgs2, n=10)
+
+# Get all genes with positive biological components
+top.hvgs3 <- scran::getTopHVGs(dec, var.threshold=0)
+head(top.hvgs3, n=10)
+
+# Get all genes with FDR below 5%
+top.hvgs4 <- scran::getTopHVGs(dec, fdr.threshold=0.05)
+head(top.hvgs4, n=10)
+```
+
+
+# Using scTransform for normalization
+
+The [method scTransform](https://github.com/satijalab/sctransform) by [Hafemeister and Satija](https://genomebiology.biomedcentral.com/articles/10.1186/s13059-019-1874-1) normalizes and calculates the variance stabilization of single-cell RNA-seq data using regularized negative binomial regression.
+```{r, results=FALSE}
+library(sctransform)
+
+countMat <- counts(ddsDrug)
+
+# Correct count matrix with scTransform
+scModel <- sctransform::vst(countMat,
+                            return_corrected_umi = TRUE)
+```
+
+Extract normalized counts matrix
+(Advantage: counts are integers and can be used as input for DESeq2)
+```{r}
+countMat.norm <- as.matrix(scModel$umi_corrected)
+
+# Create new ddsAll object with norm. counts matrix and colData from ddsDrug
+ddsAll <- DESeqDataSetFromMatrix(countMat.norm,
+                                 colData = colData(ddsDrug), design = ~1)
+rowData(ddsAll) <- rowData(ddsDrug[rownames(countMat.norm)],)
+## size factors are the same as in ddsDrug
+```
+
+Extract vst matrix calculated with scTransform
+(floats around 0, also negative counts)
+```{r}
+countMat.sc <- as.matrix(scModel$y)
+
+# Create new ddsAll object with vst count matrix
+ddsAll.sc <- ddsAll
+assay(ddsAll.sc) <- countMat.sc
+```
+
+Usually, the counts in the count matrix of a RNASeq data set are Poisson distributed
+```{r}
+hist(rowMeans(assay(ddsDrug)), breaks = 100)
+```
+
+The counts normalized with scTransform are Poisson distribution as well
+```{r}
+hist(rowMeans(assay(ddsAll)), breaks = 100)
+```
+
+Histogram of Pearson residuals obtained with scTransform
+```{r}
+hist(rowMeans(assay(ddsAll.sc)), breaks = 100)
+```
+
+Plot standard deviation and rank mean on normalized counts and vst counts
+```{r}
+vsn::meanSdPlot(countMat.norm)
+vsn::meanSdPlot(countMat.sc)
+```
+
+Compare the results of scTransform (normalized counts and vst normalized counts (Pearson residuals))
+```{r}
+# Create plot table (gene, sample ID, count)
+plotTab.count <- countMat.norm[,ddsAll$treatment=="DMSO"] %>% 
+  as_tibble(rownames = "id") %>%
+  pivot_longer(-id)
+
+plotTab.vst <- countMat.sc[,ddsAll$treatment=="DMSO"] %>%
+  as_tibble(rownames = "id") %>%
+  pivot_longer(-id)
+
+ggplot(plotTab.count, aes(x=name, y = log2(value))) +
+  geom_boxplot() + ggtitle("Raw counts normalized with scTransform") +
+  theme(axis.text.x=element_text(angle=90, hjust=1, vjust=0.5))
+ggplot(plotTab.vst, aes(x=name, y=value)) +
+  geom_boxplot() + ggtitle("Counts normalized by size factors (vst function of scTransform)") +
+  theme(axis.text.x=element_text(angle=90, hjust=1, vjust=0.5))
+```
+
+Which patients are responsible for the separation of the data points in the correlation plot showing the correlation between size factors and scTransform normalized counts. 
+```{r, fig.width=12, fig.height=4}
+plotTab <- tibble(counts=log(colSums(counts(ddsDrug))),
+                  counts.norm=log(colSums(countMat.norm)),
+                  sizeFac = log(ddsDrug$sizeFactor),
+                  expID = as.numeric(ddsDrug$expID),
+                  patID = ddsDrug$patID)
+
+# Color by expID
+p1 <- ggplot(plotTab, aes(x=counts, y=counts.norm, col=expID >= 100)) +
+  geom_point() + geom_smooth() +
+  ggtitle("Correlation between counts and scTransform norm. counts")
+
+# Color by expID and label patients
+p2 <- ggplot(plotTab, aes(x=counts, y=counts.norm, col=expID >= 100)) +
+  geom_point() +
+  ggtitle("Correlation between counts and scTransform norm. counts") +
+  ggrepel::geom_label_repel(data=plotTab[plotTab$counts.norm <= 14.15,],
+                            aes(label=patID), size=3)
+
+cowplot::plot_grid(p1, p2, ncol=2)
+```
+Many samples with an expID above 100 are on the bottom left in the plot. 
+Those samples are from the patients P0029, P0437, P0645, and P0583. Another outlier belongs to the patient P0880 who has an expID of 33.
+These are the same patients as the ones contributing most to PC1 due to their low mapping rate as well as low (DMSO) viability after two days of incubation. 
+
+## Use DESeq2::vst and limma::voom on unnormalized counts
+
+```{r}
+# Use vst function from DESeq2
+ddsAll.vst <- ddsDrug
+ddsAll.vst <- DESeq2::vst(ddsAll.vst)
+countMat.vst <- assay(ddsAll.vst)
+
+# Use voom function from limma
+countMat <- counts(ddsDrug)
+countMat.voom <- limma::voom(countMat,
+                             lib.size = ddsAll$sizeFactor)$E
+```
+
+Plot standard deviation and rank mean for vst matrix
+```{r}
+vsn::meanSdPlot(countMat.vst)
+```
+
+Plot standard deviation and rank mean for voom matrix
+```{r}
+vsn::meanSdPlot(countMat.voom)
+```
+
+Correlation plot
+```{r}
+plot(countMat.vst[5,], countMat.voom[5,])
+```
+
+## Use DESeq2::vst and limma::voom on counts normalized with scTransform
+
+### Vst
+
+VST transformation function from DESeq2 as comparison
+```{r}
+# Create new ddsAll object from norm. counts
+ddsAll.vst <- ddsAll
+
+# Reset size factors before using DESeq2
+ddsAll.vst$sizeFactor <- 1
+
+# Use vst function from DESeq2
+ddsAll.vst <- DESeq2::vst(ddsAll.vst)
+countMat.vst <- assay(ddsAll.vst)
+## counts are floats between 5 and 11
+```
+
+Plot standard deviation and rank mean on vst counts
+```{r}
+vsn::meanSdPlot(countMat.vst)
+```
+
+Correlation between size factors and counts normalized with scTransform and then variance stabilized
+```{r, fig.width=16, fig.height=4}
+plotTab <- tibble(counts=log(colSums(counts(ddsDrug))),
+                  counts.norm=log(colSums(countMat.vst)),
+                  sizeFac = log(ddsDrug$sizeFactor),
+                  expID = as.numeric(ddsDrug$expID),
+                  patID = ddsDrug$patID)
+
+p1 <- ggplot(plotTab, aes(x=sizeFac, y=counts)) +
+  geom_point() + geom_smooth() +
+  ggtitle("Correlation between size factors and counts")
+
+p2 <- ggplot(plotTab, aes(x=sizeFac, y=counts.norm)) +
+  geom_point() + geom_smooth() +
+  ggtitle("Correlation between size factors and scTransform vst counts")
+
+p3 <- ggplot(plotTab, aes(x=counts, y=counts.norm)) +
+  geom_point() + geom_smooth() +
+  ggtitle("Correlation between counts and scTransform vst counts")
+
+cowplot::plot_grid(p1, p2, p3, ncol=3)
+```
+
+### Limma::voom
+
+Limma Voom transformation for comparison
+```{r}
+countMat <- counts(ddsAll)
+countMat.voom <- limma::voom(countMat,
+                             lib.size = ddsAll$sizeFactor)$E
+```
+
+Plot standard deviation and rank mean on voom transformed counts
+```{r}
+vsn::meanSdPlot(countMat.voom)
+```
+
+### New correlation plot
+
+```{r, eval=FALSE, include=FALSE}
+sizeTab.sub <- sizeTab[match(colnames(countMat.norm), sizeTab$smpID),]
+sizeTab.sub$avgCount.sc <- colMeans(countMat.norm)
+sizeTab.sub$avgVst.sc <- colMeans(countMat.sc)
+sizeTab.sub$avgVst.vst <- colMeans(countMat.vst)
+sizeTab.sub$avgVst.voom <- colMeans(countMat.voom)
+```
+
+Add columns to correlation plot
+```{r}
+sizeTab.sub <- sizeTab[match(colnames(countMat.norm), sizeTab$smpID),]
+sizeTab.sub$totalCount.sc <- colSums(countMat.norm)
+sizeTab.sub$totalCount.sc.norm <- colSums(countMat.sc)
+sizeTab.sub$avgCount.sc <- colMeans(countMat.norm)
+sizeTab.sub$avgCount.sc.norm <- colMeans(countMat.sc)
+sizeTab.sub$avgCount.sc.vst <- colMeans(countMat.vst)
+sizeTab.sub$avgCount.sc.voom <- colMeans(countMat.voom)
+```
+
+Correlation plot
+```{r, fig.height=22, fig.width=22}
+corTab <- sizeTab.sub %>% dplyr::select(-condition) %>%
+  data.frame() %>% column_to_rownames("smpID")
+corrplot.mixed(cor(corTab, use = "pairwise.complete.obs"))
+```
+
+```{r}
+plot(countMat.vst[5,], countMat.voom[5,])
+plot(countMat.sc[5,], countMat.voom[5,])
+plot(countMat.sc[5,], countMat.vst[5,])
+```
+Linear relationship between vst normalized counts and voom normalized counts, but relationship between sc normalized counts and voom is hyperbolic. This means that Pearson residuals (result of scTransform) are not normally distributed.
+
+# Preprocessing using limma
+
+Subset genes (vst normalized with scTransform)
+```{r}
+# Remove genes on Y chromosome which could introduce some bias
+ddsSub <- ddsAll.sc[rowData(ddsAll.sc)$chromosome != "Y"]
+dim(ddsSub)
+```
+
+Order matrix by sds
+```{r}
+exprMat <- assay(ddsSub)
+sds <- genefilter::rowSds(exprMat)
+exprMat <- exprMat[order(sds, decreasing = TRUE),]
+
+plotTab <- tibble(gene1=exprMat[1,], gene2= exprMat[3,], smpID = colnames(exprMat),
+                  treatment = ddsSub$treatment,
+                  patID = ddsSub$patID)
+
+ggplot(plotTab, aes(x=gene1, y=gene2)) +
+  geom_point(aes(col=patID)) +
+  theme(legend.position = "none") +
+  ggtitle("Distribution of expressed genes using sds")
+```
+If we compare the expression of two genes, there are some outlier samples. Samples with a low mapping rate have some genes with a high expression. By using sds these genes get over-normalized. 
+
+Order matrix by mad (median absolute deviation)
+```{r}
+exprMat <- assay(ddsSub)
+sds <- apply(exprMat, 1, function(x) mad(x))
+exprMat <- exprMat[order(sds, decreasing = TRUE),]
+
+plotTab <- tibble(gene1=exprMat[1,], gene2= exprMat[3,], smpID = colnames(exprMat),
+                  treatment = ddsSub$treatment,
+                  patID = ddsSub$patID)
+
+ggplot(plotTab, aes(x=gene1, y=gene2)) +
+  geom_point(aes(col=patID)) +
+  theme(legend.position = "none") +
+  ggtitle("Distribution of expressed genes using mad")
+```
+***Using median absolute deviation for ordering the genes (prior to plotting PCAs) improves the distribution of samples.***
+
+
+# PCA on counts without patient effect adjustment
+
+For the PCA we use the counts normalized with scTransform and then variance stabilized (vst after scTransform).
+
+Prefiltering
+```{r}
+exprMat <- assay(ddsAll.vst)
+meanExpr <- colMeans(exprMat)
+# using mad instead of rowSds
+sds <- apply(exprMat, 1, function(x) mad(x))
+# using 5000 most variant genes
+exprMat <- exprMat[order(sds, decreasing = TRUE)[1:5000],]
+```
+
+Calculate PCA
+```{r}
+pcRes <- prcomp(t(exprMat), center = T, scale. = T)
+pcTab <- pcRes$x[,1:100] %>%
+    as_tibble(rownames = "smpID") %>%
+    left_join(as_tibble(colData(ddsAll.vst),
+                        rownames = "smpID"), by = "smpID") %>%
+  mutate(meanExp = meanExpr)
+```
+
+Variance explained by top 10 PC
+```{r}
+library(factoextra)
+fviz_screeplot(pcRes, addlabels=TRUE, ylim = c(0, 14))
+```
+
+PCA colored by mapping rate
+```{r}
+ggplot(pcTab, aes(x=PC1, y=PC2, col = mapping_rate)) +
+    geom_point()
+```
+
+```{r}
+ggplot(pcTab, aes(x=PC1, y=mapping_rate, col=mapping_rate)) +
+  geom_point() +
+  geom_smooth(method="glm") +
+  ggtitle("Correlation between PC1 and mapping rate") +
+    annotate(x=92, y=31, 
+         label=paste("R = ", round(cor(pcTab$PC1, pcTab$mapping_rate),2)), 
+         geom="text", size=5)
+```
+
+PCA colored by viability
+```{r}
+ggplot(pcTab, aes(x=PC1, y=PC2, col = FSC.SSC)) +
+    geom_point()
+```
+PC1 is still viability, but the variance explained is much lower. 
+
+```{r}
+ggplot(pcTab, aes(x=PC1, y=FSC.SSC, col=FSC.SSC)) +
+  geom_point() +
+  geom_smooth(method="glm") +
+  ggtitle("Correlation between PC1 and mapping rate") +
+    annotate(x=92, y=78, 
+         label=paste("R = ", round(cor(pcTab$PC1, pcTab$FSC.SSC),2)), 
+         geom="text", size=5)
+```
+
+PCA colored by IGHV
+```{r}
+ggplot(pcTab, aes(x=PC1, y=PC2, col = IGHV)) +
+    geom_point()
+```
+
+PCA colored by treatments
+```{r, fig.width=15, fig.height=8}
+p1 <- ggplot(pcTab, aes(x=PC1, y=PC2, col = treatment)) +
+    geom_point()
+p2 <- ggplot(pcTab, aes(x=PC1, y=PC3, col = treatment)) +
+    geom_point()
+p3 <- ggplot(pcTab, aes(x=PC1, y=PC4, col = treatment)) +
+    geom_point()
+p4 <- ggplot(pcTab, aes(x=PC1, y=PC5, col = treatment)) +
+    geom_point()
+p5 <- ggplot(pcTab, aes(x=PC5, y=PC7, col = treatment)) +
+    geom_point()
+
+cowplot::plot_grid(p1, p2, p3, p4, p5, ncol=3)
+```
+
+Correlation between PCs and treatment types
+```{r}
+testTab <- dplyr::select(pcTab,smpID, contains("PC"), treatment) %>%
+    pivot_longer(-c("smpID","treatment"), names_to = "PC", values_to = "value")
+
+resTab <- group_by(testTab, PC) %>% nest() %>%
+    mutate(m=map(data, ~anova(lm(value~treatment,.)))) %>%
+    mutate(res = map(m, broom::tidy)) %>%
+    unnest(res) %>% arrange(p.value) %>%
+    dplyr::select(PC, p.value)
+
+resTab
+
+ggplot(pcTab, aes(x=treatment, y=PC1)) +
+    geom_point() + geom_boxplot()
+
+ggplot(pcTab, aes(x=treatment, y=PC5)) +
+    geom_point() + geom_boxplot()
+
+ggplot(pcTab, aes(x=treatment, y=PC7)) +
+    geom_point() + geom_boxplot()
+```
+
+
+# PCA on scTransformed vst counts adjusted by patID using ComBat
+
+## Adjust for patient effect
+
+scTransform can directly adjust for patient effect (but this takes more than 40 minutes)
+```{r, eval=FALSE}
+countMat <- counts(ddsDrug)
+patTab <- data.frame(colData(ddsDrug))[,c("patID","ID"),drop=FALSE]
+scModel <- sctransform::vst(countMat,
+                            cell_attr = patTab,
+                            return_corrected_umi = TRUE,
+                            latent_var_nonreg  = "patID")
+save(scModel, file = "./output/scModel_adjusted.RData")
+countMat.norm <- as.matrix(scModel$umi_corrected)
+countMat.sc <- as.matrix(scModel$y)
+
+ddsAll.adj <- DESeqDataSetFromMatrix(countMat.norm, colData = colData(ddsDrug), design = ~1)
+rowData(ddsAll.adj) <- rowData(ddsDrug[rownames(countMat.norm)],)
+ddsAll.adj.sc <- ddsAll.adj
+assay(ddsAll.adj.sc) <- countMat.sc
+```
+
+```{r,eval=FALSE}
+vsn::meanSdPlot(countMat.sc)
+```
+
+Instead of adjusting for patient effect withing the formula of sc transform, we can simply use ComBat. This is much faster and has a similar effect. The removeBatchEffect function from the limma package has a similar effect, but ComBat is preferred here, since ComBat adjusts for differences in both the mean and variance differences across the batches, whereas limma assumes that the batch variances are the same and only accounts for mean differences across the batches. As there are large differences between the patients, ComBat is the method of choice.
+```{r}
+ddsCombat <- ddsAll.vst
+exprMat <- sva::ComBat(assay(ddsAll.vst),
+                       batch = factor(ddsAll.vst$patID))
+assay(ddsCombat) <- exprMat
+```
+
+```{r}
+vsn::meanSdPlot(assay(ddsCombat))
+hist(rowMeans(assay(ddsCombat)), breaks = 100)
+```
+
+```{r, eval=FALSE, include=FALSE}
+# Adjust for patient effect (use the adjusted scModel)
+ddsAll.adj.sc.sub <- ddsAll.adj.sc[rownames(ddsSub),]
+ddsCombat <- ddsAll.adj.sc.sub
+```
+
+Subset for selected drugs
+```{r}
+drugs <- c("DMSO","Nutlin-3a","Ibrutinib","Duvelisib")
+ddsCombat.sub <- ddsCombat[,ddsCombat$treatment %in% drugs] 
+ddsAll.vstsub <- ddsAll.vst[,ddsAll.vst$treatment %in% drugs] 
+```
+
+## Calculate PCAs
+
+Prefiltering
+```{r}
+exprMat <- assay(ddsCombat.sub)
+# Using mad instead of rowSds
+sds <- apply(exprMat,1,function(x) mad(x))
+meanExpr <- colMeans(exprMat)
+#sds <- genefilter::rowSds(exprMat)
+exprMat <- exprMat[order(sds, decreasing = TRUE)[1:5000],]
+```
+
+Calculate PCA
+```{r}
+pcRes <- prcomp(t(exprMat), center = T, scale. = T)
+pcTab <- pcRes$x[,1:100] %>%
+    as_tibble(rownames = "smpID") %>%
+    left_join(as_tibble(colData(ddsCombat.sub),
+                        rownames = "smpID"), by = "smpID") %>%
+    mutate(meanExp = meanExpr)
+```
+
+Variance explained by top 10 PC
+```{r}
+library(factoextra)
+fviz_screeplot(pcRes, addlabels=TRUE, ylim = c(0, 11))
+```
+PC1 explains now much less variance. Thus, transforming the counts using scTransform and correcting for patient ID has a strong impact. 
+
+PCA colored by mapping rate
+```{r}
+ggplot(pcTab, aes(x=PC1, y=PC2, col = mapping_rate)) +
+    geom_point()
+```
+
+```{r}
+ggplot(pcTab, aes(x=PC1, y=mapping_rate, col=mapping_rate)) +
+  geom_point() +
+  geom_smooth(method="glm") +
+  ggtitle("Correlation between PC1 and mapping rate") +
+    annotate(x=43, y=26, 
+         label=paste("R = ", round(cor(pcTab$PC1, pcTab$mapping_rate),2)), 
+         geom="text", size=5)
+```
+
+PCA colored by viability
+```{r}
+ggplot(pcTab, aes(x=PC1, y=PC2, col = FSC.SSC)) +
+    geom_point()
+```
+
+```{r}
+ggplot(pcTab, aes(x=PC1, y=FSC.SSC, col=FSC.SSC)) +
+  geom_point() +
+  geom_smooth(method="glm") +
+  ggtitle("Correlation between PC1 and mapping rate") +
+    annotate(x=-46, y=83, 
+         label=paste("R = ", round(cor(pcTab$PC1, pcTab$FSC.SSC),2)), 
+         geom="text", size=5)
+```
+
+PCA colored by IGHV
+```{r}
+ggplot(pcTab, aes(x=PC1, y=PC2, col = IGHV)) +
+    geom_point()
+```
+
+PCA colored by treatments
+```{r, fig.width=15, fig.height=8}
+p1 <- ggplot(pcTab, aes(x=PC1, y=PC2, col = treatment)) +
+    geom_point()
+p2 <- ggplot(pcTab, aes(x=PC1, y=PC3, col = treatment)) +
+    geom_point()
+p3 <- ggplot(pcTab, aes(x=PC1, y=PC4, col = treatment)) +
+    geom_point()
+p4 <- ggplot(pcTab, aes(x=PC1, y=PC5, col = treatment)) +
+    geom_point()
+p5 <- ggplot(pcTab, aes(x=PC5, y=PC7, col = treatment)) +
+    geom_point()
+
+cowplot::plot_grid(p1, p2, p3, p4, p5, ncol=3)
+```
+
+Correlation between PCs and treatment types
+```{r}
+testTab <- dplyr::select(pcTab,smpID, contains("PC"), treatment) %>%
+    pivot_longer(-c("smpID","treatment"), names_to = "PC", values_to = "value")
+
+resTab <- group_by(testTab, PC) %>% nest() %>%
+    mutate(m=map(data, ~anova(lm(value~treatment,.)))) %>%
+    mutate(res = map(m, broom::tidy)) %>%
+    unnest(res) %>% arrange(p.value) %>%
+    dplyr::select(PC, p.value)
+
+resTab
+
+ggplot(pcTab, aes(x=treatment, y=PC1)) +
+    geom_point() + geom_boxplot()
+
+ggplot(pcTab, aes(x=treatment, y=PC2)) +
+    geom_point() + geom_boxplot()
+
+ggplot(pcTab, aes(x=treatment, y=PC3)) +
+    geom_point() + geom_boxplot()
+
+ggplot(pcTab, aes(x=treatment, y=PC7)) +
+    geom_point() + geom_boxplot()
+```
+
+## UMAP
+```{r, cache=FALSE}
+library(smallvis)
+#Calculate UMAP layout, which can better retain global structure
+plotTab <- smallvis(t(exprMat), method = "umap", perplexity = 25, 
+                    eta = 0.01, epoch_callback = FALSE, verbose = FALSE)
+colnames(plotTab) <- c("umap1","umap2")
+
+plotTab <- plotTab %>% as_tibble() %>% mutate(smpID = colnames(exprMat)) %>%
+  left_join(as_tibble(colData(ddsCombat.sub), rownames = "smpID"), by = "smpID") 
+
+ggplot(plotTab, aes(x=umap1, y=umap2, col = treatment)) +
+    geom_point()
+```
+
+
+# MOFA on un-adjusted matrix
+
+As input for MOFA we use the count matrix adjusted with scTransform (vst), but not additionally adjusted for patient effect. 
+```{r}
+ddsMofa <- ddsAll.vstsub
+
+# using only 5000 most variant genes to increase speed
+sds <- apply(assay(ddsMofa), 1, function(x) mad(x))
+ddsMofa <- ddsMofa[order(sds, decreasing = TRUE)[1:5000],]
+
+exprObj <- lapply(unique(ddsMofa$treatment), function(x) {
+  ddsEach <- ddsMofa[,ddsMofa$treatment==x]
+  exprMat <- assay(ddsEach)
+  colnames(exprMat) <- ddsEach$patID
+  exprMat
+})
+names(exprObj) <- unique(ddsMofa$treatment)
+```
+
+Prepare genomics
+```{r}
+geneTab <- filter(patMeta, Patient.ID %in% unique(ddsCombat.sub$patID)) %>%
+    select(Patient.ID, IGHV.status:U1) %>%
+    mutate(across(!contains("Patient"), as.factor)) %>%
+    mutate(across(!contains("Patient"), as.numeric)) %>%
+    column_to_rownames("Patient.ID") %>% as.matrix()
+geneTab <- geneTab-1
+
+geneTab <- geneTab[,colSums(!is.na(geneTab))/nrow(geneTab) > 0.6 &
+                       colSums(geneTab == 1, na.rm = TRUE) >= 3]
+geneMat <- t(geneTab)
+
+exprObj$Gene = geneMat
+```
+
+Define function for running MOFA
+```{r}
+running_mofa <- function(obj, var=0.01, mode="slow",
+                         nFac=20, maxIter=10000){
+  
+  ### Setup MOFA training parameters
+  # Define data options
+  DataOptions <- get_default_data_options(obj)
+
+  #Define model options
+  ModelOptions <- get_default_model_options(obj)
+  #ModelOptions$likelihoods["Gene"] <- "bernoulli"
+  # number of factors to start with
+  # (in each iteration number of factors is tried to be reduced)
+  ModelOptions$num_factors <- nFac
+  #ModelOptions
+
+  # Define training options
+  TrainOptions <- get_default_training_options(obj)
+  TrainOptions$convergence_mode <- mode
+  TrainOptions$maxiter <- maxIter
+  # Automatically drop factors that explain less than x% of variance
+  TrainOptions$drop_factor_threshold <- var
+  #TrainOptions
+  
+  ### Run MOFA model
+  obj_prep <- prepare_mofa(
+    obj, 
+    data_options = DataOptions,
+    model_options = ModelOptions,
+    training_options = TrainOptions
+  )
+
+  obj_res <- run_mofa(obj_prep)
+  return(obj_res)
+}
+```
+
+Create MOFA object
+```{r}
+mofaData <- exprObj
+
+# Create MultiAssayExperiment object 
+mofaData <- MultiAssayExperiment::MultiAssayExperiment(
+  experiments = mofaData)
+```
+
+```{r}
+MOFAobject <- create_mofa_from_MultiAssayExperiment(mofaData)
+plot_data_overview(MOFAobject)
+```
+
+```{r}
+MOFAobject_res <- running_mofa(obj=MOFAobject, var=0.01, mode ="slow")
+save(MOFAobject_res, file = "./output/MOFAres_unadjustedPat_vstX.RData")
+```
+
+Load result and show factors per view
+```{r}
+load("./output/MOFAres_unadjustedPat_vstX.RData")
+plot_variance_explained(MOFAobject_res, x="view", y="factor")
+```
+Without adjusting for patients, more factors are shared across treatments. Thus, adjusting for patient effect leads to more distinct results.
+
+Factor correlation matrix
+```{r, fig.width=10, fig.height=10}
+plot_factor_cor(MOFAobject_res)
+```
+
+Total variance explained
+```{r, fig.width=5, fig.height=4}
+plot_variance_explained(MOFAobject_res, plot_total = T)[[2]]
+```
+
+## Factor heatmap
+
+```{r, fig.height=6, fig.width=18}
+#gene annotation
+facMat <- t(get_factors(MOFAobject_res)[[1]])[1:10,]
+
+patAnno <- as.data.frame(colData(ddsDrug))
+patAnno <- patAnno[!duplicated(patAnno[,"patID"]),]
+patAnno <- remove_rownames(patAnno) %>%
+  column_to_rownames(var="patID")
+
+colAnno <- tibble(Name = colnames(facMat)) %>%
+    mutate(IGHV = patAnno[Name, "IGHV"],
+           trisomy12 = patAnno[Name, "trisomy12"],
+           TP53 = patAnno[Name, "TP53"],
+           KRAS = patAnno[Name, "KRAS"]) %>%
+    data.frame() %>% column_to_rownames("Name")
+
+pheatmap(facMat, clustering_method = "complete",
+         annotation_col = colAnno, scale = "none")
+```
+
+Add meta data to MOFA result
+```{r}
+sample_metadata <- as.data.frame(colData(ddsMofa))
+sample_metadata$sample <- sample_metadata$patID
+
+# Filter metadata by patIDs
+sample_metadata <- sample_metadata[sample_metadata$sample %in% MOFAobject_res@samples_metadata$sample,]
+sample_metadata <- sample_metadata[!duplicated(sample_metadata$sample), ]
+
+# The number of rows must match the total number of samples in the model
+sum(MOFAobject_res@dimensions$N) == nrow(sample_metadata)
+
+# Add meta data to MOFA result
+samples_metadata(MOFAobject_res) <- sample_metadata
+```
+
+**Factors colored by annotations**
+```{r}
+plot_factor(MOFAobject_res, 
+  factors = 1:8,
+  color_by = "FSC.SSC")
+```
+
+```{r}
+plot_factor(MOFAobject_res, 
+  factors = 1:8,
+  color_by = "IGHV")
+```
+
+```{r}
+plot_factor(MOFAobject_res, 
+  factors = 1:8,
+  color_by = "Methylation")
+```
+
+Weight of genomic features on LF1
+```{r}
+plot_top_weights(MOFAobject_res,
+ view = "Gene",
+ factor = 1,
+ nfeatures = 10,     # Top number of features to highlight
+ scale = T           # Scale weights from -1 to 1
+)
+```
+Factor 1 is explained by IGHV status and methylation cluster. 
+
+Weight of genomic features on LF2
+```{r}
+plot_top_weights(MOFAobject_res,
+ view = "Gene",
+ factor = 2,
+ nfeatures = 10,
+ scale = T 
+)
+```
+
+Weight of genomic features on LF3
+```{r}
+plot_top_weights(MOFAobject_res,
+ view = "Gene",
+ factor = 3,
+ nfeatures = 10,   
+ scale = T      
+)
+```
+
+Weight of genomic features on LF4
+```{r}
+plot_top_weights(MOFAobject_res,
+ view = "Gene",
+ factor = 4,
+ nfeatures = 10, 
+ scale = T 
+)
+```
+
+Weight of genomic features on LF5
+```{r}
+plot_top_weights(MOFAobject_res,
+ view = "Gene",
+ factor = 5,
+ nfeatures = 10,  
+ scale = T     
+)
+```
+
+Weight of genomic features on LF6
+```{r}
+plot_top_weights(MOFAobject_res,
+ view = "Gene",
+ factor = 6,
+ nfeatures = 10,  
+ scale = T     
+)
+```
+
+Weight of genomic features on LF7
+```{r}
+plot_top_weights(MOFAobject_res,
+ view = "Gene",
+ factor = 7,
+ nfeatures = 10,  
+ scale = T     
+)
+```
+
+Weight of genomic features on LF9
+```{r}
+plot_top_weights(MOFAobject_res,
+ view = "Gene",
+ factor = 9,
+ nfeatures = 10,  
+ scale = T     
+)
+```
+
+# MOFA on patient adjusted matrix
+
+As input for MOFA we use the vst normalized counts by scTransform, which were additionally adjusted for patient effect.
+```{r}
+ddsMofa <- ddsCombat.sub
+
+sds <- apply(assay(ddsMofa),1,function(x) mad(x))
+ddsMofa <- ddsMofa[order(sds, decreasing = TRUE)[1:5000],]
+
+exprObj <- lapply(unique(ddsMofa$treatment), function(x) {
+  ddsEach <- ddsMofa[,ddsMofa$treatment==x]
+  exprMat <- assay(ddsEach)
+  colnames(exprMat) <- ddsEach$patID
+  exprMat
+})
+names(exprObj) <- unique(ddsMofa$treatment)
+```
+
+Prepare genomics
+```{r}
+geneTab <- dplyr::filter(patMeta, Patient.ID %in% unique(ddsCombat.sub$patID)) %>%
+    dplyr::select(Patient.ID, IGHV.status:U1) %>%
+    #select(-Methylation_Cluster) %>%
+    mutate(across(!contains("Patient"), as.factor)) %>%
+    mutate(across(!contains("Patient"), as.numeric)) %>%
+    column_to_rownames("Patient.ID") %>% as.matrix()
+geneTab <- geneTab-1
+
+# Use only genes with mutation in at least 5 patients
+geneTab <- geneTab[,colSums(!is.na(geneTab))/nrow(geneTab) > 0.6 &
+                       colSums(geneTab == 1, na.rm = TRUE) >= 5]
+geneMat <- t(geneTab)
+
+exprObj$Gene = geneMat
+```
+
+```{r}
+# Create object
+mofaData <- exprObj
+
+# Create MultiAssayExperiment object 
+mofaData <- MultiAssayExperiment::MultiAssayExperiment(
+  experiments = mofaData)
+```
+
+Only keep samples that have at all five views
+```{r, eval=FALSE}
+useSamples <- MultiAssayExperiment::sampleMap(mofaData) %>%
+  as_tibble() %>% group_by(primary) %>% summarise(n= length(assay)) %>%
+  filter(n >= 5) %>% pull(primary)
+mofaData <- mofaData[,useSamples]
+```
+
+```{r}
+MOFAobject <- create_mofa_from_MultiAssayExperiment(mofaData)
+MOFAobject
+plot_data_overview(MOFAobject)
+```
+MOFA only uses samples that occur in all five views. 
+
+```{r}
+MOFAobject_res <- running_mofa(obj=MOFAobject, var=0.01, mode="slow")
+save(MOFAobject_res, file = "./output/MOFAres_adjustedPat_vstX.RData")
+```
+
+Load results and show factors per view
+```{r}
+load("./output/MOFAres_adjustedPat_vstX.RData")
+plot_variance_explained(MOFAobject_res, x="view", y="factor")
+```
+
+Factor correlation matrix
+```{r, fig.width=5, fig.height=5}
+plot_factor_cor(MOFAobject_res)
+```
+
+Total variance explained
+```{r, fig.width=5, fig.height=4}
+plot_variance_explained(MOFAobject_res, plot_total = T)[[2]]
+```
+
+## Factor heatmap
+
+Contributions of patients to factors
+```{r, fig.height=6, fig.width=18}
+#gene annotation
+facMat <- t(get_factors(MOFAobject_res)[[1]])
+
+colAnno <- tibble(Name = colnames(facMat)) %>%
+    mutate(IGHV = patAnno[Name, "IGHV"],
+           trisomy12 = patAnno[Name, "trisomy12"],
+           TP53 = patAnno[Name, "TP53"]) %>%
+    data.frame() %>% column_to_rownames("Name")
+
+pheatmap(facMat, clustering_method = "complete",
+         annotation_col = colAnno,
+         scale = "none")
+```
+
+Column medians vs factors of Nutlin
+```{r}
+fac <- facMat[2,]
+facNut <- fac[names(fac) %in% colnames(exprObj$`Nutlin-3a`)]
+medCol <- colMedians(exprObj$`Nutlin-3a`[,names(facNut)])
+plot(facNut, medCol)
+```
+
+Weight of genomic features on LF1
+```{r}
+plot_top_weights(MOFAobject_res,
+ view = "Gene",
+ factor = 1,
+ nfeatures = 10,     # Top number of features to highlight
+ scale = T           # Scale weights from -1 to 1
+)
+```
+
+Weight of genomic features on LF2
+```{r}
+plot_top_weights(MOFAobject_res,
+ view = "Gene",
+ factor = 2,
+ nfeatures = 10,     # Top number of features to highlight
+ scale = T           # Scale weights from -1 to 1
+)
+```
+
+Weight of genomic features on LF3
+```{r}
+plot_top_weights(MOFAobject_res,
+ view = "Gene",
+ factor = 3,
+ nfeatures = 10,
+ scale = T
+)
+```
+
+Weight of genomic features on LF4
+```{r}
+plot_top_weights(MOFAobject_res,
+ view = "Gene",
+ factor = 4,
+ nfeatures = 10,
+ scale = T
+)
+```
+
+Weight of genomic features on LF5
+```{r}
+plot_top_weights(MOFAobject_res,
+ view = "Gene",
+ factor = 5,
+ nfeatures = 10,
+ scale = T
+)
+```
+
+Weight of genomic features on LF6
+```{r}
+plot_top_weights(MOFAobject_res,
+ view = "Gene",
+ factor = 6,
+ nfeatures = 10,
+ scale = T
+)
+```
+
+
+# MOFA on un-adjusted matrix minus DMSO
+
+As input for MOFA we use the count matrix adjusted with scTransform (vst), but not additionally adjusted for patient effect. 
+We subset this count matrix into the different treatments. The DMSO counts matrix is subtracted from each count matrix containing the counts for only one treatment. 
+```{r}
+usePat <- table(ddsAll.vstsub$patID)
+usePat <- names(usePat[usePat==4])
+ddsMofa <- ddsAll.vstsub[,ddsAll.vstsub$patID %in% usePat]
+
+ddsDMSO <- ddsMofa[,ddsMofa$treatment == "DMSO"]
+ddsDrug <- ddsMofa[,ddsMofa$treatment != "DMSO"]
+exprDMSO <- assay(ddsDMSO)
+
+exprObj <- lapply(unique(ddsDrug$treatment), function(x) {
+  ddsEach <- ddsMofa[,ddsMofa$treatment==x]
+  exprMat <- assay(ddsEach)
+  
+  # Subtract DMSO matrix from each treatment matrix
+  exprMat <- exprMat-exprDMSO
+  
+  # Remove genes with median expression = 0
+  exprMat_df <- as.data.frame(exprMat)
+  exprMat_df$row_median <- matrixStats::rowMedians(as.matrix(exprMat_df))
+  exprMat_df <- exprMat_df[exprMat_df$row_median > 0,]
+  exprMat <- exprMat[rownames(exprMat) %in% rownames(exprMat_df),]
+
+  # Only keep 5000 most variant genes 
+  sds <- apply(exprMat, 1, function(x) mad(x))
+  exprMat<- exprMat[order(sds, decreasing = TRUE)[1:5000],]
+
+  colnames(exprMat) <- ddsEach$patID
+  exprMat
+})
+names(exprObj) <- unique(ddsDrug$treatment)
+```
+
+Prepare genomics
+```{r}
+geneTab <- filter(patMeta, Patient.ID %in% unique(ddsAll.vstsub$patID)) %>%
+    select(Patient.ID, IGHV.status:U1) %>%
+    mutate(across(!contains("Patient"), as.factor)) %>%
+    mutate(across(!contains("Patient"), as.numeric)) %>%
+    column_to_rownames("Patient.ID") %>% as.matrix()
+geneTab <- geneTab-1
+
+# Use only genes with mutation in at least 5 patients
+geneTab <- geneTab[,colSums(!is.na(geneTab))/nrow(geneTab) > 0.6 &
+                       colSums(geneTab == 1, na.rm = TRUE) >= 5]
+geneMat <- t(geneTab)
+
+exprObj$Gene = geneMat
+```
+
+```{r}
+# Create MultiAssayExperiment object 
+mofaData <- MultiAssayExperiment::MultiAssayExperiment(
+  experiments = exprObj)
+
+mofaData@ExperimentList
+mofaData@sampleMap
+```
+
+```{r, eval=FALSE}
+MOFAobject <- create_mofa_from_MultiAssayExperiment(mofaData)
+MOFAobject
+plot_data_overview(MOFAobject)
+```
+
+```{r, eval=FALSE}
+MOFAobject_res <- running_mofa(obj=MOFAobject, var=0.01, mode="fast")
+save(MOFAobject_res, file = "./output/MOFAres_contrast_vstX.RData")
+```
+
+Load result and show factors per view
+```{r, eval=FALSE}
+load("./output/MOFAres_contrast_vstX.RData")
+plot_variance_explained(MOFAobject_res, x="view", y="factor")
+```
+
+Factor correlation matrix
+```{r, eval=FALSE, fig.width=5, fig.height=5}
+plot_factor_cor(MOFAobject_res)
+```
+
+Total variance explained
+```{r, eval=FALSE, fig.width=5, fig.height=4}
+plot_variance_explained(MOFAobject_res, plot_total = T)[[2]]
+```
+
+## Factor heatmap
+
+```{r, eval=FALSE, fig.height=6, fig.width=12}
+facMat <- t(get_factors(MOFAobject_res)[[1]])[1:10,]
+
+colAnno <- tibble(Name = colnames(facMat)) %>%
+    mutate(IGHV = patAnno[Name, "IGHV"],
+           trisomy12 = patAnno[Name, "trisomy12"],
+           TP53 = patAnno[Name, "TP53"]) %>%
+    data.frame() %>% column_to_rownames("Name")
+
+pheatmap(facMat, clustering_method = "complete",
+         annotation_col = colAnno, scale = "none")
+```
+
+Column medians vs factors of Ibrutinib
+```{r, eval=FALSE}
+fac <- facMat[1,]
+# Vectors need to have the same length
+facIbr <- fac[names(fac) %in% colnames(exprObj$Ibrutinib)]
+# Order Nutlin columns by factor names
+medCol <- colMedians(exprObj$Ibrutinib[,names(facIbr)])
+plot(facIbr, medCol)
+```
+
+Weight of genomic features on LF1
+```{r, eval=FALSE}
+plot_top_weights(MOFAobject_res,
+ view = "Gene",
+ factor = 1,
+ nfeatures = 10,     # Top number of features to highlight
+ scale = T           # Scale weights from -1 to 1
+)
+```
+
+Weight of genomic features on LF2
+```{r, eval=FALSE}
+plot_top_weights(MOFAobject_res,
+ view = "Gene",
+ factor = 2,
+ nfeatures = 10,     # Top number of features to highlight
+ scale = T           # Scale weights from -1 to 1
+)
+```
+
+Weight of genomic features on LF3
+```{r, eval=FALSE}
+plot_top_weights(MOFAobject_res,
+ view = "Gene",
+ factor = 3,
+ nfeatures = 10,     # Top number of features to highlight
+ scale = T           # Scale weights from -1 to 1
+)
+```
+
+# Session Info Details
+```{r, echo=FALSE, eval=TRUE}
+sessionInfo()
+```
+

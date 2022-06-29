@@ -1,0 +1,1009 @@
+---
+title: "Contrastive Poisson Latent Variable Model (CPLVM)"
+author: "Caroline Lohoff"
+date: "April 13 2022"
+output:
+  BiocStyle::html_document:
+    toc_float: true
+---
+
+# Description
+The objective of the analysis is to find genes that are associated with the individual treatments and also genes associated with viability.  
+
+Therefore, we use a method called Contrastive Poissin Latent Variable Model (CPLVM).
+This method is a probabilistic counterpart to contrastive PCAs.
+The contrastive latent variable model (CLVM, Severson et al. 2019) captures structure that is unique to the foreground data,
+as well as structure shared between the conditions. The CLVM assumes Gaussian errors, which is not ideal for modeling count-based expression profiles. Thus, a Poisson data likelihood that accounts for the count-based data produced by sequencing technologies is used in CPLVM. 
+
+CPLVM provides a common framework for both factor analysis and hypothesis testing, since it is useful to quantify the statistical significance of changes in the covariance structure of expression across treatments and controls in an experimental setting.
+Given a count-based foreground dataset and a count-based background dataset, CPLVM is designed to capture variation and covariation among count data that are unique to the foreground condition (treatment), as well as structure and variation that are shared between the foreground and background (DMSO).
+The aim is to specify the covariance of Poisson-distributed data (loading vectors in PCA).
+The method is described in the paper by [Jones et al.](https://arxiv.org/abs/2102.06731) and in [GitHub](https://github.com/andrewcharlesjones/cplvm).
+
+CPLVM is built on a hypothesis testing framework that quantifies support for structured changes in variation across conditions. Throughout, the method relies on principled probabilistic modeling of count data, rather than data transformations and Gaussian models. The model explicitly accounts for the count-based nature of gene expression profiles, while decomposing treatment-control data into a small set of interpretable factors. CPLVM can identify changes in experimental and biological conditions that standard differential expression methods are not able to detect.
+
+![Figure 1: CPLVM matrix approximation](/Users/carolinelohoff/Documents/CPLVM/CPLVM_model_explanation.png){#id .class width=110% height=110%}
+
+The analysis is done in Python, but we have to prepare the input first.
+As input we use the variance stabilisation transformed gene expression count matrices with >17000 genes and around 100 samples per treatment.
+We fit the CPLVM separately to the datasets from each of the 10 drugs. As a result, we obtain the shared loadings (viability, mutational status, etc.) and the foreground-specific loadings (effect of each drug on gene expression).
+
+# Preparations
+
+## Load data and packages
+
+Set global options
+```{r setup, include=FALSE, cache = FALSE}
+knitr::opts_knit$set(root.dir = "~/Documents/R/drugseq_test")
+knitr::opts_chunk$set(warning = FALSE, message = FALSE)
+```
+
+Load packages
+```{r}
+suppressPackageStartupMessages({
+  library(DESeq2)
+  library(tidyverse)
+  library(sjmisc)
+  library(RColorBrewer)
+  library(cowplot)
+  library(pheatmap)
+  library(utils)
+})
+```
+
+Set global ggplot variables
+```{r}
+theme_set(theme_bw() + theme(axis.text = element_text(size=12), 
+                             axis.title = element_text(size=14),
+                             legend.title = element_text(size=14),
+                             legend.text = element_text(size=12),
+                             plot.title = element_text(size=15,
+                                                       hjust=0.5,face="bold")))
+
+# Define color palette for batches
+cp <- c("#2CB902", "#FD7306", "#FF1EBE", "#0137A4", "#C8C701")
+```
+
+Load data and add annotations
+```{r}
+# Load dds data set containing 1106 samples and count matrix
+load("./output/ddsDrug_htseq_batchPilot1c234_20220207.RData")
+
+# Load meta data including genotyping info
+load("./data/patmeta_210324.RData")
+
+# Add columns to DESeq object using patient meta data
+col_vec <- c("diagnosis", "gender", "Methylation_Cluster", "trisomy12", "NOTCH1", "TP53",
+             "ATM", "FBXW7", "MED12", "BRAF", "SF3B1", "del11q", "del17p", "del13q")
+ddsDrug@colData@listData <- lapply(col_vec, function(n) {
+  ddsDrug[[n]] <- patMeta[match(ddsDrug$patID, patMeta$Patient.ID), n]
+}) %>% bind_cols() %>% sjmisc::add_columns(ddsDrug@colData@listData)
+
+names(ddsDrug@colData@listData)[names(ddsDrug@colData@listData) == "Methylation_Cluster"] <- "Methylation"
+ddsDrug$IGHVpat <- patMeta[match(ddsDrug$patID, patMeta$Patient.ID),]$IGHV.status
+ddsDrug$IGHV <- ifelse(is.na(ddsDrug$IGHV), ddsDrug$IGHVpat, ddsDrug$IGHV)
+ddsDrug$IGHVpat <- NULL
+
+# Add meta data to the samples from the pilot batch
+ddsDrug$diagnosis[ddsDrug$batch == "pilot"] <- "CLL" 
+ddsDrug$trisomy12[ddsDrug$batch == "pilot"] <- 0
+ddsDrug$TP53[ddsDrug$batch == "pilot"] <- 0
+ddsDrug$NOTCH1[ddsDrug$batch == "pilot"] <- 0
+ddsDrug$del13q[ddsDrug$batch == "pilot"] <- 1
+ddsDrug$IGHV[ddsDrug$batch == "pilot" & ddsDrug$patID %in% c("PID1095", "PID1222")] <- "U"
+ddsDrug$IGHV[ddsDrug$batch == "pilot" & ddsDrug$patID %in% c("PID1177", "PID1210")] <- "M"
+ddsDrug$gender[ddsDrug$batch == "pilot" & ddsDrug$patID %in% c("PID1095", "PID1222")] <- "f"
+ddsDrug$gender[ddsDrug$batch == "pilot" & ddsDrug$patID %in% c("PID1177", "PID1210")] <- "m"
+```
+
+
+## Transform data
+
+Filter genes
+```{r filter-genes}
+# Only use protein coding genes and include only CLL samples in analysis
+ddsAll <- ddsDrug[rowData(ddsDrug)$biotype == "protein_coding" & !rowData(ddsDrug)$symbol %in% c(NA, ""),
+                  ddsDrug$diagnosis == "CLL" & ddsDrug$treatment != "Baseline" & ddsDrug$Replicate == 1]
+
+# Remove all mitochondrial and artificial chromosomes
+ddsAll <- ddsAll[rowData(ddsAll)$chromosome %in% c(1:22,"X","Y")]
+
+# Remove genes on Y chromosome which could introduce some bias
+ddsAll <- ddsAll[rowData(ddsAll)$chromosome != "Y"]
+# ddsAll <- ddsAll[!rowData(ddsAll)$chromosome %in% c("X","Y")]
+table(rowData(ddsAll)$chromosome)
+
+# Keep only genes with a minimum of 10 counts in any sample
+keep_counts <- apply(counts(ddsAll), 1, function(x) any(x >= 10))
+ddsAll <- ddsAll[keep_counts,]
+dim(ddsAll)
+
+# Keep only genes expressed in at least 10% of all samples
+# (most genes have a basal expression)
+expr_min <- round(ncol(counts(ddsAll)) * 0.9)
+keep_counts_expr <- apply(counts(ddsAll), 1, function(x) sum(x == 0) < expr_min)
+ddsAll_expr <- ddsAll[keep_counts_expr,]
+dim(ddsAll_expr)
+```
+
+Extract count matrix and patient annotations df
+```{r}
+# Extract count matrix
+counts_df <- data.frame(assay(ddsAll))
+
+# Retrieve patient annotations from dds object as data frame
+patAnno_all <- colData(ddsAll) %>% as_tibble() %>%
+  mutate(treatment = str_replace_all(treatment,"[- ]","_"))
+patAnno <- patAnno_all %>%
+  dplyr::select(-c(fileName, expID, expBatch, Replicate, time, Barcode,
+                   Input.concentration, RIN, IDplate, Library.concentration,
+                   Libary.molarity, Average.fragment.size))
+```
+
+Variance stabilization transformation of the raw data
+```{r vst}
+RNAnorm_all <- varianceStabilizingTransformation(ddsAll)
+counts_df_vst <- data.frame(assay(RNAnorm_all))
+```
+
+Extract a vector with the names of all drug treatments and DMSO
+```{r}
+allTreatDMSO <- patAnno %>%
+  distinct(treatment) %>% pull(treatment)
+allTreat <- allTreatDMSO[!allTreatDMSO == "DMSO"]
+```
+
+## PCA
+
+The principal component analysis is calculated based on data normalized and transformed using the variance stabilizing transformation (vst) provided by the DESeq2 package.
+Principle component analysis is a substantial part of quality control in order to explore the variation in the data.
+```{r}
+exprMat <- assay(RNAnorm_all)
+sds <- rowSds(exprMat)
+
+# Invariant filtering of top 5000 most variable genes.
+# (The genes with the largest variance in gene expression are the most interesting genes.)
+exprMat_5000 <- exprMat[order(sds, decreasing=T)[1:5000],]
+
+# Calculate the PCA
+pcaRes5000 <- prcomp(t(exprMat_5000), scale=TRUE, center=TRUE)  
+varExp5000 <- (pcaRes5000$sdev^2 / sum(pcaRes5000$sdev^2))*100
+pcaTab5000 <- data.frame(pcaRes5000$x[,1:10]) %>%
+  rownames_to_column("ID") %>% left_join(patAnno)
+names(varExp5000) <- colnames(pcaRes5000$x)
+```
+
+
+# CPLVM all treatments
+
+## Prepare data
+
+The raw gene expression counts can be used as input, since CPLVM uses a Poisson model. In the paper they log transform nonzero elements only. 
+We extract the 5000 most variable genes and split the counts matrix into the samples from the individual treatments. 
+
+```{r, eval=FALSE, include=TRUE}
+# Extract expression matrix
+exprMatraw <- assay(ddsAll)
+
+# Option 1: Filter 5000 most variable genes based on raw expression
+sds_raw <- rowSds(exprMatraw)
+exprMatraw_5000 <- exprMatraw[order(sds_raw,
+                                    decreasing=T)[1:5000],]
+diff <- setdiff(rownames(exprMat_5000), rownames(exprMatraw_5000))
+print(length(diff))
+
+# Option 2: Filter 5000 most variable genes based on vst counts
+exprMatraw_5000n <- exprMatraw[rownames(exprMatraw) %in% rownames(exprMat_5000),]
+
+# Split the gene expression matrix into the different drugs
+exprMat_list <- lapply(allTreatDMSO, function(tr) {
+  IDs <- patAnno[patAnno$treatment == tr, ]$ID
+  exprMat <- exprMatraw_5000n[, colnames(exprMatraw_5000n) %in% IDs]
+})
+names(exprMat_list) <- allTreatDMSO
+
+# Save the transposed expression matrices as csv files
+j <- 1
+for(mat in exprMat_list){
+  transposed <- t(mat)
+  utils::write.table(format(transposed, scientific=FALSE), 
+              file = sprintf("/Users/carolinelohoff/Documents/CPLVM/exprMat5000raw_%s_20220405.csv",
+                              names(exprMat_list)[j]), sep=",",
+              col.names=FALSE, row.names=FALSE)
+  j <- j+1
+}
+```
+
+## Load model results from Python
+
+Load resulting matrices, all combined to one large data frame
+```{r}
+# Define number of shared factors and treatment-specific factors
+k_shared <- 6
+k_foreground <- 3
+
+# Load results of CPLVM
+CPLVM_loading_df <- read.csv(sprintf("/Users/carolinelohoff/Documents/CPLVM/CPLVM_loadings_s%s_f%s_df.csv",
+                                     k_shared, k_foreground), header=T)
+CPLVM_loading_df <- CPLVM_loading_df[-c(1)]
+
+# Extract expression matrix
+exprMatraw <- assay(ddsAll)
+exprMatraw_5000n <- exprMatraw[rownames(exprMatraw) %in% rownames(exprMat_5000),]
+
+# Add Ensembl column to df
+CPLVM_loading_df$Ensembl <- rownames(exprMatraw_5000n)
+CPLVM_loading_df <- CPLVM_loading_df %>%
+  mutate(symbol = rowData(ddsDrug)[Ensembl,]$symbol)
+```
+
+Import correlation coefficients and add column names
+```{r}
+CPLVM_cor <- read.csv(sprintf("/Users/carolinelohoff/Documents/CPLVM/CPLVM_cor_s%s_f%s.csv",
+                                     k_shared, k_foreground), header=F)
+col_names <- c()
+
+for(tr in allTreat){
+  col_names <- append(col_names, sprintf("Shared_%s",tr))
+  col_names <- append(col_names, tr)
+}
+colnames(CPLVM_cor) <- col_names
+
+# Split data frame into shared and specific variables
+CPLVM_cor_shared <- CPLVM_cor[seq(1, length(CPLVM_cor), 2)]
+CPLVM_cor_tr <- CPLVM_cor[seq(2, length(CPLVM_cor), 2)]
+
+cat(sprintf("The accuracy between the original gene expression matrices and the ones approximated by CPLVM is
+            for the %s shared variables between %s%% and %s%% and
+            for the %s treatment-specific variables between %s%% and %s%%.",
+            k_shared, apply(CPLVM_cor_shared,1,FUN=min)*100,
+            apply(CPLVM_cor_shared,1,FUN=max)*100,
+            k_foreground, apply(CPLVM_cor_tr,1,FUN=min)*100,
+            apply(CPLVM_cor_tr,1,FUN=max)*100))
+```
+
+### Check accuracy of CPLVM models with different amount of factors
+```{r}
+CPLVM_cor4 <- read.csv("/Users/carolinelohoff/Documents/CPLVM/CPLVM_cor_s5_f4.csv", header=F)
+col_names <- c()
+
+for(tr in allTreat){
+  col_names <- append(col_names, sprintf("Shared_%s",tr))
+  col_names <- append(col_names, tr)
+}
+colnames(CPLVM_cor4) <- col_names
+
+# Split data frame into shared and specific variables
+CPLVM_cor4_shared <- CPLVM_cor4[seq(1, length(CPLVM_cor4), 2)]
+CPLVM_cor4_tr <- CPLVM_cor4[seq(2, length(CPLVM_cor4), 2)]
+
+cat(sprintf("The accuracy between the original gene expression matrices and the ones approximated by CPLVM is
+            for the 5 shared variables between %s%% and %s%% and
+            for the 4 treatment-specific variables between %s%% and %s%%.",
+            apply(CPLVM_cor4_shared,1,FUN=min)*100,
+            apply(CPLVM_cor4_shared,1,FUN=max)*100,
+            apply(CPLVM_cor4_tr,1,FUN=min)*100,
+            apply(CPLVM_cor4_tr,1,FUN=max)*100))
+```
+
+## Filter model results 
+
+Function for quickly testing several numbers of genes as cutoff
+```{r}
+heatmap_CPVLM <- function(n_sig_genes){
+  
+  ### Filter most significant genes for treatments
+  iterate <- k_shared
+
+  # Create list
+  CPLVM_genes_sig <- vector(mode="list", length=1)
+
+  # Loop through the columns of every treatment
+  for(tr in allTreat){
+  
+    #print(tr)
+    genes_vec <- c()
+
+    for(col in seq_len(k_foreground)){
+      column <- iterate + col
+      #print(column)
+      genes_sig <- head(CPLVM_loading_df[order(CPLVM_loading_df[[column]],
+                                             decreasing=TRUE),]$Ensembl, n_sig_genes)
+      genes_vec <- append(genes_vec, genes_sig)
+    }
+    iterate <- column + k_shared
+    CPLVM_genes_sig[[tr]] <- unique(genes_vec)
+  }
+
+  CPLVM_genes_sig <- CPLVM_genes_sig[-1]
+  
+  ### Extract gene expression matrix of vst counts with defined genes
+  all_top_genes <- unique(unlist(CPLVM_genes_sig))
+  exprMatsub <- exprMat[rownames(exprMat) %in% all_top_genes,]
+  exprMatsub <- jyluMisc::mscale(exprMatsub, censor=2)
+
+  ### Create heatmap
+  plot <- pheatmap(exprMatsub, color = color_fill, annotation_col = annoCol,
+          annotation_colors = color_anno, clustering_method = "ward.D2", fontsize=13,
+          labels_col = paste0(patAnno[colnames(exprMatsub),]$patID,"_",
+                              patAnno[colnames(exprMatsub),]$treatment),
+          show_rownames=T, fontsize_row=3, show_colnames=T, fontsize_col=2,
+          main = sprintf("Heatmap of top %s genes per treatment", n_sig_genes*k_foreground))
+  
+  return(plot)
+}
+```
+
+Prepare annotations for heatmap
+```{r}
+# Define annotations
+annoCol <- as.data.frame(RNAnorm_all@colData) %>%
+  dplyr::select(patID, FSC.SSC, treatment, IGHV, TP53, trisomy12, batch) %>%
+  mutate(treatment = str_replace_all(treatment,"[- ]","_"))
+
+annoCol$TP53 <- as.character(annoCol$TP53)
+annoCol$TP53[annoCol$TP53 == "0"] <- "wt"
+annoCol$TP53[annoCol$TP53 == "1"] <- "m"
+annoCol$trisomy12 <- as.character(annoCol$trisomy12)
+annoCol$trisomy12[annoCol$trisomy12 == "0"] <- "wt"
+annoCol$trisomy12[annoCol$trisomy12 == "1"] <- "m"
+
+# Define colors
+color_fill <- colorRampPalette( rev(brewer.pal(9,"RdBu")) )(255)
+color_anno = list(
+  batch = c(pilot="#F8F417", batch1="#B5E222", batch2="#76EE3D", batch3="#07D256", batch4="#0A9C43"),
+  trisomy12 = c(wt = "#DB86C6", m = "#9E137B"),
+  TP53 = c(wt = "#F0C538", m = "#AC8400"),
+  IGHV = c(U="#A4FFF4", M="#17C6B1"),
+  treatment = c(DMSO="#FFFFFF", C26="#E41A1C", Duvelisib="#4A72A6", Everolimus="#7E6E85",
+                IBET762="#D16948", Ibr_x_C26="#FFB716", Ibrutinib="#E1C62F", MK2206="#B75F49",
+                Nutlin_3a = "#EC83BA", Selinexor="#999999", Trametinib="#48A462"))
+```
+
+## Show results in heatmaps
+
+Show most significant genes of every treatment in a heatmap (with a cutoff of 20 genes per factor)
+```{r, fig.width=16, fig.height=13}
+CPVLM_20genes <- heatmap_CPVLM(20)
+CPVLM_20genes 
+```
+
+Show most significant genes of every treatment in a heatmap (with a cutoff of 100 genes per factor)
+```{r, fig.width=16, fig.height=13}
+CPVLM_100genes <- heatmap_CPVLM(100)
+CPVLM_100genes 
+```
+
+Show most significant genes of every treatment in a heatmap (with a cutoff of 500 genes per factor)
+```{r, fig.width=16, fig.height=13}
+CPVLM_500genes <- heatmap_CPVLM(500)
+CPVLM_500genes 
+```
+
+The obtained gene lists can be compared with the ones after conducting differential expression analysis. 
+
+
+# Pathway enrichment analysis
+With the obtained latent variables we can directly perform a gene set hypothesis test, for example with MSigDB Hallmark gene sets.
+
+We will conduct the pathway enrichment analysis with [camera](https://www.rdocumentation.org/packages/limma/versions/3.28.14/topics/camera). 
+This method was proposed by Wu and Smyth in 2012. camera performs a competitive test in the sense defined by [Goeman and Buhlmann](https://doi.org/10.1093/bioinformatics/btm051). It tests whether the genes in the set are highly ranked in terms of differential expression relative to genes not in the set and thereby accounts for inter-gene correlation. As input camera only needs a count matrix and a design matrix. No prior differential expression (DE) is required, as camera performs a DE internally. The advantage of this method is that we obtain the information whether a significant pathway is up- or downregulated.
+
+
+## Preparations
+
+Function for dotplot
+```{r}
+camera_dotplot <- function(result){
+  plot <- result %>%
+  rownames_to_column(var="Pathway") %>%
+  arrange(FDR) %>% slice_head(n=10) %>%
+  ggplot(aes(x=Direction, y=Pathway, group=Direction, col=FDR)) +
+    geom_point(size=5) +
+    theme(axis.title=element_blank(),
+          axis.text=element_text(face="bold")) +
+    scale_colour_gradientn(colours=c("#FF0000", "#E90F97", "#0858FB"))
+  
+  return(plot)
+}
+```
+
+
+First, we have to prepare the background gene lists which we download from [MSigDB](https://www.gsea-msigdb.org/gsea/msigdb/).
+```{r prepare-camera}
+library(clusterProfiler)
+library(annotate)
+library(org.Hs.eg.db)
+
+gmt_KEGG <- read.gmt("data/c2.cp.kegg.v7.4.symbols.gmt.txt")
+gmt_Hallmark <- read.gmt("data/h.all.v7.4.symbols.gmt.txt")
+
+#Function for converting gene name data frame into list
+geneList <- function(source) {
+  pathwayNames <- levels(source$term)
+  newList<- vector("list")
+
+  for (pathway in pathwayNames) {
+    genes <- source$gene[source$term == pathway]
+    newList[[length(newList) + 1]] <- genes 
+  }
+  names(newList) <- pathwayNames
+  return(newList)
+}
+
+geneList_KEGG <- geneList(gmt_KEGG)
+geneList_Hallmark <- geneList(gmt_Hallmark)
+```
+
+Next, a design matrix is defined. 
+```{r}
+treatment = "Ibrutinib"
+patAnno_tr <- patAnno[patAnno$treatment == treatment,]
+
+designMat <- model.matrix(~ 0 + ID, patAnno_tr)
+#designMat <- model.matrix(~ 0 + FSC.SSC, patAnno_tr)
+
+# Subset vst count matrix to contain only samples of specified treatment
+counts_df_tr <- counts_df_vst[, colnames(counts_df_vst) %in% patAnno_tr$ID]
+#counts_df_tr <- counts_df[, colnames(counts_df) %in% patAnno_tr$ID]
+dim(counts_df_tr)
+
+# Rows: all 17000 genes
+# Columns: Only samples from specified treatment
+### --> Count matrix only for information???
+```
+
+Convert Ensembl identifiers to gene symbols
+```{r convert-ids}
+# Convert Ensembl IDs to Entrez IDs
+entrezID = mapIds(org.Hs.eg.db,
+                  keys=row.names(counts_df_tr),
+                  column="ENTREZID",
+                  keytype="ENSEMBL",
+                  multiVals="first")
+
+# Convert Entrez IDs to gene symbols
+gene_symbols <- getSYMBOL(na.omit(as.vector(entrezID)),
+                          data="org.Hs.eg.db")
+
+# Create new df with gene symbols as row names
+counts_df_symbols <- add_column(counts_df_tr, entrezID) %>%
+  drop_na(entrezID) %>% add_column(gene_symbols) %>%
+  dplyr::select(-entrezID) %>% drop_na(gene_symbols) %>%
+  distinct(gene_symbols, .keep_all=TRUE) %>%
+  remove_rownames %>% column_to_rownames(var="gene_symbols")
+
+dim(counts_df_symbols)
+```
+
+Subset the counts data frame
+```{r, eval=FALSE}
+# Filter most significant 1000 genes within one factor for one treatment
+genes_sig <- head(CPLVM_loading_df[order(CPLVM_loading_df[[7]],
+                                             decreasing=TRUE),]$symbol, 1000)
+
+counts_df_symbols_sig <- counts_df_symbols[rownames(counts_df_symbols) %in% genes_sig,]
+dim(counts_df_symbols_sig)
+```
+
+### Results 
+Run camera function 
+```{r run-camera-neg, eval=FALSE}
+cameraRes_KEGG <- limma::camera(counts_df_symbols_sig, geneList_KEGG,
+                                  designMat, inter.gene.cor=0.01)
+cameraRes_Hallmark <- limma::camera(counts_df_symbols_sig, geneList_Hallmark,
+                                       designMat, inter.gene.cor=0.01)
+```
+
+Plot most significant pathways as dotplot
+```{r plot-camera-neg, fig.width=20, fig.height=10, eval=FALSE}
+pKEGG <- camera_dotplot(cameraRes_KEGG)
+pHallmark <- camera_dotplot(cameraRes_Hallmark)
+
+plot_grid(pKEGG, pHallmark, n=2)
+```
+
+
+
+# Focus on Ibrutinib, Duvelisib, and Nutlin 3a
+
+Prepare gene expression matrices
+```{r}
+# Extract expression matrix
+exprMatraw <- assay(ddsAll)
+
+# Filter 5000 most variable genes based on vst counts
+exprMatraw_5000n <- exprMatraw[rownames(exprMatraw) %in% rownames(exprMat_5000),]
+
+# Create a gene expression matrix for DMSO samples only
+IDs_DMSO <- patAnno[patAnno$treatment == "DMSO", ]$ID
+exprMat_DMSO <- exprMatraw_5000n[, colnames(exprMatraw_5000n) %in% IDs_DMSO]
+exprMat_DMSOt <- t(exprMat_DMSO)
+
+# Create a gene expression matrix for treatment samples only
+IDs_tr <- patAnno[patAnno$treatment %in% c("Ibrutinib",
+                                           "Duvelisib", "Nutlin_3a"), ]$ID
+exprMat_IbrDuvNut <- exprMatraw_5000n[, colnames(exprMatraw_5000n) %in% IDs_tr]
+exprMat_IbrDuvNutt <- t(exprMat_IbrDuvNut)
+
+# Save the transposed expression matrices as csv files
+utils::write.table(format(exprMat_DMSOt, scientific=FALSE), 
+                   file = "/Users/carolinelohoff/Documents/CPLVM/exprMatDMSOraw_20220412.csv",
+                   sep=",", col.names=FALSE, row.names=FALSE)
+
+utils::write.table(format(exprMat_IbrDuvNutt, scientific=FALSE), 
+                   file = "/Users/carolinelohoff/Documents/CPLVM/exprMatIbrDuvNutraw_20220412.csv",
+                   sep=",", col.names=FALSE, row.names=FALSE)
+```
+
+Load resulting loading matrices (one for DMSO and one for drugs)
+```{r}
+# Define number of shared factors and treatment-specific factors
+k_shared <- 4
+k_foreground <- 8
+
+# Load results of CPLVM
+CPLVM_tr_df <- read.csv(sprintf("/Users/carolinelohoff/Documents/CPLVM/CPLVM_loadings_s%s_f%s_foreground.csv",
+                                     k_shared, k_foreground), header=T)
+CPLVM_tr_df <- CPLVM_tr_df[-c(1)]
+
+CPLVM_shared_df <- read.csv(sprintf("/Users/carolinelohoff/Documents/CPLVM/CPLVM_loadings_s%s_f%s_shared.csv",
+                                     k_shared, k_foreground), header=T)
+CPLVM_shared_df <- CPLVM_shared_df[-c(1)]
+
+
+# Extract expression matrix
+exprMatraw <- assay(ddsAll)
+exprMatraw_5000n <- exprMatraw[rownames(exprMatraw) %in% rownames(exprMat_5000),]
+
+# Add Ensembl column to df
+CPLVM_tr_df$Ensembl <- rownames(exprMatraw_5000n)
+CPLVM_tr_df <- CPLVM_tr_df %>%
+  mutate(symbol = rowData(ddsDrug)[Ensembl,]$symbol)
+
+CPLVM_shared_df$Ensembl <- rownames(exprMatraw_5000n)
+CPLVM_shared_df <- CPLVM_shared_df %>%
+  mutate(symbol = rowData(ddsDrug)[Ensembl,]$symbol)
+```
+
+## Results
+
+### Treatment-specific variables
+
+Load resulting variable matrices (t)
+```{r}
+tj_df <- read.csv(sprintf("/Users/carolinelohoff/Documents/CPLVM/CPLVM_tj_s%s_f%s.csv",
+                                     k_shared, k_foreground), header=T)
+tj_df <- tj_df[-c(1)]
+
+# Transpose data frame
+tj_dft <- as.data.frame(t(tj_df))
+
+# Add information as columns
+tj_dft$ID <- rownames(exprMat_IbrDuvNutt)
+tj_dft$treatment <- patAnno[match(tj_dft$ID, patAnno$ID),]$treatment
+tj_dft$patID <- patAnno[match(tj_dft$ID, patAnno$ID),]$patID
+tj_dft$FSC.SSC <- patAnno[match(tj_dft$ID, patAnno$ID),]$FSC.SSC
+tj_dft$IGHV <- patAnno[match(tj_dft$ID, patAnno$ID),]$IGHV
+```
+
+Plot factor 1 vs factor 2 (based on samples, matrix tj)
+```{r}
+ggplot(tj_dft, aes(x = V1, y = V2, color=treatment)) +
+  geom_point(alpha = 0.7) + ggtitle("CPLVM colored by treatment") +
+  theme_minimal()
+```
+
+Plot factor 1 vs factor 2 (based on samples, matrix tj)
+```{r}
+ggplot(tj_dft, aes(x = V1, y = V2, color=FSC.SSC)) +
+  geom_point(alpha = 0.95) + ggtitle("CPLVM colored by viability") +
+  theme_minimal()
+```
+
+Plot factor 1 vs factor 2 (based on samples, matrix tj)
+```{r}
+ggplot(tj_dft, aes(x = V1, y = V2, color=IGHV)) +
+  geom_point(alpha = 0.7) + ggtitle("CPLVM colored by IGHV") +
+  theme_minimal()
+```
+
+Plot factor 1 vs factor 2 (based on samples, matrix tj)
+```{r, fig.width=11, fig.height=6}
+ggplot(tj_dft, aes(x = V1, y = V2, color=patID)) +
+  geom_point(alpha = 0.7) + ggtitle("CPLVM colored by patients") +
+  theme_minimal()
+```
+Often, samples from the same patients do not cluster. 
+
+### Top genes present in factors
+
+```{r}
+genes_sig_f1 <- head(CPLVM_tr_df[order(CPLVM_tr_df$Foreground_1,
+                                       decreasing=TRUE),]$symbol, 10)
+genes_sig_f1
+genes_sig_f2 <- head(CPLVM_tr_df[order(CPLVM_tr_df$Foreground_2,
+                                       decreasing=TRUE),]$symbol, 10)
+genes_sig_f2
+```
+
+Contribution of genes to factors 1 and 2 (matrix W)
+```{r}
+ggplot(CPLVM_tr_df, aes(x = Foreground_1, y = Foreground_2)) +
+  geom_point(alpha = 0.7) + ggtitle("V1 vs V2 from matrix W") +
+  theme_minimal()
+```
+
+
+
+## Accuracy of different models
+
+Import correlation coefficients and show accuracy of CPLVM models with different numbers of variables
+```{r}
+accuracy <- function(ks, kf){
+  CPLVM_tr_cor <- read.csv(sprintf("/Users/carolinelohoff/Documents/CPLVM/CPLVM_cor_s%s_f%s_foreground.csv",
+                                     ks, kf), header=F)
+  CPLVM_shared_cor <- read.csv(sprintf("/Users/carolinelohoff/Documents/CPLVM/CPLVM_cor_s%s_f%s_shared.csv",
+                                     ks, kf), header=F)
+
+  cat(sprintf("The accuracy between the original gene expression matrices and the ones approximated by CPLVM is
+            for the %s shared variables %s%% and
+            for the %s treatment-specific variables %s%%. \n",
+            ks, CPLVM_shared_cor*100,
+            kf, CPLVM_tr_cor*100))
+}
+```
+
+```{r}
+accuracy_3s_3f <- accuracy(3, 3)
+accuracy_3s_4f <- accuracy(3, 4)
+accuracy_3s_5f <- accuracy(3, 5)
+accuracy_3s_6f <- accuracy(3, 6) # best for 3
+accuracy_3s_7f <- accuracy(3, 7)
+cat("\n")
+accuracy_4s_6f <- accuracy(4, 6)
+accuracy_4s_7f <- accuracy(4, 7)
+accuracy_4s_8f <- accuracy(4, 8) # best of all
+accuracy_4s_9f <- accuracy(4, 9)
+accuracy_4s_10f <- accuracy(4, 10)
+accuracy_4s_12f <- accuracy(4, 12)
+cat("\n")
+accuracy_5s_6f <- accuracy(5, 6)
+accuracy_5s_7f <- accuracy(5, 7)
+accuracy_5s_8f <- accuracy(5, 8)
+accuracy_5s_9f <- accuracy(5, 9)
+accuracy_5s_10f <- accuracy(5, 10)
+cat("\n")
+accuracy_6s_6f <- accuracy(6, 6)
+accuracy_6s_7f <- accuracy(6, 7)
+accuracy_6s_8f <- accuracy(6, 8)
+accuracy_6s_9f <- accuracy(6, 9)
+accuracy_6s_10f <- accuracy(6, 10)
+accuracy_6s_12f <- accuracy(6, 12)
+```
+3 shared variables are not enough to explain the differences between foreground and background. 
+
+
+# Focus on Ibrutinib, Duvelisib, and Nutlin 3a (samples grouped by viability)
+
+The PCA result shows that PC1 is the viability. Thus, we assign the samples into three groups which are based on viability. 
+
+DMSO PCA plot colored by viability
+```{r, fig.width=8, fig.height=6}
+pcaTab5000 %>%
+    dplyr::filter(treatment == "DMSO") %>%
+    ggplot(aes(x=PC1, y=PC2, col=FSC.SSC)) + geom_point(size=2) + theme_bw() + 
+    xlab(sprintf("PC1 (%2.1f%%)",varExp5000[1])) +
+    ylab(sprintf("PC2 (%2.1f%%)",varExp5000[2])) +
+    ggtitle("PCA of DMSO samples colored by patients")
+```
+
+```{r}
+viability_below <- patAnno[patAnno$FSC.SSC < 32 & patAnno$treatment == "DMSO", ]$patID
+viability_above <- patAnno[patAnno$FSC.SSC > 66 & patAnno$treatment == "DMSO", ]$patID
+lower_upper <- c(viability_below, viability_above)
+viability_between <- setdiff(patAnno[patAnno$treatment == "DMSO", ]$patID, lower_upper)
+```
+
+Verify grouping in boxplot
+```{r, fig.height=5, fig.width=8}
+# Subset patAnno df and add new column with viability groups
+patAnno_DMSO <- patAnno[patAnno$treatment == "DMSO", ]
+patAnno_DMSO$viability <- "medium"
+patAnno_DMSO$viability[patAnno_DMSO$patID %in% viability_below] <- "low"
+patAnno_DMSO$viability[patAnno_DMSO$patID %in% viability_above] <- "high"
+
+patAnno_DMSO$viability <- factor(patAnno_DMSO$viability,
+    levels = c("low", "medium", "high"), ordered = TRUE)
+
+# Plot groups as boxplots
+patAnno_DMSO %>%
+  group_by(viability) %>%
+  ggplot(aes(x=viability, y=FSC.SSC, col=viability)) +
+  geom_violin() +
+  xlab("DMSO samples grouped by viability") +
+  ggtitle("Viability of DMSO samples across groups") +
+  geom_jitter(height = 0, width = 0.1)
+```
+
+## CPLVM with high viability samples
+
+Prepare gene expression matrices
+```{r}
+# DMSO
+viability_DMSO_below_smp <- patAnno_DMSO[patAnno_DMSO$patID %in% viability_below, ]$ID
+viability_DMSO_between_smp <- patAnno_DMSO[patAnno_DMSO$patID %in% viability_between, ]$ID
+viability_DMSO_above_smp <- patAnno_DMSO[patAnno_DMSO$patID %in% viability_above, ]$ID
+exprMat_DMSOt_above <- exprMat_DMSOt[rownames(exprMat_DMSOt) %in% viability_DMSO_above_smp, ]
+utils::write.table(format(exprMat_DMSOt_above, scientific=FALSE), 
+                   file = "/Users/carolinelohoff/Documents/CPLVM/exprMatDMSOabove_20220412.csv",
+                   sep=",", col.names=FALSE, row.names=FALSE)
+
+# Treatments
+patAnno_tr <- patAnno[patAnno$treatment %in% c("Ibrutinib",
+                                               "Duvelisib", "Nutlin_3a"), ]
+viability_tr_below_smp <- patAnno_tr[patAnno_tr$patID %in% viability_below, ]$ID
+viability_tr_between_smp <- patAnno_tr[patAnno_tr$patID %in% viability_between, ]$ID
+viability_tr_above_smp <- patAnno_tr[patAnno_tr$patID %in% viability_above, ]$ID
+exprMat_IbrDuvNutt_above <- exprMat_IbrDuvNutt[rownames(exprMat_IbrDuvNutt) %in% viability_tr_above_smp, ]
+utils::write.table(format(exprMat_IbrDuvNutt_above, scientific=FALSE), 
+                   file = "/Users/carolinelohoff/Documents/CPLVM/exprMatIbrDuvNutabove_20220412.csv",
+                   sep=",", col.names=FALSE, row.names=FALSE)
+```
+
+Load resulting loading matrices (one for DMSO and one for drugs)
+```{r}
+# Define number of shared factors and treatment-specific factors
+k_shared <- 4
+k_foreground <- 8
+
+# Load results of CPLVM
+CPLVM_tr_highV <- read.csv(sprintf("/Users/carolinelohoff/Documents/CPLVM/CPLVM_loadings_s%s_f%s_foreground_highV.csv",
+                                     k_shared, k_foreground), header=T)
+CPLVM_tr_highV <- CPLVM_tr_highV[-c(1)]
+
+CPLVM_shared_highV <- read.csv(sprintf("/Users/carolinelohoff/Documents/CPLVM/CPLVM_loadings_s%s_f%s_shared_highV.csv",
+                                     k_shared, k_foreground), header=T)
+CPLVM_shared_highV <- CPLVM_shared_highV[-c(1)]
+
+# Add Ensembl column to df
+CPLVM_tr_highV$Ensembl <- rownames(exprMatraw_5000n)
+CPLVM_tr_highV <- CPLVM_tr_highV %>%
+  mutate(symbol = rowData(ddsDrug)[Ensembl,]$symbol)
+
+CPLVM_shared_highV$Ensembl <- rownames(exprMatraw_5000n)
+CPLVM_shared_highV <- CPLVM_shared_highV %>%
+  mutate(symbol = rowData(ddsDrug)[Ensembl,]$symbol)
+```
+
+## Results
+
+## Accuracy
+
+```{r}
+CPLVM_tr_cor_highV <- read.csv(sprintf("/Users/carolinelohoff/Documents/CPLVM/CPLVM_cor_s%s_f%s_foreground_highV.csv",
+                                     4, 8), header=F)
+CPLVM_shared_cor_highV <- read.csv(sprintf("/Users/carolinelohoff/Documents/CPLVM/CPLVM_cor_s%s_f%s_shared_highV.csv",
+                                     4, 8), header=F)
+
+cat(sprintf("The accuracy between the original gene expression matrices and the ones approximated by CPLVM is
+            for the %s shared variables %s%% and
+            for the %s treatment-specific variables %s%%. \n",
+            4, CPLVM_shared_cor_highV*100,
+            8, CPLVM_tr_cor_highV*100))
+```
+
+
+### Treatment-specific variables
+
+Load resulting variable matrices (t)
+```{r}
+tj_highV <- read.csv(sprintf("/Users/carolinelohoff/Documents/CPLVM/CPLVM_tj_s%s_f%s_highV.csv",
+                                     k_shared, k_foreground), header=T)
+tj_highV <- tj_highV[-c(1)]
+
+# Transpose data frame
+tj_highVt <- as.data.frame(t(tj_highV))
+
+# Add information as columns
+tj_highVt$ID <- rownames(exprMat_IbrDuvNutt_above)
+tj_highVt$patID <- patAnno[match(tj_highVt$ID, patAnno$ID),]$patID
+tj_highVt$treatment <- patAnno[match(tj_highVt$ID, patAnno$ID),]$treatment
+tj_highVt$FSC.SSC <- patAnno[match(tj_highVt$ID, patAnno$ID),]$FSC.SSC
+tj_highVt$IGHV <- patAnno[match(tj_highVt$ID, patAnno$ID),]$IGHV
+tj_highVt$TP53 <- patAnno[match(tj_highVt$ID, patAnno$ID),]$TP53
+```
+
+Can the factors separate the treatments?
+```{r}
+p1 <- ggplot(tj_highVt, aes(x = V1, y = V2, color=treatment)) +
+  geom_point(alpha = 0.7) + ggtitle("CPLVM colored by treatment") +
+  theme_minimal()
+p2 <- ggplot(tj_highVt, aes(x = log(V1), y = log(V2), color=treatment)) +
+  geom_point(alpha = 0.7) + ggtitle("CPLVM colored by treatment") +
+  theme_minimal()
+p3 <- ggplot(tj_highVt, aes(x = V1, y = V3, color=treatment)) +
+  geom_point(alpha = 0.7) + ggtitle("CPLVM colored by treatment") +
+  theme_minimal()
+p4 <- ggplot(tj_highVt, aes(x = log(V1), y = log(V3), color=treatment)) +
+  geom_point(alpha = 0.7) + ggtitle("CPLVM colored by treatment") +
+  theme_minimal()
+p5 <- ggplot(tj_highVt, aes(x = V1, y = V4, color=treatment)) +
+  geom_point(alpha = 0.7) + ggtitle("CPLVM colored by treatment") +
+  theme_minimal()
+p6 <- ggplot(tj_highVt, aes(x = log(V1), y = log(V4), color=treatment)) +
+  geom_point(alpha = 0.7) + ggtitle("CPLVM colored by treatment") +
+  theme_minimal()
+
+plot_grid(p1, p2, p3, p4, p5, p6, ncol=2)
+```
+
+
+Can the factors separate the IGHV status?
+```{r}
+p1 <- ggplot(tj_highVt, aes(x = V1, y = V2, color=IGHV)) +
+  geom_point(alpha = 0.7) + ggtitle("CPLVM colored by IGHV") +
+  theme_minimal()
+p2 <- ggplot(tj_highVt, aes(x = log(V1), y = log(V2), color=IGHV)) +
+  geom_point(alpha = 0.7) + ggtitle("CPLVM colored by IGHV") +
+  theme_minimal()
+p3 <- ggplot(tj_highVt, aes(x = V1, y = V3, color=IGHV)) +
+  geom_point(alpha = 0.7) + ggtitle("CPLVM colored by IGHV") +
+  theme_minimal()
+p4 <- ggplot(tj_highVt, aes(x = log(V1), y = log(V3), color=IGHV)) +
+  geom_point(alpha = 0.7) + ggtitle("CPLVM colored by IGHV") +
+  theme_minimal()
+p5 <- ggplot(tj_highVt, aes(x = V1, y = V4, color=IGHV)) +
+  geom_point(alpha = 0.7) + ggtitle("CPLVM colored by IGHV") +
+  theme_minimal()
+p6 <- ggplot(tj_highVt, aes(x = log(V1), y = log(V4), color=IGHV)) +
+  geom_point(alpha = 0.7) + ggtitle("CPLVM colored by IGHV") +
+  theme_minimal()
+
+plot_grid(p1, p2, p3, p4, p5, p6, ncol=2)
+```
+
+Can the factors separate the patients?
+```{r}
+p1 <- ggplot(tj_highVt, aes(x = V1, y = V2, color=patID)) +
+  geom_point(alpha = 0.7) + ggtitle("CPLVM colored by patients") +
+  theme_minimal()
+p2 <- ggplot(tj_highVt, aes(x = log(V1), y = log(V2), color=patID)) +
+  geom_point(alpha = 0.7) + ggtitle("CPLVM colored by patients") +
+  theme_minimal()
+plot_grid(p1, p2, ncol=2)
+```
+
+
+Can the factors separate the TP53 status?
+```{r}
+p1 <- ggplot(tj_highVt, aes(x = V1, y = V2, color=TP53)) +
+  geom_point(alpha = 0.7) + ggtitle("CPLVM colored by TP53") +
+  theme_minimal()
+p2 <- ggplot(tj_highVt, aes(x = log(V1), y = log(V2), color=TP53)) +
+  geom_point(alpha = 0.7) + ggtitle("CPLVM colored by TP53") +
+  theme_minimal()
+p3 <- ggplot(tj_highVt, aes(x = V1, y = V3, color=TP53)) +
+  geom_point(alpha = 0.7) + ggtitle("CPLVM colored by TP53") +
+  theme_minimal()
+p4 <- ggplot(tj_highVt, aes(x = log(V1), y = log(V3), color=TP53)) +
+  geom_point(alpha = 0.7) + ggtitle("CPLVM colored by TP53") +
+  theme_minimal()
+p5 <- ggplot(tj_highVt, aes(x = V1, y = V4, color=TP53)) +
+  geom_point(alpha = 0.7) + ggtitle("CPLVM colored by TP53") +
+  theme_minimal()
+p6 <- ggplot(tj_highVt, aes(x = log(V1), y = log(V4), color=TP53)) +
+  geom_point(alpha = 0.7) + ggtitle("CPLVM colored by TP53") +
+  theme_minimal()
+
+plot_grid(p1, p2, p3, p4, p5, p6, ncol=2)
+```
+
+### Shared variables
+
+Load resulting variable matrices (z)
+```{r}
+tj_highV <- read.csv(sprintf("/Users/carolinelohoff/Documents/CPLVM/CPLVM_zj_s%s_f%s_highV.csv",
+                                     k_shared, k_foreground), header=T)
+tj_highV <- tj_highV[-c(1)]
+
+# Transpose data frame
+tj_highVt <- as.data.frame(t(tj_highV))
+
+# Add information as columns
+tj_highVt$ID <- rownames(exprMat_IbrDuvNutt_above)
+tj_highVt$patID <- patAnno[match(tj_highVt$ID, patAnno$ID),]$patID
+tj_highVt$treatment <- patAnno[match(tj_highVt$ID, patAnno$ID),]$treatment
+tj_highVt$FSC.SSC <- patAnno[match(tj_highVt$ID, patAnno$ID),]$FSC.SSC
+tj_highVt$IGHV <- patAnno[match(tj_highVt$ID, patAnno$ID),]$IGHV
+tj_highVt$TP53 <- patAnno[match(tj_highVt$ID, patAnno$ID),]$TP53
+```
+
+Can the factors separate the treatments?
+```{r}
+p1 <- ggplot(tj_highVt, aes(x = V1, y = V2, color=treatment)) +
+  geom_point(alpha = 0.7) + ggtitle("CPLVM colored by treatment") +
+  theme_minimal()
+p2 <- ggplot(tj_highVt, aes(x = log(V1), y = log(V2), color=treatment)) +
+  geom_point(alpha = 0.7) + ggtitle("CPLVM colored by treatment") +
+  theme_minimal()
+p3 <- ggplot(tj_highVt, aes(x = V1, y = V3, color=treatment)) +
+  geom_point(alpha = 0.7) + ggtitle("CPLVM colored by treatment") +
+  theme_minimal()
+p4 <- ggplot(tj_highVt, aes(x = log(V1), y = log(V3), color=treatment)) +
+  geom_point(alpha = 0.7) + ggtitle("CPLVM colored by treatment") +
+  theme_minimal()
+p5 <- ggplot(tj_highVt, aes(x = V1, y = V4, color=treatment)) +
+  geom_point(alpha = 0.7) + ggtitle("CPLVM colored by treatment") +
+  theme_minimal()
+p6 <- ggplot(tj_highVt, aes(x = log(V1), y = log(V4), color=treatment)) +
+  geom_point(alpha = 0.7) + ggtitle("CPLVM colored by treatment") +
+  theme_minimal()
+
+plot_grid(p1, p2, p3, p4, p5, p6, ncol=2)
+```
+
+Can the factors separate the IGHV status?
+```{r}
+p1 <- ggplot(tj_highVt, aes(x = V1, y = V2, color=IGHV)) +
+  geom_point(alpha = 0.7) + ggtitle("CPLVM colored by IGHV") +
+  theme_minimal()
+p2 <- ggplot(tj_highVt, aes(x = log(V1), y = log(V2), color=IGHV)) +
+  geom_point(alpha = 0.7) + ggtitle("CPLVM colored by IGHV") +
+  theme_minimal()
+p3 <- ggplot(tj_highVt, aes(x = V1, y = V3, color=IGHV)) +
+  geom_point(alpha = 0.7) + ggtitle("CPLVM colored by IGHV") +
+  theme_minimal()
+p4 <- ggplot(tj_highVt, aes(x = log(V1), y = log(V3), color=IGHV)) +
+  geom_point(alpha = 0.7) + ggtitle("CPLVM colored by IGHV") +
+  theme_minimal()
+p5 <- ggplot(tj_highVt, aes(x = V1, y = V4, color=IGHV)) +
+  geom_point(alpha = 0.7) + ggtitle("CPLVM colored by IGHV") +
+  theme_minimal()
+p6 <- ggplot(tj_highVt, aes(x = log(V1), y = log(V4), color=IGHV)) +
+  geom_point(alpha = 0.7) + ggtitle("CPLVM colored by IGHV") +
+  theme_minimal()
+
+plot_grid(p1, p2, p3, p4, p5, p6, ncol=2)
+```
+
+Can the factors separate the patients?
+```{r}
+p1 <- ggplot(tj_highVt, aes(x = V1, y = V2, color=patID)) +
+  geom_point(alpha = 0.7) + ggtitle("CPLVM colored by patients") +
+  theme_minimal()
+p2 <- ggplot(tj_highVt, aes(x = log(V1), y = log(V2), color=patID)) +
+  geom_point(alpha = 0.7) + ggtitle("CPLVM colored by patients") +
+  theme_minimal()
+plot_grid(p1, p2, ncol=2)
+```
+
+Can the factors separate the TP53 status?
+```{r}
+p1 <- ggplot(tj_highVt, aes(x = V1, y = V2, color=TP53)) +
+  geom_point(alpha = 0.7) + ggtitle("CPLVM colored by TP53") +
+  theme_minimal()
+p2 <- ggplot(tj_highVt, aes(x = log(V1), y = log(V2), color=TP53)) +
+  geom_point(alpha = 0.7) + ggtitle("CPLVM colored by TP53") +
+  theme_minimal()
+p3 <- ggplot(tj_highVt, aes(x = V1, y = V3, color=TP53)) +
+  geom_point(alpha = 0.7) + ggtitle("CPLVM colored by TP53") +
+  theme_minimal()
+p4 <- ggplot(tj_highVt, aes(x = log(V1), y = log(V3), color=TP53)) +
+  geom_point(alpha = 0.7) + ggtitle("CPLVM colored by TP53") +
+  theme_minimal()
+p5 <- ggplot(tj_highVt, aes(x = V1, y = V4, color=TP53)) +
+  geom_point(alpha = 0.7) + ggtitle("CPLVM colored by TP53") +
+  theme_minimal()
+p6 <- ggplot(tj_highVt, aes(x = log(V1), y = log(V4), color=TP53)) +
+  geom_point(alpha = 0.7) + ggtitle("CPLVM colored by TP53") +
+  theme_minimal()
+
+plot_grid(p1, p2, p3, p4, p5, p6, ncol=2)
+```
+
+# Session Info Details
+```{r, echo=FALSE, eval=TRUE}
+sessionInfo()
+```
+

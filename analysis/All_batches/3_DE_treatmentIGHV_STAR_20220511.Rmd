@@ -1,0 +1,512 @@
+---
+title: "DE of IGHV status and treatments, pre-processed with STAR + HTSeq"
+author: "Caroline Lohoff"
+date: "May 11 2022"
+output:
+  BiocStyle::html_document:
+    toc_float: true
+---
+
+# Description
+
+In this differential gene expression analysis we analyse whether the IGHV status (M-CLL or U-CLL) has an influence on the effectiveness of the drug treatments. 
+Therefore, we conduct DE analyses separately for the drugs Ibrutinib, Duvelisib, and Ibr x C26.
+For Nutlin 3a a DESeq analysis is performed in which the TP53 status is investigated.
+
+Design formula: ~ IGHV  (separately for treatments)
+
+# Preparations
+
+## Load libraries and set options
+
+Set global options
+```{r setup, include=FALSE, cache = FALSE}
+knitr::opts_knit$set(root.dir = "~/Documents/R/drugseq_test")
+knitr::opts_chunk$set(warning = FALSE, message = FALSE)
+```
+
+Load libraries
+```{r}
+suppressPackageStartupMessages({
+  library(DESeq2)
+  library(tidyverse)
+  library(RColorBrewer)
+  library(cowplot)
+  library(BiocParallel)
+})
+register(MulticoreParam(2))
+```
+
+Set global ggplot variables
+```{r}
+theme_set(theme_bw() + theme(axis.text = element_text(size=12), 
+                             axis.title = element_text(size=14),
+                             legend.title = element_text(size=14),
+                             legend.text = element_text(size=12),
+                             plot.title = element_text(size=16,
+                                                       hjust=0.5,face="bold")))
+```
+
+## Load data and add annotations
+```{r}
+# Load dds data set containing 1106 samples and count matrix
+load("./output/ddsDrug_htseq_batchPilot1c234_20220426.RData")
+
+# Load meta data including genotyping info
+load("./data/patmeta_210324.RData")
+
+# Add columns to DESeq object using patient meta data
+col_vec <- c("diagnosis", "gender", "Methylation_Cluster", "trisomy12", "NOTCH1", "TP53")
+ddsDrug@colData@listData <- lapply(col_vec, function(n) {
+  ddsDrug[[n]] <- patMeta[match(ddsDrug$patID, patMeta$Patient.ID), n]
+}) %>% bind_cols() %>% sjmisc::add_columns(ddsDrug@colData@listData)
+
+names(ddsDrug@colData@listData)[names(ddsDrug@colData@listData) == "Methylation_Cluster"] <- "Methylation"
+ddsDrug$IGHVpat <- patMeta[match(ddsDrug$patID, patMeta$Patient.ID),]$IGHV.status
+ddsDrug$IGHV <- ifelse(is.na(ddsDrug$IGHV), ddsDrug$IGHVpat, ddsDrug$IGHV)
+
+# Add meta data to the samples from the pilot batch
+ddsDrug$diagnosis[ddsDrug$batch == "pilot"] <- "CLL" 
+ddsDrug$trisomy12[ddsDrug$batch == "pilot"] <- 0
+ddsDrug$NOTCH1[ddsDrug$batch == "pilot"] <- 0
+ddsDrug$TP53[ddsDrug$batch == "pilot"] <- 0
+ddsDrug$IGHV[ddsDrug$batch == "pilot" & ddsDrug$patID %in% c("PID1095", "PID1222")] <- "U"
+ddsDrug$IGHV[ddsDrug$batch == "pilot" & ddsDrug$patID %in% c("PID1177", "PID1210")] <- "M"
+ddsDrug$gender[ddsDrug$batch == "pilot" & ddsDrug$patID %in% c("PID1095", "PID1222")] <- "f"
+ddsDrug$gender[ddsDrug$batch == "pilot" & ddsDrug$patID %in% c("PID1177", "PID1210")] <- "m"
+
+# Rename IGHV status from 'U' and 'M' to 0 and 1
+ddsDrug$IGHV[ddsDrug$IGHV == "U"] <- 0
+ddsDrug$IGHV[ddsDrug$IGHV == "M"] <- 1
+ddsDrug$IGHV <- as.factor(ddsDrug$IGHV)
+ddsDrug$IGHVpat <- NULL
+
+dim(ddsDrug)
+```
+
+Filter genes, counts and diagnosis
+```{r}
+# Only use protein coding genes and include only CLL samples in analysis
+ddsAll <- ddsDrug[rowData(ddsDrug)$biotype == "protein_coding" & !rowData(ddsDrug)$symbol %in% c(NA, ""),
+                  ddsDrug$diagnosis == "CLL" & ddsDrug$treatment != "Baseline" & ddsDrug$Replicate == 1]
+
+# Remove all mitochondrial and artificial chromosomes
+ddsAll <- ddsAll[rowData(ddsAll)$chromosome %in% c(1:22,"X","Y")]
+
+# Remove genes on Y chromosome which could introduce some bias
+ddsAll <- ddsAll[rowData(ddsAll)$chromosome != "Y"]
+
+# Keep only genes with a minimum of 10 counts in any sample
+keep_counts <- apply(counts(ddsAll), 1, function(x) any(x >= 10))
+ddsAll <- ddsAll[keep_counts,]
+
+# Keep only genes expressed in at least 30% of all samples, 
+# since most genes have a basal expression. 
+# With this function the sparsity of the expression matrix is reduced.
+expr_min <- round(ncol(counts(ddsAll)) * 0.7)
+keep_counts_expr <- apply(counts(ddsAll), 1, function(x) sum(x == 0) < expr_min)
+ddsAll <- ddsAll[keep_counts_expr,]
+dim(ddsAll)
+```
+
+Filter patients
+```{r}
+# Remove patients with a DMSO viability after unfreezing below 70%
+## see script Viability_analysis_20220411.html
+patLowViab <- c("P0645", "P0437", "P0067", "P0035",
+                "P0604", "P0494", "P0051")
+
+# Remove patients who are outliers in PCA plots and
+# correlation plot size factors vs normalized counts (scTransform script)
+remPat <- c("P0029", "P0583", "P0880")
+patLowViab <- c(patLowViab, remPat)
+ddsAll <- ddsAll[, !ddsAll$patID %in% patLowViab]
+
+# Replace spaces in treatment names
+ddsAll$treatment <- str_replace_all(ddsAll$treatment,"[- ]","_")
+
+# Extract count matrix
+counts_df <- data.frame(assay(ddsAll))
+
+# Extract patient annotation
+patAnno <- data.frame(colData(ddsAll))
+dim(ddsAll)
+```
+
+
+# Differential expression using DESeq2
+
+Differential expression analysis of genomic data types uses linear models to determine the size and direction of the changes in gene expression.
+
+## Preparations
+
+Define treatments to use in this analysis
+```{r}
+allTreat <- c("Ibrutinib", "Duvelisib", "Ibr_x_C26", "Nutlin_3a")
+```
+
+Remove patients with undefined IGHV status
+```{r}
+ddsAll <- ddsAll[, !is.na(ddsAll$IGHV)]
+ddsAll$IGHV <- factor(ddsAll$IGHV)
+```
+
+Correct count matrix with scTransform and create new dds object
+(Resulting counts are integers and can be used as input for DESeq2)
+```{r, results=FALSE}
+countMat <- counts(ddsAll)
+scModel <- sctransform::vst(countMat,
+                            return_corrected_umi = TRUE)
+
+# Extract normalized counts matrix
+countMat.norm <- as.matrix(scModel$umi_corrected)
+
+# Create new ddsAll object with norm. counts matrix and colData from ddsDrug
+ddsAll.adj <- DESeqDataSetFromMatrix(countMat.norm,
+                                     colData = colData(ddsAll), design = ~1)
+rowData(ddsAll.adj) <- rowData(ddsAll[rownames(countMat.norm)],)
+
+# Reset size factors before using DESeq2
+ddsAll.adj$sizeFactor <- 1
+```
+
+Subset dds object into different treatments and exclude lowly expressed genes
+```{r}
+# Remove genes not expressed in 50% of samples
+remove_genes <- function(dds){
+  expr_min <- round(ncol(counts(dds)) * 0.5)
+  keep_counts_expr <- apply(counts(dds), 1, function(x) sum(x == 0) < expr_min)
+  dds <- dds[keep_counts_expr,]
+  return(dds)
+}
+
+# Subset dds object
+ddsIbr <- ddsAll.adj[,ddsAll.adj$treatment == "Ibrutinib"]
+ddsIbr <- remove_genes(ddsIbr)
+dim(ddsIbr)
+ddsDuv <- ddsAll.adj[,ddsAll.adj$treatment == "Duvelisib"]
+ddsDuv <- remove_genes(ddsDuv)
+dim(ddsDuv)
+ddsComb <- ddsAll.adj[,ddsAll.adj$treatment == "Ibr_x_C26"]
+ddsComb <- remove_genes(ddsComb)
+dim(ddsComb)
+ddsNut <- ddsAll.adj[,ddsAll.adj$treatment == "Nutlin_3a"]
+ddsNut <- remove_genes(ddsNut)
+dim(ddsNut)
+```
+
+Add design to dds objects
+```{r}
+design(ddsIbr) <- ~ IGHV
+design(ddsDuv) <- ~ IGHV
+design(ddsComb) <- ~ IGHV
+design(ddsNut) <- ~ TP53
+```
+
+## Run DESeq2
+
+The DESeq function fits the raw counts to the negative binomial model. The final dds object contains all the information needed for performing DE testing between specific sample groups. New information such as shrunken dispersions, model coefficients, Wald test results, and gene-wise dispersions will be added to the dds object.
+```{r, eval=FALSE}
+DEresIbr <- DESeq(ddsIbr, parallel=TRUE)
+save(DEresIbr, file = "./output/DEres_allbatches_IbrutinibIGHV_STAR_20220511.RData")
+DEresDuv <- DESeq(ddsDuv, parallel=TRUE)
+save(DEresDuv, file = "./output/DEres_allbatches_DuvelisibIGHV_STAR_20220511.RData")
+DEresComb <- DESeq(ddsComb, parallel=TRUE)
+save(DEresComb, file = "./output/DEres_allbatches_IbrxC26IGHV_STAR_20220511.RData")
+DEresNut <- DESeq(ddsNut, parallel=TRUE)
+save(DEresNut, file = "./output/DEres_allbatches_NutlinIGHV_STAR_20220511.RData")
+```
+
+## Load DESeq results
+
+Load dds object
+```{r}
+load("./output/DEres_allbatches_IbrutinibIGHV_STAR_20220511.RData")
+load("./output/DEres_allbatches_DuvelisibIGHV_STAR_20220511.RData")
+load("./output/DEres_allbatches_IbrxC26IGHV_STAR_20220511.RData")
+load("./output/DEres_allbatches_NutlinIGHV_STAR_20220511.RData")
+```
+
+Extract results names
+```{r}
+resultsNames(DEresIbr)
+resultsNames(DEresDuv)
+resultsNames(DEresComb)
+resultsNames(DEresNut)
+```
+
+### Log fold change shrinkage
+
+Shrinkage of effect size (LFC estimates) is useful for visualization and ranking of genes. 
+
+The results for each treatment are extracted with prior shrinkage of LFC values using the [apeglm estimator](https://academic.oup.com/bioinformatics/article/35/12/2084/5159452), which improves on the previous estimator.
+```{r}
+resIbr <- lfcShrink(DEresIbr[which(mcols(DEresIbr)$betaConv),],
+                     coef="IGHV_1_vs_0", type="apeglm", parallel=TRUE)
+resDuv <- lfcShrink(DEresDuv[which(mcols(DEresDuv)$betaConv),],
+                     coef="IGHV_1_vs_0", type="apeglm", parallel=TRUE)
+resComb <- lfcShrink(DEresComb[which(mcols(DEresComb)$betaConv),],
+                     coef="IGHV_1_vs_0", type="apeglm", parallel=TRUE)
+resNut <- lfcShrink(DEresNut[which(mcols(DEresNut)$betaConv),],
+                     coef="TP53_1_vs_0", type="apeglm", parallel=TRUE)
+```
+
+Combine all results in a list
+```{r}
+allResShrink <- list(resIbr, resDuv, resComb, resNut)  
+names(allResShrink) <- allTreat
+```
+
+### Create resulting data frames 
+
+Create data frame
+```{r}
+allResdf <- lapply(allResShrink, function(res) {
+  resTab <- data.frame(res@listData) %>%
+      rownames_to_column(var = "Ensembl") %>%
+      mutate(symbol = rowData(ddsDrug)[Ensembl,]$symbol) %>%
+      mutate(chromosome = rowData(ddsDrug)[Ensembl,]$chromosome)
+  names(resTab)[names(resTab) == "log2FoldChange"] <- "LFC"
+  resTab_final <- resTab
+})
+names(allResdf) <- allTreat
+
+allResdf$Ibrutinib <- mutate(allResdf$Ibrutinib, treatment="Ibrutinib")
+allResdf$Duvelisib <- mutate(allResdf$Duvelisib, treatment="Duvelisib")
+allResdf$Ibr_x_C26 <- mutate(allResdf$Ibr_x_C26, treatment="Ibr_x_C26")
+allResdf$Nutlin_3a <- mutate(allResdf$Nutlin_3a, treatment="Nutlin_3a")
+```
+
+Combine all data frames
+```{r}
+# Add treatment info to column names
+colname <- c("Ibr", "Duv", "IbrC26", "Nut")
+name <- 0
+
+allResdf.names <- lapply(allResdf, function(df) {
+  name <<- name + 1
+  dfsub <- dplyr::select(df, c(-treatment, -symbol, -chromosome))
+  colnames(dfsub) <- paste(colnames(dfsub),colname[name],sep="_")
+  df_new <- dfsub
+})
+names(allResdf.names) <- allTreat
+
+
+# Create one df with the results of all treatments
+allResdf.combined <- allResdf$Ibrutinib %>%
+  dplyr::select(Ensembl, symbol, chromosome)
+
+coljoin <- c("Ensembl_Ibr", "Ensembl_Duv",
+             "Ensembl_IbrC26", "Ensembl_Nut")
+enumerator <- 0
+
+for(df in allResdf.names){
+  enumerator <- enumerator + 1
+  allResdf.combined <- full_join(allResdf.combined, df,
+                             by=c("Ensembl" = coljoin[enumerator]), keep=FALSE)
+}
+```
+
+Save combined data frame as csv file
+```{r}
+write.csv(allResdf.combined, file="./output/DEgenes_treatIGHVonly_20220516.csv", sep="\t")
+save(allResdf.combined, file = "./output/DEgenes_treatIGHVonly_20220516.RData")
+```
+
+
+# Analyzing results
+
+## Dispersion of results before shrinkage
+
+Before plotting the dispersion estimates, we omit the rows which did not converge.
+```{r}
+DEres.dispIbr <- DEresIbr[which(mcols(DEresIbr)$betaConv),]
+plotDispEsts(DEres.dispIbr)
+DEres.dispDuv <- DEresDuv[which(mcols(DEresDuv)$betaConv),]
+plotDispEsts(DEres.dispDuv)
+DEres.dispComb <- DEresComb[which(mcols(DEresComb)$betaConv),]
+plotDispEsts(DEres.dispComb)
+DEres.dispNut <- DEresNut[which(mcols(DEresNut)$betaConv),]
+plotDispEsts(DEres.dispNut)
+```
+
+## MA-plot
+Plot the log2 fold changes attributable to a given variable over the mean of normalized counts for all the samples in the dds object. Points will be colored red if the adjusted p value is less than 0.1. Points which fall out of the window are plotted as open triangles pointing either up or down.
+We visualize the MA-plot for the shrunken log2 fold changes, which remove the noise associated with log2 fold changes from low count genes without requiring arbitrary filtering thresholds.
+
+```{r}
+plotMA(resIbr, ylim=c(-2,2), cex=.8, main="IGHV mutated vs wild type after Ibrutinib treatment")
+abline(h=c(-1,1), col="dodgerblue", lwd=2)
+
+plotMA(resDuv, ylim=c(-2,2), cex=.8, main="IGHV mutated vs wild type after Duvelisib treatment")
+abline(h=c(-1,1), col="dodgerblue", lwd=2)
+
+plotMA(resComb, ylim=c(-2,2), cex=.8, main="IGHV mutated vs wild type after Ibr and C26 combinatorial treatment")
+abline(h=c(-1,1), col="dodgerblue", lwd=2)
+
+plotMA(resNut, ylim=c(-2,2), cex=.8, main="TP53 mutated vs wild type after Nutlin treatment")
+abline(h=c(-1,1), col="dodgerblue", lwd=2)
+```
+
+## P-value histogram
+
+```{r, fig.height=6, fig.width=8}
+hist_list <- lapply(allResdf, function(res) {
+ ggplot(res, aes(x=pvalue)) +
+    geom_histogram(fill="lightblue", color="black",binwidth=0.025) +
+    geom_vline(xintercept=0.05,color="red",linetype="longdash") +
+    facet_wrap(~ treatment) +
+    scale_x_continuous(breaks = seq(0,1,by=0.2)) +
+    ylab("# of genes") +
+    theme(plot.title = element_text(face="bold",hjust=0.5))
+})
+
+plot_grid(plotlist=hist_list, ncol=2)
+```
+The p-value histograms look good.
+
+## Number of significant DE genes 
+
+### Preparation
+Function for creating a df with significant up- or downregulated genes
+```{r}
+object_names <- names(allResdf)
+
+sig_genes_df <- function(gle, fdr){
+  # Create new df with number of sign. genes for each treatment
+  genes_df <- setNames(data.frame(matrix(ncol = 2, nrow = 0)),
+                         c("treatment", "sig_genes"))
+  compare <- match.fun(gle)
+
+  for(df in allResdf){
+    n_genes <- filter(df, compare(LFC,0) & padj < fdr) %>% 
+      summarise(n=length(Ensembl)) %>% pull(n)
+    tr <- unique(df$treatment)
+  
+    new_row <- c(tr, n_genes)
+    genes_df[nrow(genes_df) + 1, ] <- new_row
+  }
+  genes_df$sig_genes <- as.numeric(genes_df$sig_genes)
+  genes_df$treatment <- factor(genes_df$treatment,
+                               levels = allTreat)
+  return(genes_df)
+}
+```
+
+Function for plotting number of significant genes for IGHV and viability
+```{r}
+sigDEgenes <- function(df, title){
+  plot <- ggplot(df, aes(x=treatment, y=sig_genes)) +
+    geom_bar(stat = "identity", color="black", fill="#0C3C9F") +
+    theme(axis.text.x = element_text(angle = 90, vjust=0.5, hjust=1)) +
+    ylab("# significant DE genes") +
+    theme(axis.title.x = element_blank()) +
+    ggtitle(title) +
+    geom_text(aes(label=sig_genes),vjust=1.5,size=3,color="white")
+  return(plot)
+}
+```
+
+#### 5% FDR
+```{r,fig.height=4, fig.width=8}
+# Upregulated
+sig_genes_df_up <- sig_genes_df(gle=">", fdr=0.05)
+genes_5FDRup <- sigDEgenes(df=sig_genes_df_up, title="5% FDR upregulated")
+
+# Downregulated
+sig_genes_df_down <- sig_genes_df(gle="<", fdr=0.05)
+genes_5FDRdown <- sigDEgenes(df=sig_genes_df_down, title="5% FDR downregulated")
+
+plot_grid(genes_5FDRup, genes_5FDRdown, ncol=2)
+```
+
+#### 10% FDR
+```{r,fig.height=4, fig.width=8}
+# Upregulated
+sig_genes_df_up <- sig_genes_df(gle=">", fdr=0.1)
+genes_10FDRup <- sigDEgenes(df=sig_genes_df_up, title="10% FDR upregulated")
+
+# Downregulated
+sig_genes_df_down <- sig_genes_df(gle="<", fdr=0.1)
+genes_10FDRdown <- sigDEgenes(df=sig_genes_df_down, title="10% FDR downregulated")
+
+plot_grid(genes_10FDRup, genes_10FDRdown, ncol=2)
+```
+
+#### 25% FDR
+```{r,fig.height=4, fig.width=8}
+# Upregulated
+sig_genes_df_up <- sig_genes_df(gle=">", fdr=0.25)
+genes_25FDRup <- sigDEgenes(df=sig_genes_df_up, title="25% FDR upregulated")
+
+# Downregulated
+sig_genes_df_down <- sig_genes_df(gle="<", fdr=0.25)
+genes_25FDRdown <- sigDEgenes(df=sig_genes_df_down, title="25% FDR downregulated")
+
+plot_grid(genes_25FDRup, genes_25FDRdown, ncol=2)
+```
+
+## Table of significant associations
+
+Show combined data frame and pre-filter genes
+```{r}
+allResdf.combined %>%
+  filter_at(vars(padj_Ibr, padj_Duv, padj_IbrC26, padj_Nut),
+            all_vars(. < 0.5)) %>%
+  dplyr::select(Ensembl, symbol, chromosome,
+                LFC_Ibr, padj_Ibr, LFC_Duv, padj_Duv,
+                LFC_IbrC26, padj_IbrC26, LFC_Nut, padj_Nut) %>%
+  mutate_if(is.numeric, formatC, digits=2) %>%
+  DT::datatable()
+```
+
+## Volcano plots
+
+Function for creating volcano plot
+```{r}
+volcano <- function(res, title){
+  plot <- ggplot(res, aes(x=LFC, y=-log10(padj))) +
+    geom_vline(xintercept = 0, color="black", linetype="solid", size=0.25) +
+    geom_hline(yintercept = -log10(0.01), color="darkgrey", linetype="dashed") +
+    geom_hline(yintercept = -log10(0.10), color="darkgrey", linetype="dashed") +
+    geom_vline(xintercept = 1, color="darkgrey", linetype="dashed") +
+    geom_vline(xintercept =-1, color="darkgrey", linetype="dashed") +
+    geom_point(data=res[res$LFC >= 0 & res$padj <= 0.1,],
+              color="firebrick3", size=0.9) +
+    geom_point(data=res[res$LFC <= 0 & res$padj <= 0.1,],
+              color="navy", size=0.9) +
+    geom_point(data=res[res$padj >= 0.1,], color="darkgrey", size=0.9) +
+    ggrepel::geom_label_repel(data=res[res$LFC > 0 & res$padj <= 0.001,],
+                              aes(label=symbol), color="firebrick3", size=2,
+                              max.overlaps=20) +
+    ggrepel::geom_label_repel(data=res[res$LFC < 0 & res$padj <= 0.001,],
+                              aes(label=symbol), color="navy", size=2,
+                              max.overlaps=20) +
+    ggtitle(title) +
+    theme(plot.title = element_text(hjust=0.5, face="bold"))
+  return(plot)
+}
+```
+
+Remove genes with non-calculated adjusted p-values
+```{r}
+allResdf.na<- lapply(allResdf, function(df) {
+  df <- df[!is.na(df$padj),]
+  })
+names(allResdf.na) <- allTreat
+```
+
+Show volcano plot for all conditions
+```{r, fig.height=10, fig.width=12}
+p1 <- volcano(allResdf.na$Ibrutinib, title="IGHV mutated vs wt after Ibrutinib treatment")
+p2 <- volcano(allResdf.na$Duvelisib, title="IGHV mutated vs wt after Duvelisib treatment")
+p3 <- volcano(allResdf.na$Ibr_x_C26, title="IGHV mutated vs wt after Ibr_x_C26 treatment")
+p4 <- volcano(allResdf.na$Nutlin_3a, title="TP53 mutated vs wt after Nutlin treatment")
+
+plot_grid(p1, p2, p3, p4, ncol=2)
+```
+
+# Session Info Details
+```{r, echo=FALSE, eval=TRUE}
+sessionInfo()
+```

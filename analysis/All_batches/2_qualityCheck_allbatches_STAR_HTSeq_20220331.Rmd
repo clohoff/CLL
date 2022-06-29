@@ -1,0 +1,1626 @@
+---
+title: "Quality assessment of untrimmed, drug-perturbed CLL RNA-Seq data from all batches, pre-processed with STAR & HTSeq"
+author: "Caroline Lohoff (based on code from Junyan Lu)"
+date: "May 27 2022"
+output:
+  BiocStyle::html_document:
+    toc_float: true
+---
+
+# Description
+The objective of the analysis is the quality control of the RNA sequencing data after perturbation with either DMSO or one of ten drugs. The RNAseq data from 1106 samples and 112 patients were pre-processed with STAR without any prior trimming. The genes were counted with HTSeq.
+This analysis assesses and compares the quality of the five batches pilot, batch 1 combined, batch 2, batch 3, and batch 4. The aim of the exploratory data analysis is to find reasons for variation in the data.
+Furthermore, the sequencing quality is compared to previous CLL RNAseq data sets from 2018 and 2019.
+
+# Load data and packages
+
+Set global options
+```{r setup, include=FALSE, cache = FALSE}
+knitr::opts_knit$set(root.dir = "~/Documents/R/drugseq_test")
+knitr::opts_chunk$set(warning = FALSE, message = FALSE)
+```
+
+Load packages
+```{r}
+suppressPackageStartupMessages({
+  library(DESeq2)
+  library(tidyverse)
+  library(sjmisc)
+  library(RColorBrewer)
+  library(factoextra)
+  library(pheatmap)
+  library(cowplot)
+})
+```
+
+Set global ggplot variables
+```{r}
+theme_set(theme_bw() + theme(axis.text = element_text(size=12), 
+                             axis.title = element_text(size=16),
+                             legend.title = element_text(size=16),
+                             legend.text = element_text(size=14),
+                             plot.title = element_text(size=18,
+                                                       hjust=0.5,face="bold")))
+# Define color palette
+cp <- c("#2CB902", "#FD7306", "#FF1EBE", "#0137A4", "#C8C701")
+```
+
+Load data and add annotations
+```{r}
+# Load dds data set containing 1106 samples and count matrix
+load("./output/ddsDrug_htseq_batchPilot1c234_20220426.RData")
+
+# Load meta data including genotyping info
+load("./data/patmeta_210324.RData")
+
+# Add columns to DESeq object using patient meta data
+col_vec <- c("diagnosis", "gender", "Methylation_Cluster", "trisomy12", "NOTCH1", "TP53",
+             "ATM", "FBXW7", "MED12", "BRAF", "SF3B1", "del11q", "del17p", "del13q")
+ddsDrug@colData@listData <- lapply(col_vec, function(n) {
+  ddsDrug[[n]] <- patMeta[match(ddsDrug$patID, patMeta$Patient.ID), n]
+}) %>% bind_cols() %>% sjmisc::add_columns(ddsDrug@colData@listData)
+
+names(ddsDrug@colData@listData)[names(ddsDrug@colData@listData) == "Methylation_Cluster"] <- "Methylation"
+ddsDrug$IGHVpat <- patMeta[match(ddsDrug$patID, patMeta$Patient.ID),]$IGHV.status
+ddsDrug$IGHV <- ifelse(is.na(ddsDrug$IGHV), ddsDrug$IGHVpat, ddsDrug$IGHV)
+ddsDrug$IGHVpat <- NULL
+
+# Add meta data to the samples from the pilot batch
+ddsDrug$diagnosis[ddsDrug$batch == "pilot"] <- "CLL" 
+ddsDrug$trisomy12[ddsDrug$batch == "pilot"] <- 0
+ddsDrug$TP53[ddsDrug$batch == "pilot"] <- 0
+ddsDrug$NOTCH1[ddsDrug$batch == "pilot"] <- 0
+ddsDrug$del13q[ddsDrug$batch == "pilot"] <- 1
+ddsDrug$IGHV[ddsDrug$batch == "pilot" & ddsDrug$patID %in% c("PID1095", "PID1222")] <- "U"
+ddsDrug$IGHV[ddsDrug$batch == "pilot" & ddsDrug$patID %in% c("PID1177", "PID1210")] <- "M"
+ddsDrug$gender[ddsDrug$batch == "pilot" & ddsDrug$patID %in% c("PID1095", "PID1222")] <- "f"
+ddsDrug$gender[ddsDrug$batch == "pilot" & ddsDrug$patID %in% c("PID1177", "PID1210")] <- "m"
+
+# Remove replicate samples
+ddsDrug <- ddsDrug[,ddsDrug$Replicate == 1]
+dim(ddsDrug)
+
+# Retrieve patient annotations from dds object as data frame
+patAnno_all <- colData(ddsDrug) %>% as_tibble()
+patAnno <- patAnno_all %>%
+  dplyr::select(-c(expBatch, Replicate, time, Barcode,
+                   Input.concentration, RIN, IDplate, Library.concentration,
+                   Libary.molarity, Average.fragment.size))
+```
+
+Add mapping rate to annotation columns
+```{r}
+# Load mapping rate data
+htTab <- read_tsv("./output/htseq_process_batchPilot1c234_20220203.tsv")
+htTab <- htTab %>% mutate(percent = percent*100)
+
+# Only select mapping rate & add column with patient IDs
+htTab_mapRate <- htTab[htTab$feature == "total mapped",] %>%
+   mutate(patID = patAnno[match(fileName, patAnno$fileName),]$patID)
+
+# Add mapping rate to patAnno
+patAnno <- patAnno %>%
+  mutate(mapping_rate = htTab_mapRate[match(fileName,htTab_mapRate$fileName),]$percent)
+ddsDrug$mapping_rate <- patAnno[match(ddsDrug$fileName, patAnno$fileName),]$mapping_rate
+```
+
+
+# Abundance of different types of genes
+```{r, fig.width=10, fig.height=5}
+ddsDMSO <- ddsDrug[,ddsDrug$treatment=="DMSO"]
+sumTab <- counts(ddsDMSO) %>% as_tibble(rownames = "id") %>%
+  pivot_longer(-id) %>%
+  mutate(patID = colData(ddsDMSO)[name,]$patID,
+         treatment = colData(ddsDMSO)[name,]$treatment,
+         biotype = rowData(ddsDMSO)[id,]$biotype,
+         chr = rowData(ddsDMSO)[id,]$chromosome)
+sumType <- group_by(sumTab, biotype, patID) %>%
+  summarise(medVal = median(value), meanVal = mean(value))
+
+ggplot(sumType, aes(x=biotype, y=log(medVal))) +
+  geom_boxplot() + geom_point() +
+  theme(axis.text.x=element_text(angle=90, hjust=1, vjust=0.5)) +
+  ggtitle("Median counts")
+ggplot(sumType, aes(x=biotype, y=log(meanVal))) +
+  geom_boxplot() + geom_point() +
+  theme(axis.text.x=element_text(angle=90, hjust=1, vjust=0.5)) +
+  ggtitle("Mean counts")
+```
+In comparison the abundance of mitochondrial genes is higher than the abundance of genes from the chromosomes. One explanation, why mt_rRNA is so abundant could be that mitochondrial RNA is associated with viability. This could be hint that a lot of cells are dying, as the cellular mitochondrial content determines the apoptotic fate and modulates the time to death. Cells with higher mitochondrial content are more prone to die [see paper Márquez-Jurado et al. "Mitochondrial levels determine variability in cell death by modulating apoptotic gene expression"](https://www.nature.com/articles/s41467-017-02787-4). In this paper they confer mitochondria a powerful discriminatory capacity of apoptotic fate. The results reveal a different role of mitochondria in apoptosis as the global regulator of apoptotic protein expression. 
+
+Show number of genes per category
+```{r, fig.height=6, fig.width=12}
+geneType <- as.data.frame(table(sumTab$biotype))
+ggplot(geneType, aes(x=Var1, y=Freq)) +
+  geom_bar(stat="identity", fill="steelblue") +
+  geom_text(aes(label=Freq), vjust=-0.3, size=2.5) +
+  theme_minimal() +
+  theme(axis.title.x=element_blank(),
+        axis.text.x = element_text(angle=90, vjust=0.5, hjust=1))
+```
+Most of the genes are protein coding. For further analysis we only use protein coding genes. 
+
+Show log mean expression of genes per chromosome
+```{r}
+sumType <- group_by(sumTab, chr, patID) %>%
+  summarise(medVal = median(value), meanVal = mean(value))
+
+ggplot(sumType, aes(x=chr, y=log(medVal))) + geom_boxplot() + geom_point() +
+  theme(axis.text.x = element_text(angle = 90, hjust=1, vjust=0.5)) +
+  ggtitle("Median counts of genes per chromosome")
+ggplot(sumType, aes(x=chr, y=log(meanVal))) + geom_boxplot() + geom_point() +
+  theme(axis.text.x = element_text(angle = 90, hjust=1, vjust=0.5)) +
+  ggtitle("Mean counts of genes per chromosome")
+```
+The mean expression value of genes from chromosome X is very similar to genes on the chromosomes 1-22. Genes on chromosome Y show a different expression pattern. Hence, we only consider chromosomes 1-22 and X for further analysis. 
+
+Filter genes 
+```{r filter-genes}
+# Remove rows/genes with too few counts (less than ten)
+keep <- apply(counts(ddsDrug), 1, function(x) any(x >= 10))
+ddsAll <- ddsDrug[keep,]
+
+# Only use protein coding genes
+ddsAll <- ddsAll[rowData(ddsAll)$biotype %in% "protein_coding",]
+
+# Show chromosomes
+table(rowData(ddsAll)$chromosome)
+
+# Remove all chromosomes, except for 1,2,3,...,22 and X
+ddsAll <- ddsAll[rowData(ddsAll)$chromosome %in% c(1:22,"X")]
+table(rowData(ddsAll)$chromosome)
+dim(ddsAll)
+```
+
+
+# Visualize quality and batch effects
+
+We want to investigate whether the mapping rate has an influence on the number of counts. 
+Patients with a sparse counts matrix should be excluded, as they negatively impact the estimated size Factors. 
+
+## Distribution of raw counts
+
+Define function for raw counts box plot
+```{r}
+raw_counts_plot <- function(inputTable){
+  plot <- inputTable %>%
+    ggplot(aes(reorder(ID, log10(count), median),
+               log10(count), fill=batch, color=batch)) +
+    geom_boxplot(alpha=0.1) + theme_bw() + 
+    xlab("Samples") + 
+    theme(axis.text.x=element_text(angle=90, hjust=1, size=4)) +
+    scale_fill_manual(values=cp) +
+    scale_color_manual(values=cp) +
+    facet_wrap(~batch, scales='free', ncol=1)+
+        scale_x_discrete(labels=setNames(as.character(inputTable$ID), inputTable$ID))
+  return(plot)
+}
+```
+
+```{r}
+raw_counts_plot_patID <- function(inputTable){
+  plot <- inputTable %>%
+    ggplot(aes(reorder(patID, log10(count), median),
+               log10(count), fill=batch, color=batch)) +
+    geom_boxplot(alpha=0.1) + theme_bw() + 
+    xlab("Patients") + 
+    theme(axis.text.x=element_text(angle=90, hjust=1, size=4)) +
+    scale_fill_manual(values=cp) +
+    scale_color_manual(values=cp)
+  return(plot)
+}
+```
+
+### Before normalization
+
+```{r}
+plotTab <- data.frame(counts(ddsAll)) %>% 
+  rownames_to_column("id") %>%
+  gather(key = "ID", value = "count",-id) %>%
+  dplyr::filter(count > 0) %>%
+  mutate(batch = patAnno[match(ID, patAnno$ID),]$batch,
+         patID = patAnno[match(ID, patAnno$ID),]$patID)
+```
+
+Are there any outlier samples in the different batches?
+```{r, fig.width=15, fig.height=15}
+raw_counts_plot(plotTab)
+```
+
+Are there any outlier patients?
+```{r, fig.width=12, fig.height=5}
+raw_counts_plot_patID(plotTab)
+```
+
+```{r}
+patIDs_counts <- plotTab %>%  
+  group_by(patID) %>% 
+  summarize(min = min(log10(count)),
+            q1 = quantile(log10(count), 0.25),
+            median = median(log10(count)),
+            mean = mean(log10(count)),
+            q3 = quantile(log10(count), 0.75),
+            max = max(log10(count)))
+
+# Patients with very few counts
+patIDs_counts[patIDs_counts$median <= 1,]$patID
+```
+
+## Mapping rate per patient
+```{r, fig.width=12, fig.height=5}
+patAnno %>%
+    ggplot(aes(reorder(patID, mapping_rate, median),
+               mapping_rate, fill=batch, color=batch)) +
+    geom_boxplot(alpha=0.1) + theme_bw() + 
+    xlab("Patients") + 
+    theme(axis.text.x=element_text(angle=90, hjust=1, size=5)) +
+    scale_fill_manual(values=cp) +
+    scale_color_manual(values=cp)
+```
+
+```{r}
+patIDs_mapRate <- patAnno %>%  
+  group_by(patID) %>% 
+  summarize(min = min(mapping_rate),
+            q1 = quantile(mapping_rate, 0.25),
+            median = median(mapping_rate),
+            mean = mean(mapping_rate),
+            q3 = quantile(mapping_rate, 0.75),
+            max = max(mapping_rate))
+
+# Patients with very low mapping rate
+patIDs_mapRate[patIDs_mapRate$median <= 5,]$patID
+```
+
+The patients P0029, P0437, and P0708 have a very low mapping rate and thus very few median gene counts. Therefore, these patients will be excluded from differential gene expression analysis. 
+Based on mapping rate, also the samples from the pilot batch should be excluded from differential gene expression analysis. The mapping rate of patients from the pilot batch is much higher than the mapping rate in all other batches. 
+
+### After normalization
+
+Variance stabilization transformation of the raw data
+```{r vst}
+RNAnorm_all <- vst(ddsAll)
+```
+
+Prepare plot table
+```{r}
+plotTab <- data.frame(assay(RNAnorm_all)) %>% 
+  rownames_to_column("id") %>%
+  gather(key= "ID", value = "count",-id) %>%
+  dplyr::filter(count > 0) %>%
+  mutate(batch = patAnno[match(ID, patAnno$ID),]$batch,
+         patID = patAnno[match(ID, patAnno$ID),]$patID)
+```
+
+```{r, fig.width=15, fig.height=15}
+raw_counts_plot(plotTab)
+```
+After normalization, the box plots of the log10 counts per sample look quite homogeneous. 
+
+```{r, fig.width=12, fig.height=5}
+raw_counts_plot_patID(plotTab)
+```
+
+
+## Check ECDF
+
+An empirical cumulative distribution function (ECDF) is an estimator of the Cumulative Distribution Function. The ECDF allows to plot one feature of the data, here mean counts, ordered from least to greatest to see how this feature is distributed across the data set. It can be a useful summary statistic to detect outlier samples.
+
+A successful normalization should lead to overlapping empirical cumulative distribution function (ECDF) curves.
+```{r, fig.width=15, fig.height=7, cache=TRUE}
+par(mfrow = c(1,2))
+geneplotter::multidensity(assay(RNAnorm_all), xlim = c(0,20),
+                          legend = F, xlab = "mean counts")
+geneplotter::multiecdf(assay(RNAnorm_all), legend = F, xlab="mean counts")
+```
+There are potentially some outlier samples.
+
+# Clustering -- PCA
+
+The exploratory data analysis is performed on data normalized and transformed using the variance stabilizing transformation (vst) provided by the DESeq2 package. Principle component analysis is a substantial part of quality control to explore the variation in the data.
+
+## PCA with all samples
+
+Invariant filtering of top 5000 most variant genes
+```{r}
+exprMat <- assay(RNAnorm_all)
+sds <- rowSds(exprMat)
+exprMat <- exprMat[order(sds, decreasing=T)[1:5000],]
+```
+
+Calculate PCA
+```{r}
+pcaRes <- prcomp(t(exprMat), scale=TRUE, center=TRUE)
+varExp <- (pcaRes$sdev^2 / sum(pcaRes$sdev^2))*100
+pcaTab <- data.frame(pcaRes$x[,1:10]) %>%
+  rownames_to_column("ID") %>% left_join(patAnno)
+names(varExp) <- colnames(pcaRes$x)
+```
+
+### PCA colored by treatment
+```{r}
+ggplot(pcaTab, aes(x=PC1,y=PC2, col = treatment)) + geom_point() + theme_bw() + 
+  xlab(sprintf("PC1 (%2.1f%%)",varExp[1])) + ylab(sprintf("PC2 (%2.1f%%)",varExp[2])) +
+  ggtitle("PCA colored by treatment all samples")
+```
+The treatments are not separated by the principal components. Only the baseline samples of batches one to four are separated by PC2. This is expected, as there is a strong patient-to-patient variation, which dominates the PCA more than the drug effects.
+
+### PCA colored by diagnosis
+```{r}
+# Remove the baseline samples
+remove <- dplyr::filter(pcaTab, treatment == "Baseline")
+pcaTab <- dplyr::anti_join(pcaTab, remove, by="ID")
+
+ggplot(pcaTab, aes(x=PC1, y=PC2, col = diagnosis)) + geom_point() + theme_bw() + 
+  xlab(sprintf("PC1 (%2.1f%%)",varExp[1])) + ylab(sprintf("PC2 (%2.1f%%)",varExp[2])) +
+  ggtitle("PCA colored by diagnosis (baseline samples excluded)")
+```
+After removing the baseline samples, we see that PC2 separates patients with a different diagnosis than CLL. Especially mantle cell lymphoma (MCL) can be clearly separated from CLL.
+
+### PCA colored by batch
+```{r}
+ggplot(pcaTab, aes(x=PC1,y=PC2, col=batch)) + geom_point() + theme_bw() + scale_color_manual(values=cp) + 
+  xlab(sprintf("PC1 (%2.1f%%)",varExp[1])) + ylab(sprintf("PC2 (%2.1f%%)",varExp[2])) +
+  ggtitle("PCA colored by batches (baseline samples excluded)")
+```
+There is no separation between the batches. Thus, all batches can be used together in further analysis. Also the samples from the pilot batch are not separated from batches 1-4.
+
+## Focus on CLL
+
+In this analysis we are only interested in CLL. Therefore, all samples from patients with a different diagnosis than CLL are being removed. In addition, we have seen that the baseline samples are separated from the other samples. To be able to see differences between the drug-perturbed samples, the seventeen baseline samples will be removed.
+```{r}
+# Remove all 17 baseline samples
+remove <- dplyr::filter(patAnno, treatment == "Baseline")
+patAnno_CLL <- dplyr::anti_join(patAnno, remove, by="ID")
+
+# Keep only the 1013 CLL samples, and remove all other 76 samples
+patAnno_CLL <- dplyr::filter(patAnno_CLL, diagnosis == "CLL")
+
+# Subset the expression matrix by the removed samples
+exprMat_CLL <- exprMat[, patAnno_CLL$ID]
+sds_CLL <- rowSds(exprMat_CLL)
+
+# Focus on the 500, 1000, and 5000 most variant genes
+exprMat_CLL500 <- exprMat_CLL[order(sds_CLL, decreasing=T)[1:500],]
+exprMat_CLL1000 <- exprMat_CLL[order(sds_CLL, decreasing=T)[1:1000],]
+exprMat_CLL5000 <- exprMat_CLL[order(sds_CLL, decreasing=T)[1:5000],]
+
+### Calculate the PCA
+# Top 500 genes
+pcaRes500 <- prcomp(t(exprMat_CLL500), scale=TRUE, center=TRUE)  #scale=FALSE
+varExp500 <- (pcaRes500$sdev^2 / sum(pcaRes500$sdev^2))*100
+pcaTab500 <- data.frame(pcaRes500$x[,1:10]) %>%
+  rownames_to_column("ID") %>% left_join(patAnno_CLL)
+names(varExp500) <- colnames(pcaRes500$x)
+
+# Top 1000 genes
+pcaRes1000 <- prcomp(t(exprMat_CLL1000), scale=TRUE, center=TRUE)  #scale=FALSE
+varExp1000 <- (pcaRes1000$sdev^2 / sum(pcaRes1000$sdev^2))*100
+pcaTab1000 <- data.frame(pcaRes1000$x[,1:10]) %>%
+  rownames_to_column("ID") %>% left_join(patAnno_CLL)
+names(varExp1000) <- colnames(pcaRes1000$x)
+
+# Top 5000 genes
+pcaRes5000 <- prcomp(t(exprMat_CLL5000), scale=TRUE, center=TRUE)  #scale=FALSE
+varExp5000 <- (pcaRes5000$sdev^2 / sum(pcaRes5000$sdev^2))*100
+pcaTab5000 <- data.frame(pcaRes5000$x[,1:10]) %>%
+  rownames_to_column("ID") %>% left_join(patAnno_CLL)
+names(varExp5000) <- colnames(pcaRes5000$x)
+```
+
+Visualize eigenvalues (variance explained by the principal components)
+```{r}
+fviz_screeplot(pcaRes5000, addlabels = TRUE, ylim = c(0, 22))
+```
+
+#### PCA colored by batch
+```{r}
+ggplot(pcaTab5000, aes(x=PC1,y=PC2, col = batch)) +
+  geom_point() + theme_bw() + scale_color_manual(values=cp) +
+  xlab(sprintf("PC1 (%2.1f%%)",varExp5000[1])) + ylab(sprintf("PC2 (%2.1f%%)",varExp5000[2])) +
+  ggtitle("PCA colored by batches (only CLL)")
+```
+After removing the baseline samples and all other diagnosis than CLL, there is still no separation between the batches. Thus, there is no need to adjust for batch effects. However, all samples from the pilot batch are on the left side of the plot. 
+
+#### PCA colored by patientID
+```{r, fig.width=10, fig.height=5}
+ggplot(pcaTab5000, aes(x=PC1, y=PC2, col = patID)) + geom_point(size=2) + theme_bw() + 
+  xlab(sprintf("PC1 (%2.1f%%)",varExp5000[1])) + ylab(sprintf("PC2 (%2.1f%%)",varExp5000[2])) +
+  ggtitle("PCA colored by patients (only CLL)") +
+  ggrepel::geom_label_repel(data=pcaTab5000[pcaTab5000$PC1 >= 110,],
+                            aes(label=patID), size=3)
+```
+There is a high inter-patient heterogeneity in the data set, as samples from the same patients cluster together. 
+The patients identified before (P0437, P0029 and P0708) as the ones with the lowest counts and low mapping rate are slightly separated from the other patients. 
+
+#### PCA colored by viability
+```{r}
+ggplot(pcaTab5000, aes(x=PC1, y=PC2, col=FSC.SSC.d0)) + geom_point(size=2) + theme_bw() + 
+  xlab(sprintf("PC1 (%2.1f%%)",varExp5000[1])) + ylab(sprintf("PC2 (%2.1f%%)",varExp5000[2])) +
+  ggtitle("PCA colored by viability after unfreezing the samples (before incubation)")
+```
+
+```{r}
+ggplot(pcaTab5000, aes(x=PC1, y=PC2, col=FSC.SSC)) + geom_point(size=2) + theme_bw() + 
+  xlab(sprintf("PC1 (%2.1f%%)",varExp5000[1])) + ylab(sprintf("PC2 (%2.1f%%)",varExp5000[2])) +
+  ggtitle("PCA colored by viability after incubation for 48 hours")
+```
+When we compare the viability at the different time points (directly after unfreezing the samples and after incubation at 37°C for 48 hours), we can clearly see a decrease in overall viability from 50% - 95% to 10% - 88%. Thus, spontaneous apoptosis is a major problem of CLL samples that leads to strong noise in the data set. Principal component 1 is the viability.
+
+#### PCA colored by mapping rate
+```{r}
+ggplot(pcaTab5000, aes(x=PC1, y=PC2, col=mapping_rate)) + geom_point(size=2) + theme_bw() + 
+  xlab(sprintf("PC1 (%2.1f%%)",varExp5000[1])) + ylab(sprintf("PC2 (%2.1f%%)",varExp5000[2])) +
+  ggtitle("PCA colored by mapping rate")
+```
+
+Correlation between viability and mapping rate
+```{r, fig.width=20, fig.height=5}
+p1 <- ggplot(pcaTab5000, aes(x=FSC.SSC, y=mapping_rate, col=FSC.SSC)) +
+  geom_point() +
+  geom_smooth(method="glm") +
+  ggtitle("Correlation between viability and mapping rate") +
+    annotate(x=20, y=31, 
+         label=paste("R = ", round(cor(pcaTab5000$FSC.SSC, pcaTab5000$mapping_rate),2)), 
+         geom="text", size=6)
+
+p2 <- ggplot(pcaTab5000, aes(x=PC1, y=mapping_rate, col=mapping_rate)) +
+  geom_point() +
+  geom_smooth(method="glm") +
+  ggtitle("Correlation between PC1 and mapping rate") +
+    annotate(x=138, y=31, 
+         label=paste("R = ", round(cor(pcaTab5000$PC1, pcaTab5000$mapping_rate),2)), 
+         geom="text", size=6)
+
+p3 <- ggplot(pcaTab5000, aes(x=PC1, y=FSC.SSC, col=FSC.SSC)) +
+  geom_point() +
+  geom_smooth(method="glm") +
+  ggtitle("Correlation between PC1 and viability") +
+    annotate(x=138, y=77, 
+         label=paste("R = ", round(cor(pcaTab5000$PC1, pcaTab5000$FSC.SSC),2)), 
+         geom="text", size=6)
+
+plot_grid(p1, p2, p3, ncol=3)
+```
+Mapping rate and viability are PC1. 
+
+***We can conclude that a low viability of samples leads to a low mapping rate. A low mapping rate causes a low library size and a low number of counts (sparse count matrix).***
+
+#### PCA colored by IGHV status
+```{r, fig.width=12, fig.height=5}
+p1 <- ggplot(pcaTab500, aes(x=PC1, y=PC2, col = IGHV)) + geom_point(size=2) + theme_bw() + 
+  xlab(sprintf("PC1 (%2.1f%%)",varExp500[1])) + ylab(sprintf("PC2 (%2.1f%%)",varExp500[2])) +
+  ggtitle("PCA colored by IGHV top 500 genes")
+
+p2 <- ggplot(pcaTab1000, aes(x=PC1, y=PC2, col = IGHV)) + geom_point(size=2) + theme_bw() + 
+  xlab(sprintf("PC1 (%2.1f%%)",varExp1000[1])) + ylab(sprintf("PC2 (%2.1f%%)",varExp1000[2])) +
+  ggtitle("PCA colored by IGHV top 1000 genes")
+
+p3 <- ggplot(pcaTab5000, aes(x=PC1, y=PC2, col = IGHV)) + geom_point(size=2) + theme_bw() + 
+  xlab(sprintf("PC1 (%2.1f%%)",varExp5000[1])) + ylab(sprintf("PC2 (%2.1f%%)",varExp5000[2])) +
+  ggtitle("PCA colored by IGHV top 5000 genes")
+
+plot_grid(p1, p2, p3, ncol=3)
+```
+PC2 is the immunoglobulin heavy chain gene (IgHV) mutation status. The separation between mutated and unmutated IgHV status is most clearly when using the 500 most variant genes.
+Extensive demethylation occurs both during normal B cell maturation through the germinal center and through the process of development from normal to leukemic cells. This leukemic demethylation mostly occurs in heterochromatin, but it also occurs in specific transcription factor binding sites and enhancers. The epigenetic subtypes of CLL can be divided into naive-like and memory-like. Naive-like CLLs (mainly unmutated CLL) have a higher global methylation heterogeneity and are more aggressive than memory-like CLLs (mainly mutated CLL). These two epigenetic subtypes have different clinical outcomes ([Nadeu et al.](https://www.annualreviews.org/doi/10.1146/annurev-pathmechdis-012419-032810)). CLL patients with unmutated IgHV status (U-CLL) have a worse survival rate than patients with mutated IgHV (M-CLL).
+
+#### PCA colored by methylation cluster
+```{r, fig.width=14, fig.height=5}
+p1 <- ggplot(pcaTab500, aes(x=PC1, y=PC2, col=Methylation)) + geom_point(size=2) + theme_bw() + 
+  xlab(sprintf("PC1 (%2.1f%%)",varExp500[1])) + ylab(sprintf("PC2 (%2.1f%%)",varExp500[2])) +
+  ggtitle("PCA colored by methylation top 500 genes")
+p2 <- ggplot(pcaTab1000, aes(x=PC1, y=PC2, col=Methylation)) + geom_point(size=2) + theme_bw() + 
+  xlab(sprintf("PC1 (%2.1f%%)",varExp1000[1])) + ylab(sprintf("PC2 (%2.1f%%)",varExp1000[2])) +
+  ggtitle("PCA colored by methylation top 1000 genes")
+p3 <- ggplot(pcaTab5000, aes(x=PC1, y=PC2, col=Methylation)) + geom_point(size=2) + theme_bw() + 
+  xlab(sprintf("PC1 (%2.1f%%)",varExp5000[1])) + ylab(sprintf("PC2 (%2.1f%%)",varExp5000[2])) +
+  ggtitle("PCA colored by methylation top 5000 genes")
+plot_grid(p1, p2, p3, ncol=3)
+```
+PC2 also describes the methylation cluster, which is correlated with the IgHV status. There is a continuous transition from low-programmed (LP) over intermediate-programmed (IP) to high-programmed (HP) methylation cluster.
+
+Both effects, the separation of IgHV status and the trend with respect to methylation cluster, are strongest when only the top 500 most variant genes are considered when calculating the PCA.
+
+#### PCA colored by trisomy 12 status
+```{r, fig.width=9, fig.height=5}
+p1 <- ggplot(pcaTab500, aes(x=PC1, y=PC3, col=trisomy12)) + geom_point(size=2) + theme_bw() + 
+  xlab(sprintf("PC1 (%2.1f%%)",varExp500[1])) + ylab(sprintf("PC3 (%2.1f%%)",varExp500[3])) +
+  ggtitle("PCA colored by trisomy 12 status top 500 genes")
+
+p2 <- ggplot(pcaTab5000, aes(x=PC1, y=PC3, col=trisomy12)) + geom_point(size=2) + theme_bw() + 
+  xlab(sprintf("PC1 (%2.1f%%)",varExp5000[1])) + ylab(sprintf("PC3 (%2.1f%%)",varExp5000[3])) +
+  ggtitle("PCA colored by trisomy 12 status top 5000 genes")
+plot_grid(p1, p2, ncol=2)
+```
+PC 3 describes the trisomy 12 status. 
+
+#### PCA colored by TP53
+```{r}
+ggplot(pcaTab5000, aes(x=PC1, y=PC2, col=TP53)) + geom_point() + theme_bw() + 
+  xlab(sprintf("PC1 (%2.1f%%)",varExp5000[1])) + ylab(sprintf("PC2 (%2.1f%%)",varExp5000[2])) +
+  ggtitle("PCA colored by TP53 mutation")
+```
+PC2 is also related to the TP53 status.
+
+#### PCA colored by NOTCH1
+```{r}
+ggplot(pcaTab5000, aes(x=PC1, y=PC2, col=NOTCH1)) + geom_point() + theme_bw() + 
+  xlab(sprintf("PC1 (%2.1f%%)",varExp5000[1])) + ylab(sprintf("PC2 (%2.1f%%)",varExp5000[2]))
+```
+
+#### PCA colored by interesting genetic features
+```{r, fig.width=11, fig.height=6}
+p1 <- ggplot(pcaTab5000, aes(x=PC1, y=PC2, col = IGHV)) + geom_point(size=2) + theme_bw() + 
+  xlab(sprintf("PC1 (%2.1f%%)",varExp5000[1])) + ylab(sprintf("PC2 (%2.1f%%)",varExp5000[2])) +
+  ggtitle("PCA colored by IGHV status")
+
+p2 <- ggplot(pcaTab5000, aes(x=PC1, y=PC2, col = Methylation)) + geom_point(size=2) + theme_bw() + 
+  xlab(sprintf("PC1 (%2.1f%%)",varExp5000[1])) + ylab(sprintf("PC2 (%2.1f%%)",varExp5000[2])) +
+  ggtitle("PCA colored by methylation cluster")
+
+p3 <- ggplot(pcaTab5000, aes(x=PC1, y=PC3, col = trisomy12)) + geom_point(size=2) + theme_bw() + 
+  xlab(sprintf("PC1 (%2.1f%%)",varExp5000[1])) + ylab(sprintf("PC3 (%2.1f%%)",varExp5000[3])) +
+  ggtitle("PCA colored by trisomy 12 status")
+
+p4 <- ggplot(pcaTab5000, aes(x=PC1, y=PC2, col = TP53)) + geom_point(size=2) + theme_bw() + 
+  xlab(sprintf("PC1 (%2.1f%%)",varExp5000[1])) + ylab(sprintf("PC2 (%2.1f%%)",varExp5000[2])) +
+  ggtitle("PCA colored by TP53 mutation")
+
+plot_grid(p1, p2, p3, p4, ncol=2)
+```
+
+#### Remove all samples with a PC1 greater than 100
+```{r, fig.width=11, fig.height=6}
+# Subset the pca table and the variance vector
+pcaTabred <- pcaTab5000[pcaTab5000$PC1 > -100 & pcaTab5000$PC1 < 100,]
+varExpred <- varExp5000[pcaTab5000$PC1 > -100 & pcaTab5000$PC1 < 100]
+
+p1 <- ggplot(pcaTabred, aes(x=PC1, y=PC2, col=FSC.SSC)) + geom_point(size=2) + theme_bw() + 
+  xlab(sprintf("PC1 (%2.1f%%)",varExpred[1])) + ylab(sprintf("PC2 (%2.1f%%)",varExpred[2])) +
+  ggtitle("PCA colored by viability after incubation for 48 hours")
+
+p2 <- ggplot(pcaTabred, aes(x=PC1, y=PC2, col = IGHV)) + geom_point(size=2) + theme_bw() + 
+  xlab(sprintf("PC1 (%2.1f%%)",varExpred[1])) + ylab(sprintf("PC2 (%2.1f%%)",varExpred[2])) +
+  ggtitle("PCA colored by IGHV status")
+
+p3 <- ggplot(pcaTabred, aes(x=PC1, y=PC2, col=Methylation)) + geom_point(size=2) + theme_bw() + 
+  xlab(sprintf("PC1 (%2.1f%%)",varExpred[1])) + ylab(sprintf("PC2 (%2.1f%%)",varExpred[2])) +
+  ggtitle("PCA colored by methylation cluster")
+
+p4 <- ggplot(pcaTabred, aes(x=PC1, y=PC2, col=TP53)) + geom_point() + theme_bw() + 
+  xlab(sprintf("PC1 (%2.1f%%)",varExpred[1])) + ylab(sprintf("PC2 (%2.1f%%)",varExpred[2])) +
+  ggtitle("PCA colored by TP53 mutation")
+
+plot_grid(p1, p2, p3, p4, ncol=2)
+```
+From these plots we clearly see a strong correlation between unmutated IGHV status, mutated TP53 mutation, and low-programming methylation cluster. Conversely, there is a strong correlation between mutated IGHV status and high-programming methylation cluster.
+PC1 is the viability, whereas PC2 describes the IGHV status, the methylation cluster as well as TP53 mutation status. 
+
+```{r, eval=FALSE, include=FALSE}
+# We investigate whether keeping X chromosome genes have an influence on the differences between genders.
+ggplot(pcaTab5000, aes(x=PC1, y=PC3, col=gender)) + geom_point(size=2) + theme_bw() + 
+  xlab(sprintf("PC1 (%2.1f%%)",varExp5000[1])) + ylab(sprintf("PC2 (%2.1f%%)",varExp5000[2])) +
+  ggtitle("PCA colored by gender")
+```
+
+#### PCA colored by treatment
+```{r}
+color_vec <- colorRampPalette(brewer.pal(9,"Set1"))(11)
+
+ggplot(pcaTab5000, aes(x=PC1, y=PC2, col=treatment)) + geom_point() + theme_bw() + 
+  xlab(sprintf("PC1 (%2.1f%%)",varExp5000[1])) + ylab(sprintf("PC2 (%2.1f%%)",varExp5000[2])) +
+  ggtitle("PCA colored by treatment") +
+  scale_color_manual(values=color_vec)
+```
+Since no difference can be determined on the basis of the treatment, it must be assumed that the viability is mostly driven by apoptosis (PC1). However, the concentration of the drugs was rather low so that we can observe the changes in pathway activities in the cells, rather than evaluating the amount of dead cells. Furthermore, our assumption is that the patients are more similar than the treatments. Therefore, we have to correct for inter-patient variation in a next step. In the further analysis after performing differential expression, we want to determine the different modes of action of the drugs. 
+
+```{r, fig.width=15, fig.height=6}
+p1 <- ggplot(pcaTab5000, aes(x=PC1, y=PC3, col=treatment)) + geom_point() + theme_bw() + 
+  xlab(sprintf("PC1 (%2.1f%%)",varExp5000[1])) + ylab(sprintf("PC3 (%2.1f%%)",varExp5000[3])) +
+  ggtitle("PCA colored by treatment (PC3)") +
+  scale_color_manual(values=color_vec)
+p2 <- ggplot(pcaTab5000, aes(x=PC1, y=PC4, col=treatment)) + geom_point() + theme_bw() + 
+  xlab(sprintf("PC1 (%2.1f%%)",varExp5000[1])) + ylab(sprintf("PC4 (%2.1f%%)",varExp5000[4])) +
+  ggtitle("PCA colored by treatment (PC4)") +
+  scale_color_manual(values=color_vec)
+p3 <- ggplot(pcaTab5000, aes(x=PC1, y=PC5, col=treatment)) + geom_point() + theme_bw() + 
+  xlab(sprintf("PC1 (%2.1f%%)",varExp5000[1])) + ylab(sprintf("PC5 (%2.1f%%)",varExp5000[5])) +
+  ggtitle("PCA colored by treatment (PC5)") +
+  scale_color_manual(values=color_vec)
+p4 <- ggplot(pcaTab5000, aes(x=PC1, y=PC6, col=treatment)) + geom_point() + theme_bw() + 
+  xlab(sprintf("PC1 (%2.1f%%)",varExp5000[1])) + ylab(sprintf("PC6 (%2.1f%%)",varExp5000[6])) +
+  ggtitle("PCA colored by treatment (PC6)") +
+  scale_color_manual(values=color_vec)
+p5 <- ggplot(pcaTab5000, aes(x=PC1, y=PC7, col=treatment)) + geom_point() + theme_bw() + 
+  xlab(sprintf("PC1 (%2.1f%%)",varExp5000[1])) + ylab(sprintf("PC7 (%2.1f%%)",varExp5000[7])) +
+  ggtitle("PCA colored by treatment (PC7)") +
+  scale_color_manual(values=color_vec)
+p6 <- ggplot(pcaTab5000, aes(x=PC1, y=PC8, col=treatment)) + geom_point() + theme_bw() + 
+  xlab(sprintf("PC1 (%2.1f%%)",varExp5000[1])) + ylab(sprintf("PC8 (%2.1f%%)",varExp5000[8])) +
+  ggtitle("PCA colored by treatment (PC8)") +
+  scale_color_manual(values=color_vec)
+
+plot_grid(p1, p2, p3, p4, p5, p6, ncol=3)
+```
+
+#### PCA colored by expID
+```{r}
+pcaTab5000$expID <- as.numeric(pcaTab5000$expID)
+ggplot(pcaTab5000, aes(x=PC1, y=PC2, col=expID)) + geom_point(size=2) + theme_bw() + 
+  xlab(sprintf("PC1 (%2.1f%%)",varExp5000[1])) + ylab(sprintf("PC2 (%2.1f%%)",varExp5000[2])) +
+  ggtitle("PCA colored by expID (top 5000 genes)") +
+  ggrepel::geom_label_repel(data=pcaTab5000[pcaTab5000$expID >= 100,],
+                            aes(label=expID), size=3)
+```
+
+
+
+
+### Correcting for patient effect
+After correcting for the patients themselves, the differences in drug treatment will have a stronger effect on the PCA.
+
+Prepare data
+```{r}
+# Remove patient effect
+exprMat_CLLpat <- limma::removeBatchEffect(exprMat_CLL, patAnno_CLL$patID)
+sdspat <- rowSds(exprMat_CLLpat)
+
+# Remove rows with NAs
+# na_ids <- which(is.na(patAnno_CLL$IGHV) | is.na(patAnno_CLL$Methylation) | is.na(patAnno_CLL$FSC.SSC) | is.na(patAnno_CLL$FSC.SSC.d0))
+
+# Invariant filtering of top 5000 most variant genes
+exprMat_CLLpat5000 <- exprMat_CLLpat[order(sdspat, decreasing=T)[1:5000], ]
+#exprMat_CLLpat5000 <- exprMat_CLLpat[order(sdspat, decreasing=T)[1:5000], -na_ids]
+
+# Caluclate PCA with top 5000 genes
+pcaRes5000 <- prcomp(t(exprMat_CLLpat5000), scale=FALSE, center=TRUE)  #scale=FALSE
+varExp5000 <- (pcaRes5000$sdev^2 / sum(pcaRes5000$sdev^2))*100
+pcaTab5000 <- data.frame(pcaRes5000$x[,1:10]) %>%
+  rownames_to_column("ID") %>% left_join(patAnno_CLL)
+names(varExp5000) <- colnames(pcaRes5000$x)
+```
+
+Visualize eigenvalues (variance explained by the principal components)
+```{r}
+fviz_screeplot(pcaRes5000, addlabels = TRUE, ylim = c(0, 18))
+```
+
+#### PCA colored by patients
+```{r, fig.width=10, fig.height=5}
+ggplot(pcaTab5000, aes(x=PC1, y=PC2, col=patID)) + geom_point() + theme_bw() + 
+  xlab(sprintf("PC1 (%2.1f%%)",varExp5000[1])) + ylab(sprintf("PC2 (%2.1f%%)",varExp5000[2])) +
+  ggtitle("PCA colored by patient ID")
+```
+There is no clustering of patients anymore. 
+
+#### PCA colored by viability
+```{r}
+ggplot(pcaTab5000, aes(x=PC1, y=PC2, col=FSC.SSC)) + geom_point(size=2) + theme_bw() + 
+  xlab(sprintf("PC1 (%2.1f%%)",varExp5000[1])) + ylab(sprintf("PC2 (%2.1f%%)",varExp5000[2])) +
+  ggtitle("PCA colored by viability after incubation for 48 hours")
+```
+PC1 is the viability, which still dominates the variation in the data set. 
+
+#### PCA colored by treatment
+```{r}
+ggplot(pcaTab5000, aes(x=PC1, y=PC2, col = treatment)) + geom_point(size=2) + theme_bw() + 
+  xlab(sprintf("PC1 (%2.1f%%)",varExp5000[1])) + ylab(sprintf("PC2 (%2.1f%%)",varExp5000[2])) +
+  ggtitle("PCA colored by treatment") +
+  scale_color_manual(values=color_vec)
+```
+PC2 is now the drug treatment. Thus, after adjusting for the patient heterogeneity the drug treatment is the second most important reason for variability in the data set.
+As expected, Ibrutinib and Ibr x C26 cluster together. 
+Furthermore, the effects of all compounds which are no kinase inhibitors namely Selinexor, Nutlin-3a, C26, IBET762 seem to be less strong, as they are located at the same position as the samples treated with DMSO. The locations of samples from the kinase inhibitors Trametinib (MEK inhibitor), Everolimus (mTOR inhibitor), and MK2206 (AKT inhibitor) are very similar. Duvelisib (PI3-Kinase inhibitor) appears to be the most distinct treatment from DMSO.
+
+```{r, fig.width=11, fig.height=6}
+p1 <- ggplot(pcaTab5000, aes(x=PC1, y=PC3, col = treatment)) + geom_point(size=2) + theme_bw() + 
+  xlab(sprintf("PC1 (%2.1f%%)",varExp5000[1])) + ylab(sprintf("PC3 (%2.1f%%)",varExp5000[3])) +
+  ggtitle("PCA colored by treatment") +
+  scale_color_manual(values=color_vec)
+p2 <- ggplot(pcaTab5000, aes(x=PC1, y=PC4, col = treatment)) + geom_point(size=2) + theme_bw() + 
+  xlab(sprintf("PC1 (%2.1f%%)",varExp5000[1])) + ylab(sprintf("PC4 (%2.1f%%)",varExp5000[4])) +
+  ggtitle("PCA colored by treatment") +
+  scale_color_manual(values=color_vec)
+p3 <- ggplot(pcaTab5000, aes(x=PC1, y=PC5, col = treatment)) + geom_point(size=2) + theme_bw() + 
+  xlab(sprintf("PC1 (%2.1f%%)",varExp5000[1])) + ylab(sprintf("PC5 (%2.1f%%)",varExp5000[5])) +
+  ggtitle("PCA colored by treatment") +
+  scale_color_manual(values=color_vec)
+p4 <- ggplot(pcaTab5000, aes(x=PC1, y=PC6, col = treatment)) + geom_point(size=2) + theme_bw() + 
+  xlab(sprintf("PC1 (%2.1f%%)",varExp5000[1])) + ylab(sprintf("PC6 (%2.1f%%)",varExp5000[6])) +
+  ggtitle("PCA colored by treatment") +
+  scale_color_manual(values=color_vec)
+plot_grid(p1, p2, p3, p4, ncol=2)
+```
+
+#### PCA colored by IGHV status
+```{r, fig.width=11, fig.height=6}
+p1 <- ggplot(pcaTab5000, aes(x=PC1, y=PC2, col=IGHV)) + geom_point(size=2) + theme_bw() + 
+  xlab(sprintf("PC1 (%2.1f%%)",varExp5000[1])) + ylab(sprintf("PC2 (%2.1f%%)",varExp5000[2])) +
+  ggtitle("PCA colored by IGHV status")
+p2 <- ggplot(pcaTab5000, aes(x=PC1, y=PC3, col=IGHV)) + geom_point(size=2) + theme_bw() + 
+  xlab(sprintf("PC1 (%2.1f%%)",varExp5000[1])) + ylab(sprintf("PC3 (%2.1f%%)",varExp5000[3])) +
+  ggtitle("PCA colored by IGHV status")
+p3 <- ggplot(pcaTab5000, aes(x=PC1, y=PC4, col=IGHV)) + geom_point(size=2) + theme_bw() + 
+  xlab(sprintf("PC1 (%2.1f%%)",varExp5000[1])) + ylab(sprintf("PC4 (%2.1f%%)",varExp5000[4])) +
+  ggtitle("PCA colored by IGHV status")
+p4 <- ggplot(pcaTab5000, aes(x=PC1, y=PC5, col=IGHV)) + geom_point(size=2) + theme_bw() + 
+  xlab(sprintf("PC1 (%2.1f%%)",varExp5000[1])) + ylab(sprintf("PC5 (%2.1f%%)",varExp5000[5])) +
+  ggtitle("PCA colored by IGHV status")
+plot_grid(p1, p2, p3, p4, ncol=2)
+```
+After correcting for the patient effect, there is no clear separation anymore between U-CLL and M-CLL, since the genetic features such as IgHV mutation status are part of the differences between patients. 
+
+#### PCA colored by methylation cluster
+```{r, fig.width=11, fig.height=6}
+p1 <- ggplot(pcaTab5000, aes(x=PC1, y=PC2, col=Methylation)) + geom_point(size=2) + theme_bw() + 
+  xlab(sprintf("PC1 (%2.1f%%)",varExp5000[1])) + ylab(sprintf("PC2 (%2.1f%%)",varExp5000[2])) +
+  ggtitle("PCA colored by methylation cluster")
+p2 <- ggplot(pcaTab5000, aes(x=PC1, y=PC3, col=Methylation)) + geom_point(size=2) + theme_bw() + 
+  xlab(sprintf("PC1 (%2.1f%%)",varExp5000[1])) + ylab(sprintf("PC3 (%2.1f%%)",varExp5000[3])) +
+  ggtitle("PCA colored by methylation cluster")
+p3 <- ggplot(pcaTab5000, aes(x=PC1, y=PC4, col=Methylation)) + geom_point(size=2) + theme_bw() + 
+  xlab(sprintf("PC1 (%2.1f%%)",varExp5000[1])) + ylab(sprintf("PC4 (%2.1f%%)",varExp5000[4])) +
+  ggtitle("PCA colored by methylation cluster")
+p4 <- ggplot(pcaTab5000, aes(x=PC1, y=PC5, col=Methylation)) + geom_point(size=2) + theme_bw() + 
+  xlab(sprintf("PC1 (%2.1f%%)",varExp5000[1])) + ylab(sprintf("PC5 (%2.1f%%)",varExp5000[5])) +
+  ggtitle("PCA colored by methylation cluster")
+plot_grid(p1, p2, p3, p4, ncol=2)
+```
+
+#### PCA colored by trisomy 12
+```{r, fig.width=11, fig.height=6}
+p1 <- ggplot(pcaTab5000, aes(x=PC1, y=PC2, col=trisomy12)) + geom_point(size=2) + theme_bw() + 
+  xlab(sprintf("PC1 (%2.1f%%)",varExp5000[1])) + ylab(sprintf("PC2 (%2.1f%%)",varExp5000[2])) +
+  ggtitle("PCA colored by trisomy 12")
+p2 <- ggplot(pcaTab5000, aes(x=PC1, y=PC3, col=trisomy12)) + geom_point(size=2) + theme_bw() + 
+  xlab(sprintf("PC1 (%2.1f%%)",varExp5000[1])) + ylab(sprintf("PC3 (%2.1f%%)",varExp5000[3])) +
+  ggtitle("PCA colored by trisomy 12")
+p3 <- ggplot(pcaTab5000, aes(x=PC1, y=PC4, col=trisomy12)) + geom_point(size=2) + theme_bw() + 
+  xlab(sprintf("PC1 (%2.1f%%)",varExp5000[1])) + ylab(sprintf("PC4 (%2.1f%%)",varExp5000[4])) +
+  ggtitle("PCA colored by trisomy 12")
+p4 <- ggplot(pcaTab5000, aes(x=PC1, y=PC5, col=trisomy12)) + geom_point(size=2) + theme_bw() + 
+  xlab(sprintf("PC1 (%2.1f%%)",varExp5000[1])) + ylab(sprintf("PC5 (%2.1f%%)",varExp5000[5])) +
+  ggtitle("PCA colored by trisomy 12")
+plot_grid(p1, p2, p3, p4, ncol=2)
+```
+
+
+##### Show individual treatments with respect to IGHV status
+The following PCA plots show the difference between one treatment and DMSO samples, and furthermore how this treatments effects CLL cells with unmethylated or methylated IgHV status. 
+```{r create-IGHVdf}
+pcaTab5000$treatment <- factor(str_replace_all(pcaTab5000$treatment,"[- ]","_"))
+
+# Create two data sets: U-CLL and M-CLL
+patAnno_CLLna <- patAnno_CLL[!is.na(patAnno_CLL$IGHV), ]
+
+UCLL <- patAnno_CLLna[patAnno_CLLna$IGHV == "U", ]$ID
+MCLL <- patAnno_CLLna[patAnno_CLLna$IGHV == "M", ]$ID
+pcaTabU <- pcaTab5000[pcaTab5000$ID %in% UCLL, ]
+pcaTabM <- pcaTab5000[pcaTab5000$ID %in% MCLL, ]
+```
+
+Define a function for plotting PCAs for the individual treatments 
+```{r function-pca}
+plot_pca <- function(tab, tr, status, color){
+  v1 <- c(DMSO = color_vec[2])
+  plot <- ggplot(tab[tab$treatment %in% c(tr, "DMSO"), ], aes(x=PC1, y=PC5, col = treatment)) +
+    geom_point(size=2) + theme_bw() + ggtitle(sprintf("PCA of %s vs DMSO in %s", tr, status)) +
+    xlab(sprintf("PC1 (%2.1f%%)",varExp5000[1])) + ylab(sprintf("PC2 (%2.1f%%)",varExp5000[2])) +
+    scale_color_manual(values = c(v1, color))
+  return(plot)
+}
+```
+
+Plot PCAs
+```{r, fig.width=8, fig.height=24}
+treat_vec <-c("Ibrutinib", "Duvelisib", "Trametinib", "Everolimus", "MK2206",
+              "C26", "Ibr_x_C26", "Nutlin_3a", "IBET762", "Selinexor")
+color_vecTr <- c(Ibrutinib = color_vec[7], Duvelisib = color_vec[3],
+                 Trametinib = color_vec[11], Everolimus = color_vec[4],
+                 MK2206 = color_vec[8], C26 = color_vec[1], Ibr_x_C26 = color_vec[6],
+                 Nutlin_3a = color_vec[9], IBET762 = color_vec[5], Selinexor = color_vec[10])
+
+plot_list1 <- lapply(treat_vec, function(tr) {
+  plot_pca(pcaTabU, tr, "U-CLL", color_vecTr[tr])
+})
+
+plot_list2 <- lapply(treat_vec, function(tr) {
+  plot_pca(pcaTabM, tr, "M-CLL", color_vecTr[tr])
+})
+
+plot_list <- c(plot_list1, plot_list2)
+plot_list <- plot_list[c(1,11,2,12,3,13,4,14,5,15,6,16,7,17,8,18,9,19,10,20)]
+
+plot_grid(plotlist=plot_list, ncol=2)
+```
+
+For most kinase inhibitors (Everolimus, Trametinib, MK2206) and the combination of Ibrutinib & C26 the treatment is more distinct from DMSO in CLL samples with unmethylated IgHV status (left column). To some extend this is also the case for Ibrutinib and Duvelisib. In comparison, the effects of C26, Nutlin-3a, IBET 762, and Selinexor seem to be similar in U-CLL and M-CLL. Furthermore, their effects appear to be less strong than the ones from the kinase inhibitors.
+
+Since patients with CLL and unmutated IGHV have inferior survival (see [Rotbain et al.](https://doi.org/10.3324/haematol.2019.220194)), somatic hypermutation of IGHV is an accepted prognostic biomarker in CLL. However, no difference in progression-free survival as well as in overall survival was observed between patients treated with ibrutinib with mutated or unmutated IGHV status (see [Fig. 4 in O'Brien et a.l](https://doi.org/10.1182/blood-2017-10-810044) and [Fig. 2D in Munir et al.](https://doi.org/10.1002/ajh.25638)). Thus, more data are needed to determine if IGHV mutation status has a prognostic value with respect to ibrutinib therapy outcome and survival. So far, the hypothes is that IGHV status does not affect survival among CLL patients treated with ibrutinib.
+
+
+##### Show individual treatments with respect to TP53 mutational status
+The following PCA plots show the difference between one treatment and DMSO samples with respect to the TP53 mutational status in CLL cells. 
+```{r create-TP53df}
+patAnno_CLLna <- patAnno_CLL[!is.na(patAnno_CLL$TP53), ]
+
+WTP53 <- patAnno_CLLna[patAnno_CLLna$TP53 == 0, ]$ID
+MTP53 <- patAnno_CLLna[patAnno_CLLna$TP53 == 1, ]$ID
+pcaTabW <- pcaTab5000[pcaTab5000$ID %in% WTP53, ]
+pcaTabM <- pcaTab5000[pcaTab5000$ID %in% MTP53, ]
+```
+
+Plot PCAs
+```{r, fig.width=11, fig.height=28}
+plot_list1 <- lapply(treat_vec, function(tr) {
+  plot_pca(pcaTabW, tr, "wild-type TP53 CLL", color_vecTr[tr])
+})
+
+plot_list2 <- lapply(treat_vec, function(tr) {
+  plot_pca(pcaTabM, tr, "mutated TP53 CLL", color_vecTr[tr])
+})
+
+plot_list <- c(plot_list1, plot_list2)
+plot_list <- plot_list[c(1,11,2,12,3,13,4,14,5,15,6,16,7,17,8,18,9,19,10,20)]
+
+plot_grid(plotlist=plot_list, ncol=2)
+```
+
+TP53 seems to be a good marker, as with continuous ibrutinib therapy, the greatest benefit is yielded in patients with TP53 wild-type CLL (see [Fig. 2E in Munir et al.](https://doi.org/10.1002/ajh.25638)).
+
+##### Show individual treatments with respect to trisomy 12
+The following PCA plots show the difference between one treatment and DMSO samples with respect to trisomy 12 status in CLL cells. Perhaps the plots are not representative, as there are only fourteen patients with trisomy 12.
+```{r create-trisomy12df}
+Wtrisomy12 <- patAnno_CLL[patAnno_CLL$trisomy12 == 0, ]$ID
+Mtrisomy12 <- patAnno_CLL[patAnno_CLL$trisomy12 == 1, ]$ID
+pcaTabW <- pcaTab5000[pcaTab5000$ID %in% Wtrisomy12, ]
+pcaTabM <- pcaTab5000[pcaTab5000$ID %in% Mtrisomy12, ]
+```
+
+Plot PCAs
+```{r, fig.width=12, fig.height=30}
+plot_list1 <- lapply(treat_vec, function(tr) {
+  plot_pca(pcaTabW, tr, "no trisomy 12 CLL", color_vecTr[tr])
+})
+
+plot_list2 <- lapply(treat_vec, function(tr) {
+  plot_pca(pcaTabM, tr, "trisomy 12 CLL", color_vecTr[tr])
+})
+
+plot_list <- c(plot_list1, plot_list2)
+plot_list <- plot_list[c(1,11,2,12,3,13,4,14,5,15,6,16,7,17,8,18,9,19,10,20)]
+
+plot_grid(plotlist=plot_list, ncol=2)
+```
+
+
+# scTransform
+
+We normalize the count matrix in the ddsAll object with scTransform and then apply vst. As a result, we expect PC1 to be less correlated with the mapping rate and viability.
+```{r, results=FALSE}
+ddsCLL <- ddsAll[,ddsAll$diagnosis == "CLL" & 
+                  ddsAll$treatment != "Baseline" &
+                  ddsAll$Replicate == 1]
+
+# Use scTransform on the count matrix
+countMat <- counts(ddsCLL)
+scModel <- sctransform::vst(countMat,
+                            return_corrected_umi = TRUE)
+
+# Extract normalized counts matrix
+countMat.norm <- as.matrix(scModel$umi_corrected)
+
+# Create new ddsCLL object with norm. counts matrix and colData from ddsCLL
+ddsCLL.sc <- DESeqDataSetFromMatrix(countMat.norm,
+                                     colData = colData(ddsCLL), design = ~1)
+rowData(ddsCLL.sc) <- rowData(ddsCLL[rownames(countMat.norm)],)
+
+# Reset size factors
+ddsCLL.sc$sizeFactor <- 1
+```
+
+## Raw counts distribution after scTransform
+
+Prepare plot table
+```{r}
+plotTab <- data.frame(assay(ddsCLL.sc)) %>% 
+  rownames_to_column("id") %>%
+  gather(key= "ID", value = "count",-id) %>%
+  dplyr::filter(count > 0) %>%
+  mutate(batch = patAnno[match(ID, patAnno$ID),]$batch,
+         patID = patAnno[match(ID, patAnno$ID),]$patID)
+```
+
+```{r, fig.width=15, fig.height=15}
+raw_counts_plot(plotTab)
+```
+
+```{r, fig.width=12, fig.height=5}
+raw_counts_plot_patID(plotTab)
+```
+
+## Raw counts distribution after scTransform and vst
+
+Variance stabilization transformation on the scTransform normalized counts
+```{r}
+ddsCLL.scvst <- DESeq2::vst(ddsCLL.sc)
+```
+
+Prepare plot table
+```{r}
+plotTab <- data.frame(assay(ddsCLL.scvst)) %>% 
+  rownames_to_column("id") %>%
+  gather(key= "ID", value = "count",-id) %>%
+  dplyr::filter(count > 0) %>%
+  mutate(batch = patAnno[match(ID, patAnno$ID),]$batch,
+         patID = patAnno[match(ID, patAnno$ID),]$patID)
+```
+
+```{r, fig.width=15, fig.height=15}
+raw_counts_plot(plotTab)
+```
+
+```{r, fig.width=12, fig.height=5}
+raw_counts_plot_patID(plotTab)
+```
+
+## PCA
+
+Calculate PCA
+```{r}
+# Prepare for PCA
+exprMat.scvst <- assay(ddsCLL.scvst)
+sds.scvst <- rowSds(exprMat.scvst)
+patAnno.scvst <- as.data.frame(colData(ddsCLL.scvst))
+
+# Calculate the PCA and focus on the 5000 most variant genes
+exprMat.scvst5000 <- exprMat.scvst[order(sds.scvst, decreasing=T)[1:5000],]
+pcaRes.scvst5000 <- prcomp(t(exprMat.scvst5000), scale=TRUE, center=TRUE)
+varExp.scvst5000 <- (pcaRes.scvst5000$sdev^2 / sum(pcaRes.scvst5000$sdev^2))*100
+pcaTab.scvst5000 <- data.frame(pcaRes.scvst5000$x[,1:10]) %>%
+  rownames_to_column("ID") %>% left_join(patAnno.scvst)
+names(varExp.scvst5000) <- colnames(pcaRes.scvst5000$x)
+```
+
+Visualize eigenvalues (variance explained by the principal components)
+```{r}
+fviz_screeplot(pcaRes.scvst5000, addlabels=TRUE, ylim=c(0, 22))
+```
+
+Visualize results
+```{r}
+ggplot(pcaTab.scvst5000, aes(x=PC1, y=PC2, col=FSC.SSC)) + geom_point(size=2) + theme_bw() + 
+  xlab(sprintf("PC1 (%2.1f%%)",varExp.scvst5000[1])) + ylab(sprintf("PC2 (%2.1f%%)",varExp.scvst5000[2])) +
+  ggtitle("PCA colored by viability after 48 hours (scTransform)")
+```
+
+```{r}
+ggplot(pcaTab.scvst5000, aes(x=PC1, y=PC2, col=mapping_rate)) + geom_point(size=2) + theme_bw() + 
+  xlab(sprintf("PC1 (%2.1f%%)",varExp.scvst5000[1])) + ylab(sprintf("PC2 (%2.1f%%)",varExp.scvst5000[2])) +
+  ggtitle("PCA colored by mapping rate (scTransform)")
+```
+
+Correlation between viability and mapping rate
+```{r, fig.width=22, fig.height=5}
+p1 <- ggplot(pcaTab.scvst5000,
+       aes(x=FSC.SSC, y=mapping_rate, col=FSC.SSC)) +
+  geom_point() +
+  geom_smooth(method="glm") +
+  ggtitle("Correlation viability and mapping rate (scTransform)") +
+    annotate(x=20, y=31, 
+         label=paste("R = ", round(cor(pcaTab.scvst5000$FSC.SSC,
+                                       pcaTab.scvst5000$mapping_rate),2)), 
+         geom="text", size=6)
+
+p2 <- ggplot(pcaTab.scvst5000,
+       aes(x=PC1, y=mapping_rate, col=mapping_rate)) +
+  geom_point() +
+  geom_smooth(method="glm") +
+  ggtitle("Correlation PC1 and mapping rate (scTransform)") +
+    annotate(x=86, y=31, 
+         label=paste("R = ", round(cor(pcaTab.scvst5000$PC1,
+                                       pcaTab.scvst5000$mapping_rate),2)), 
+         geom="text", size=6)
+
+p3 <- ggplot(pcaTab.scvst5000,
+       aes(x=PC1, y=FSC.SSC, col=FSC.SSC)) +
+  geom_point() +
+  geom_smooth(method="glm") +
+  ggtitle("Correlation PC1 and viability (scTransform)") +
+    annotate(x=86, y=77, 
+         label=paste("R = ", round(cor(pcaTab.scvst5000$PC1,
+                                       pcaTab.scvst5000$FSC.SSC),2)), 
+         geom="text", size=6)
+plot_grid(p1, p2, p3, ncol=3)
+```
+
+Prepare correlation plot
+```{r}
+# Raw counts
+countMat <- assay(ddsCLL)
+tCount <- colSums(countMat)
+#aCount <- colMeans(countMat)
+
+# Normalized counts (vst)
+ddsCLL.vst <- DESeq2::vst(ddsCLL)
+countMat.norm <- assay(ddsCLL.vst)
+tCount.norm <- colSums(countMat.norm)
+#aCount.norm <- colMeans(countMat.norm)
+
+# Raw counts after scTransform
+countMat.sc <- assay(ddsCLL.sc)
+tCount.sc <- colSums(countMat.sc)
+#aCount.sc <- colMeans(countMat.sc)
+
+# Normalized counts (vst) after scTransform
+countMat.sc.norm <- assay(ddsCLL.scvst)
+tCount.sc.norm <- colSums(countMat.sc.norm)
+#aCount.sc.norm <- colMeans(countMat.sc.norm)
+
+# Create table
+sizeTab <- tibble(smpID = colnames(ddsCLL),
+                  sizeFactor = ddsCLL$sizeFactor,
+                  mapRate = ddsCLL$mapping_rate,
+                  viab = ddsCLL$FSC.SSC,
+                  viab0 = ddsCLL$FSC.SSC.d0,
+                  tCount = tCount,
+                  tCount.norm = tCount.norm,
+                  #avgCount = aCount,
+                  #avgCount.norm = aCount.norm,
+                  tCount.sc = tCount.sc,
+                  tCount.sc.norm = tCount.sc.norm)
+                  #avgCount.sc = aCount.sc,
+                  #avgCount.sc.norm = aCount.sc.norm) 
+```
+
+Plot correlation plot
+```{r, fig.width=16, fig.height=16}
+corTab <- sizeTab %>% data.frame() %>%
+  column_to_rownames("smpID")
+corrplot::corrplot.mixed(cor(corTab, use = "pairwise.complete.obs"))
+```
+
+
+# Hierarchical clustering -- Heatmap
+
+## Sample distance (only CLL)
+
+Preparations
+```{r}
+# Calculate distance matrix
+sampleDists <- dist(t(exprMat_CLL))
+sampleDistMat <- as.matrix(sampleDists)
+annoCol <- patAnno_CLL %>%
+  select(patID, FSC.SSC, IGHV, Methylation, trisomy12, treatment, batch, ID) %>%
+  data.frame() %>% column_to_rownames("ID")
+
+# Rename treatments
+annoCol$treatment <- gsub("Ibr x C26", "Ibr_x_C26", annoCol$treatment)
+annoCol$treatment <- gsub("Nutlin-3a", "Nutlin_3a", annoCol$treatment)
+
+# Define colors
+color_fill <- colorRampPalette( rev(brewer.pal(9,"Blues")) )(255)
+color_anno = list(
+  batch = c(pilot="#F8F417", batch1="#B5E222", batch2="#76EE3D", batch3="#07D256", batch4="#0A9C43"),
+  Methylation = c(HP="#C825BB", IP="#FF5AE2", LP="#FFB8F9"),
+  IGHV = c(U="#A4FFF4", M="#17C6B1"),
+  treatment = c(DMSO="#FEF7F7", C26="#FECFCF", Duvelisib="#FEB6B6", Everolimus="#FF9595",
+                IBET762="#FF6666", Ibr_x_C26="#FF3939", Ibrutinib="#FF0000", MK2206="#D30000",
+                Nutlin_3a = "#A90000", Selinexor="#740000", Trametinib="#4B0000"))
+
+# Column labels
+patAnno_CLLids <- as.data.frame(patAnno_CLL)
+rownames(patAnno_CLLids) <- patAnno_CLLids[,"ID"]
+```
+
+Show heatmap
+```{r, fig.width=16, fig.height=13}
+pheatmap(sampleDistMat, color = color_fill, clustering_distance_rows = sampleDists,
+         clustering_distance_cols = sampleDists, annotation_col = annoCol,
+         annotation_colors = color_anno, clustering_method = "ward.D2", fontsize=13,
+         labels_col = paste0(patAnno_CLLids[colnames(sampleDistMat),]$patID,"_",
+                             patAnno_CLLids[colnames(sampleDistMat),]$treatmentID),
+         show_rownames=T, fontsize_row=2, show_colnames=T, fontsize_col=2,
+         main = "Heatmap of CLL sample distances")
+```
+In this heatmap the patients cluster together because the samples from one patient are more similar than samples from one drug treatment. 
+On the left side of the heatmap, we can see around 100 samples that are different to the other samples. Most of these samples have a low viability. All samples from the patients with the IDs P0437, P0029, P0708, P0645, P0781, P0679, P0462, P0648, and P0583 belong to this cluster. Other samples belonging to this cluster were often treated with Ibrutinib, Ibr x C26 or Duvelisib and belong to the patients P0433 (Ibrutinib), P0027 (Ibr x C26), P0880 (Ibrutinib, Duvelisib, Trametinib), P1075 (Ibrutinib, Duvelisib, Ibr x C26), P0484 (Ibrutinib, Duvelisib, Ibr x C26, Nutlin-3a), P0604 (Ibrutinib, Duvelisib, Everolimus, Trametinib, Nutlin-3a), P0051 (Duvelisib, Nutlin-3a), P0108 (Ibrutinib, Duvelisib, MK2206), P0070 (Ibrutinib, Duvelisib, Trametinib, Ibr x C26), P0583 (Duvelisib), P0638 (Duvelisib), P0010 (Duvelisib, Selinexor), P0367 (Selinexor), P0036 (C26), P0687 (C26), P0995 (MK2206), and P0494 (Everolimus, C26, Ibr x C26, Nutlin-3a).
+
+
+### Only DMSO samples
+```{r, fig.width=15, fig.height=13}
+annoColDMSO <- dplyr::filter(annoCol, treatment == "DMSO") %>% select(-treatment, -patID)
+exprMat_CLLDMSO <- exprMat_CLL[,colnames(exprMat_CLL)%in%rownames(annoColDMSO)]
+
+sampleDistsDMSO <- dist(t(exprMat_CLLDMSO))
+sampleDistMatDMSO <- as.matrix(sampleDistsDMSO)
+
+pheatmap(sampleDistMatDMSO, color = color_fill, clustering_distance_rows = sampleDistsDMSO,
+         clustering_distance_cols = sampleDistsDMSO, annotation_col = annoColDMSO,
+         annotation_colors = color_anno[c("batch", "Methylation", "IGHV")],
+         clustering_method = "ward.D2", cluster_rows=T, cluster_cols=T, fontsize=14,
+         fontsize_row=9, fontsize_col=9, main = "Heatmap of DMSO sample distances",
+         labels_col = patAnno_CLLids[colnames(sampleDistMatDMSO),]$patID)
+```
+
+Sample order according to viability
+```{r, fig.width=15, fig.height=13}
+annoColDMSOorder <- arrange(annoColDMSO, FSC.SSC)
+
+na_ids <- which(is.na(annoColDMSOorder$IGHV) | is.na(annoColDMSOorder$Methylation))
+annoColDMSOorder <- annoColDMSOorder[-na_ids, ]
+
+exprMat_CLLDMSOorder <- exprMat_CLLDMSO[,colnames(exprMat_CLLDMSO)%in%rownames(annoColDMSOorder)]
+exprMat_CLLDMSOorder <- exprMat_CLLDMSO[,rownames(annoColDMSOorder)]
+sampleDistsDMSOorder <- dist(t(exprMat_CLLDMSOorder))
+sampleDistMatDMSOorder <- as.matrix(sampleDistsDMSOorder)
+
+pheatmap(sampleDistMatDMSOorder, color = color_fill, clustering_distance_rows = sampleDistsDMSOorder,
+         clustering_distance_cols = sampleDistsDMSOorder, annotation_col = annoColDMSOorder,
+         annotation_colors = color_anno[c("batch", "Methylation", "IGHV")],
+         clustering_method = "ward.D2", cluster_rows=F, cluster_cols=F, fontsize=14,
+         fontsize_row=9, fontsize_col=9, main = "Heatmap of DMSO sample distances ordered by viability",
+         labels_col = patAnno_CLLids[colnames(sampleDistMatDMSOorder),]$patID)
+```
+This heatmap reinforces the statement from the PCAs above that there is a strong correlation of mutated IGHV status with high-programming methylation cluster.
+
+## Sample similarity (only CLL)
+
+Next, we plot the sample similarity which is based on Pearson correlation.
+```{r, fig.width=16, fig.height=13}
+sampleSimMat <- cor(exprMat_CLL)
+color_fill <- colorRampPalette(brewer.pal(9,"Greens"))(255)
+
+pheatmap(sampleSimMat, color = color_fill, annotation_col = annoCol,
+         annotation_colors = color_anno, main = "Heatmap of CLL sample correlations",
+         clustering_method = "ward.D2", cluster_rows=T, cluster_cols=T,
+         labels_col = paste0(patAnno_CLLids[colnames(sampleSimMat),]$patID,"_",
+                             patAnno_CLLids[colnames(sampleSimMat),]$treatmentID),
+         fontsize=13, show_rownames=T, fontsize_row=2, show_colnames=T, fontsize_col=2)
+```
+
+### Only DMSO samples
+```{r, fig.width=15, fig.height=14}
+sampleSimMatDMSO <- cor(exprMat_CLLDMSO)
+
+pheatmap(sampleSimMatDMSO, color = color_fill, annotation_col = annoColDMSO,
+         annotation_colors = color_anno[c("batch", "Methylation", "IGHV")],
+         main = "Heatmap of DMSO sample correlations",
+         clustering_method = "ward.D2", cluster_rows=T, cluster_cols=T,
+         fontsize=14, fontsize_row=9, fontsize_col=9,
+         labels_col = patAnno_CLLids[colnames(sampleSimMatDMSO),]$patID)
+```
+The samples with a low viability have a low correlation to other samples.
+
+# Compare with previous RNAseq data (samples with baseline included)
+
+## Processing datasets
+```{r}
+load("~/Documents/R/drugseq_test/data/ddsrna_180717.RData")
+ddsCLL <- dds
+
+ddsSub <- ddsDrug[,ddsDrug$treatment %in% "Baseline"]
+dim(ddsSub) # 17 samples in new RNA seq data contain baseline
+overPat <- intersect(ddsCLL$PatID, ddsSub$patID) 
+overPat    # 5 overlapping patient IDs
+ddsOld <- ddsCLL[,overPat]  
+ddsNew <- ddsDrug[,match(overPat, ddsDrug$patID)]  
+
+# Only keep protein coding genes
+ddsOld <- ddsOld[rowData(ddsOld)$biotype %in% "protein_coding",]
+dim(ddsOld)
+ddsNew <- ddsNew[rowData(ddsNew)$biotype %in% "protein_coding",]
+dim(ddsNew)
+colnames(ddsNew) <- ddsNew$patID
+```
+5 overlapping patient IDs between old (2018) and new RNAseq (2021) data.
+
+## Summarise detected genes
+```{r}
+sumCount <- function(pat, old, new){
+  genesSum <- lapply(pat, function(n) {
+    subOld <- old[,n]
+    subNew <- new[,n]
+    geneOld <- rownames(subOld)[rowSums(assay(subOld)) > 0]
+    geneNew <- rownames(subNew)[rowSums(assay(subNew)) > 0]
+    tibble(patID = n,
+          onlyNew = length(setdiff(geneNew, geneOld)),
+          onlyOld = length(setdiff(geneOld, geneNew)),
+          both = length(intersect(geneNew, geneOld)),
+          total = sum(length(setdiff(geneNew, geneOld)),
+                      length(setdiff(geneOld, geneNew)),
+                      length(intersect(geneNew, geneOld))))
+  }) %>% bind_rows()
+  return(genesSum)
+}
+sumCountTab <- sumCount(overPat, ddsOld, ddsNew)
+sumCountTab
+```
+
+```{r}
+plotTab <- sumCountTab %>% dplyr::select(-total) %>%
+  pivot_longer(-patID, names_to = "group", values_to = "count") %>%
+  mutate(group = factor(group, level = c("onlyNew","both","onlyOld")))
+ggplot(plotTab, aes(x=patID, y = count, fill = group)) + geom_bar(stat = "identity") +
+  labs(title="Number of counted genes per sample", x="patient ID", y="gene count") +
+  theme(axis.text.x = element_text(angle = 90, hjust=1, vjust=0.5))
+```
+Around 70% of all genes were found in both the old and the new samples. Around 29% of the counted genes were only found in the old samples due to a higher sequencing depth. However, between 164 and 183 genes were only found in the new samples, which are more genes than found after pre-processing the RNA-Seq data with Salmon. Therefore, also shallow sequencing can reveal new insights. 
+
+### Combine genes only detected in either old or new samples into a list 
+```{r}
+detected_genes <- vector("list")
+
+geneCountsDiff <- lapply(overPat, function(n) {
+  subOld <- ddsOld[,n]
+  subNew <- ddsNew[,n]
+  geneOld <- rownames(subOld)[rowSums(assay(subOld)) > 0]
+  geneNew <- rownames(subNew)[rowSums(assay(subNew)) > 0]
+  list_element <- list(
+         onlyNew = setdiff(geneNew, geneOld),
+         onlyOld = setdiff(geneOld, geneNew))
+  detected_genes[[length(detected_genes) + 1]] <- list_element
+})
+
+names(geneCountsDiff) <- overPat
+
+onlyNewintersect <- Reduce(intersect,
+                           list(geneCountsDiff$P0369$onlyNew, geneCountsDiff$P0793$onlyNew,
+                                geneCountsDiff$P0024$onlyNew, geneCountsDiff$P0341$onlyNew,
+                                geneCountsDiff$P0646$onlyNew))
+onlyNewintersect
+```
+STAR + HTSeq detected more common genes in all of the new samples (n=85) than Salmon (n=4). 
+To conclude, Salmon counts more genes in total but the results obtained with STAR & HTSeq are more relevant.
+
+## Correlations of gene counts
+
+```{r, fig.width=10, fig.height=8}
+plotList <- lapply(overPat, function(n) {
+  subOld <- ddsOld[,n]
+  subNew <- ddsNew[,n]
+  overGene <- intersect(rownames(subOld), rownames(subNew))
+  subOld <- subOld[overGene,]
+  subNew <- subNew[overGene,]
+  plotTab <- tibble(geneID = overGene,
+                    countOld = assay(subOld)[,1],
+                    countNew = assay(subNew)[,1])
+  ggplot(plotTab, aes(x=log10(countOld), y=log10(countNew))) +
+    scattermore::geom_scattermore() + geom_smooth(method="glm") + ggtitle(n) +
+    annotate(x=1.5, y=3.75, 
+         label=paste("R = ", round(cor(plotTab$countOld, plotTab$countNew),2)), 
+         geom="text", size=6)
+})
+plot_grid(plotList[[1]], plotList[[2]], plotList[[3]],
+          plotList[[4]], plotList[[5]], ncol=3, labels="AUTO")
+```
+These correlation plots only show genes counted in both data sets, old and new CLL data. With deep sequencing genes were counted more often, leading to a right shift of the correlation. Furthermore, the old samples have a much higher resolution and also contain genes only counted once (log10(1) = 0). Nevertheless, there is a moderate positive correlation. 
+
+Genes which were only counted in one of the samples have a negative log10 value, but are shown in the following correlation plot.
+```{r, fig.width=8, fig.height=6}
+subOld <- ddsOld[,overPat[1]]
+subNew <- ddsNew[,overPat[1]]
+overGene <- intersect(rownames(subOld), rownames(subNew))
+subOld <- subOld[overGene,]
+subNew <- subNew[overGene,]
+plotTab <- tibble(geneID = overGene,
+                    countOld = assay(subOld)[,1],
+                    countNew = assay(subNew)[,1])
+genes_counted <- ifelse(plotTab$countOld > 0 & plotTab$countNew == 0,"onlyOld",
+                    ifelse(plotTab$countOld == 0 & plotTab$countNew > 0,"onlyNew",
+                           ifelse(plotTab$countOld == 0 & plotTab$countNew == 0,"never","both")))
+ggplot(plotTab, aes(x=log10(countOld), y=log10(countNew), color = genes_counted)) +
+    scattermore::geom_scattermore(pointsize=2.5) + ggtitle(overPat[1]) +
+    scale_color_manual(values=c("#5A5A5A", "#40D100", "#FD8C7E", "#21A2D0"))
+```
+
+## Compare similarity of expression pattern
+
+Assemble combined DESeq object of old and new samples
+```{r}
+oldMat <- counts(ddsOld)
+newMat <- counts(ddsNew)
+colnames(newMat) <- paste0(colnames(newMat),"_new")
+patBack <- data.frame(row.names = c(colnames(oldMat), colnames(newMat)),
+                      patID = c(ddsOld$patientID,ddsNew$patID),
+                      set = rep(c("old","new"), each = ncol(oldMat)))
+overGene <- intersect(rownames(oldMat), rownames(newMat))
+comMat <- cbind(oldMat[overGene,],newMat[overGene,])
+ddsCom <- DESeqDataSetFromMatrix(comMat, patBack, design= ~1)
+ddsCom <- estimateSizeFactors(ddsCom)
+```
+
+Distribution after normalization
+```{r,fig.width=8, fig.height=5}
+plotTab <- data.frame(counts(ddsCom, normalized = TRUE)) %>% 
+  rownames_to_column("id") %>%
+  gather(key= "ID", value = "count",-id) %>%
+  dplyr::filter(count > 0) %>%
+  mutate(set = patBack[ID,]$set)
+
+ggplot(plotTab, aes(x= ID, y= log10(count))) +
+  geom_boxplot(aes(fill = set)) + theme_bw() + 
+  labs(title="Log transformed gene counts of old and new samples", x="patient ID") +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1))
+```
+As we have already seen before, deep sequencing (old) leads to significantly more detected genes and to a higher resolution in terms of how often one gene was counted. Thus, the variance in the box plots is much higher.
+
+Variance stabilization transformation
+```{r}
+ddsCom.vst <- varianceStabilizingTransformation(ddsCom)
+```
+
+### PCA
+
+```{r, fig.height=5, fig.width=6}
+# Create new patient annotation object
+patAnno <- colData(ddsCom) %>% data.frame() %>% rownames_to_column("ID") %>%
+  mutate(IGHV = patMeta[match(patID, patMeta$Patient.ID),]$IGHV.status,
+         trisomy12 = patMeta[match(patID, patMeta$Patient.ID),]$trisomy12)
+
+# Invariant filtering of top 5000 genes
+exprMat <- assay(ddsCom.vst)
+sds <- rowSds(exprMat)
+exprMat <- exprMat[order(sds, decreasing  = T)[1:5000],]
+
+PCA_plot <- function(mat, anno){
+
+  # Calculate PCA
+  pcaRes <- prcomp(t(mat), scale = TRUE, center=TRUE)
+  varExp <- (pcaRes$sdev^2 / sum(pcaRes$sdev^2))*100
+  pcaTab <- data.frame(pcaRes$x[,1:10]) %>%
+    rownames_to_column("ID") %>% left_join(anno)
+
+  # Create plot
+  plot <- ggplot(pcaTab, aes(x=PC1,y=PC2, col = set, shape = IGHV)) +
+    geom_point() + theme_bw() + 
+    xlab(sprintf("PC1 (%2.1f%%)",varExp[1])) + 
+    ylab(sprintf("PC2 (%2.1f%%)",varExp[2])) +
+    geom_line(aes(group = patID), col = "grey50", linetype = "dotted") +
+    ggrepel::geom_text_repel(aes(label = patID)) +
+    ggtitle("PCA colored by data set")
+
+  return(plot)
+}
+
+PCA_plot(exprMat, patAnno)
+```
+The sequencing platform and type of RNA sequencing explains the major difference between the old and new samples.
+
+### Sample similarity
+```{r, fig.width=10, fig.height=8}
+sampleSimMat <- cor(exprMat)
+
+color_fill <- colorRampPalette(brewer.pal(9,"Greens"))(255)
+color_anno = list(
+  IGHV = c(U="#A4FFF4", M="#17C6B1"),
+  set = c(new="#C825BB", old="#FFB8F9"),
+  patID = c(P0024="#2CB902", P0341="#FD7306", P0369="#FF1EBE",
+            P0646="#0137A4", P0793="#C8C701")
+)
+
+annoCol <- patAnno %>% dplyr::select(ID, patID, set, IGHV) %>%
+  column_to_rownames("ID")
+
+pheatmap(sampleSimMat, color = color_fill, annotation_col = annoCol,
+         annotation_colors = color_anno, clustering_method = "ward.D2",
+         main = "Heatmap of old and new baseline sample similarities", fontsize=12)
+```
+Samples from the same data set are more similar to each other than samples coming from the same patients. Therefore, we adjust for the sequencing platform in a next step.
+
+## Compare similarity of expression pattern after adjusting for batch
+
+Adjust batch effect using ComBat
+```{r}
+exprMat <- assay(ddsCom.vst)
+exprMat <- sva::ComBat(exprMat, batch = factor(ddsCom.vst$set))
+ddsCom.adj <- ddsCom.vst
+assay(ddsCom.adj) <- exprMat
+```
+
+### PCA
+
+```{r, fig.height=5, fig.width=6}
+# Create new patient annotation object
+patAnno <- colData(ddsCom.adj) %>% data.frame() %>% rownames_to_column("ID") %>%
+  mutate(IGHV = patMeta[match(patID, patMeta$Patient.ID),]$IGHV.status,
+         trisomy12 = patMeta[match(patID, patMeta$Patient.ID),]$trisomy12)
+
+# Invariant filtering of top 5000 genes
+sds <- rowSds(exprMat)
+exprMat <- exprMat[order(sds, decreasing  = T)[1:5000],]
+
+PCA_plot(exprMat, patAnno)
+```
+
+### Sample similarity
+```{r, fig.width=10, fig.height=9}
+sampleSimMat <- cor(exprMat)
+
+annoCol <- patAnno %>% dplyr::select(ID, patID, set, IGHV) %>%
+  column_to_rownames("ID")
+
+pheatmap(sampleSimMat, color = color_fill, annotation_col = annoCol,
+         annotation_colors = color_anno, clustering_method = "ward.D2", fontsize=12,
+         main = "Heatmap of old and new baseline sample similarities after batch correction")
+```
+
+
+# Compare with previous RNAseq data (using DMSO as baseline)
+
+## Processing datasets
+```{r}
+load("~/Documents/R/drugseq_test/data/ddsrna_180717.RData")
+ddsCLL <- dds
+
+ddsSub <- ddsDrug[,ddsDrug$treatment %in% "DMSO"]
+dim(ddsSub)  # 107 samples were treated with DMSO
+overPat <- intersect(ddsCLL$PatID, ddsSub$patID) 
+overPat      # 102 overlapping patient IDs
+ddsOld <- ddsCLL[,overPat]  
+ddsNew <- ddsDrug[,match(overPat, ddsDrug$patID)] 
+
+#only keep protein coding genes
+ddsOld <- ddsOld[rowData(ddsOld)$biotype %in% "protein_coding",]
+dim(ddsOld)
+ddsNew <- ddsNew[rowData(ddsNew)$biotype %in% "protein_coding",] 
+dim(ddsNew)
+colnames(ddsNew) <- ddsNew$patID
+```
+102 patient IDs treated with DMSO are shared between old (2018) and new RNAseq (2021) data.
+
+## Summarise detected genes
+```{r}
+sumCountTab <- sumCount(overPat, ddsOld, ddsNew)
+sumCountTab
+```
+
+```{r, fig.width=10, fig.height=6}
+plotTab <- sumCountTab %>% dplyr::select(-total) %>%
+  pivot_longer(-patID, names_to = "group", values_to = "count") %>%
+  mutate(group = factor(group, level = c("onlyNew","both","onlyOld")))
+ggplot(plotTab, aes(x=patID, y = count, fill = group)) + geom_bar(stat = "identity") +
+  labs(title="Number of counted genes per sample", x="patient ID", y="gene count") +
+  theme(axis.text.x = element_text(angle = 90, hjust=1, vjust=0.5, size=5))
+```
+
+## Correlations of gene counts
+
+```{r}
+plotList <- lapply(overPat, function(n) {
+  subOld <- ddsOld[,n]
+  subNew <- ddsNew[,n]
+  overGene <- intersect(rownames(subOld), rownames(subNew))
+  subOld <- subOld[overGene,]
+  subNew <- subNew[overGene,]
+  plotTab <- tibble(geneID = overGene,
+                    countOld = assay(subOld)[,1],
+                    countNew = assay(subNew)[,1])
+  ggplot(plotTab, aes(x=log10(countOld), y=log10(countNew))) +
+    scattermore::geom_scattermore() + geom_smooth(method="glm") + ggtitle(n) +
+    annotate(x=1.5, y=3.75, 
+         label=paste("R = ", round(cor(plotTab$countOld, plotTab$countNew),2)), 
+         geom="text", size=5)
+})
+
+pdf(file="./output/correlation_plots_Star.pdf", width=15, height=50)
+plot_grid(plotlist=plotList, ncol=5)
+dev.off()
+```
+The plots are shown in a [PDF file](https://www.huber.embl.de/users/lohoff/drugSeq/correlation_plots_Star.pdf).
+
+If we compare the correlations of gene counts, the old samples have a much higher resolution and also contain genes only counted once (log10(1) = 0). The deep sequencing also counted the same genes more often, leading to a right shift in the correlation. Nevertheless, there is a moderate positive correlation with coefficients between 0.34 and 0.61. The positive correlation indicates that the ratio of the counts per gene is similar in both data sets. Thus, shallow sequencing is able to reproduce the transcriptional landscape of CLL cells without introducing a bias. It is of interest that the correlation coefficients are higher than those obtained with Salmon (0.06 - 0.41). The mapping rate of Salmon is higher, but it seems that is also captures more noise.
+
+## Compare the similarity of expression pattern
+
+Assemble new combined DESeq object
+```{r}
+oldMat <- counts(ddsOld)
+newMat <- counts(ddsNew)
+colnames(newMat) <- paste0(colnames(newMat),"_new")
+patBack <- data.frame(row.names = c(colnames(oldMat), colnames(newMat)),
+                      patID = c(ddsOld$patientID,ddsNew$patID),
+                      set = rep(c("old","new"), each = ncol(oldMat)))
+overGene <- intersect(rownames(oldMat), rownames(newMat))
+comMat <- cbind(oldMat[overGene,],newMat[overGene,])
+ddsCom <- DESeqDataSetFromMatrix(comMat, patBack, design= ~1)
+ddsCom <- estimateSizeFactors(ddsCom)
+```
+
+Distribution after normalization
+```{r,fig.width=12, fig.height=6}
+plotTab <- data.frame(counts(ddsCom, normalized = TRUE)) %>% 
+  rownames_to_column("id") %>%
+  gather(key= "ID", value = "count",-id) %>%
+  dplyr::filter(count > 0) %>%
+  mutate(set = patBack[ID,]$set)
+
+ggplot(plotTab, aes(x = ID, y = log10(count))) +
+  geom_boxplot(aes(fill = set)) + theme_bw() + 
+  labs(title="Log transformed gene counts of old and new samples", x="patient ID") +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1, size=4))
+```
+
+Variance stabilization transformation
+```{r}
+ddsCom.vst <- varianceStabilizingTransformation(ddsCom)
+```
+
+### PCA
+
+```{r, fig.height=5, fig.width=6}
+# Create new patient annotation object
+patAnno <- colData(ddsCom) %>% data.frame() %>% rownames_to_column("ID") %>%
+  mutate(IGHV = patMeta[match(patID, patMeta$Patient.ID),]$IGHV.status,
+         trisomy12 = patMeta[match(patID, patMeta$Patient.ID),]$trisomy12)
+
+# Invariant filtering of top 5000 genes
+exprMat <- assay(ddsCom.vst)
+sds <- rowSds(exprMat)
+exprMat <- exprMat[order(sds, decreasing  = T)[1:5000],]
+
+
+PCA_plot(exprMat, patAnno)
+```
+The sequencing platform and type of RNA sequencing explains the major difference between the old and new samples.
+
+### Sample similarity
+```{r, fig.width=14, fig.height=12}
+sampleSimMat <- cor(exprMat)
+
+annoCol <- patAnno %>%
+  dplyr::select(ID, patID, set, IGHV) %>%
+  column_to_rownames("ID")
+
+pheatmap(sampleSimMat, color = color_fill, annotation_col = annoCol,
+         annotation_colors = color_anno[1:2], clustering_method = "ward.D2",
+         main = "Heatmap of old and new DMSO sample similarities",
+         fontsize=12, fontsize_row=5, fontsize_col=5)
+```
+
+## Compare similarity of expression pattern after adjusting for batch
+
+Adjust batch effect using ComBat
+```{r}
+exprMat <- assay(ddsCom.vst)
+exprMat <- sva::ComBat(exprMat, batch = factor(ddsCom.vst$set))
+ddsCom.adj <- ddsCom.vst
+assay(ddsCom.adj) <- exprMat
+```
+
+
+### PCA
+
+```{r, fig.height=5, fig.width=6}
+# Create new patient annotation object
+patAnno <- colData(ddsCom.adj) %>% data.frame() %>% rownames_to_column("ID") %>%
+  mutate(IGHV = patMeta[match(patID, patMeta$Patient.ID),]$IGHV.status,
+         trisomy12 = patMeta[match(patID, patMeta$Patient.ID),]$trisomy12)
+
+# Invariant filtering of top 5000 genes
+sds <- rowSds(exprMat)
+exprMat <- exprMat[order(sds, decreasing  = T)[1:5000],]
+
+PCA_plot(exprMat, patAnno)
+```
+
+### Sample similarity
+```{r, fig.width=14, fig.height=12}
+sampleSimMat <- cor(exprMat)
+
+annoCol <- patAnno %>%
+  dplyr::select(ID, patID, set, IGHV) %>%
+  column_to_rownames("ID")
+
+pheatmap(sampleSimMat, color = color_fill, annotation_col = annoCol,
+         annotation_colors = color_anno[1:2], clustering_method = "ward.D2",
+         main = "Heatmap of old and new DMSO sample similarities after batch correction",
+         fontsize=12, fontsize_row=5, fontsize_col=5)
+```
+
+
+# Session Info Details
+```{r, echo=FALSE, eval=TRUE}
+sessionInfo()
+```

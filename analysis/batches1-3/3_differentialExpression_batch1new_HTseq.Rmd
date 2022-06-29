@@ -1,0 +1,432 @@
+---
+title: "Detect differential expressed genes of drug treatment HTSeq batch 1 new"
+author: "Caroline Lohoff"
+date: "November 30 2021"
+output:
+  BiocStyle::html_document:
+    toc_float: true
+---
+
+
+# Load libraries
+
+Libraries
+```{r, message=FALSE, warning=FALSE}
+library(DESeq2)
+library(piano)
+library(tidyverse)
+library(clusterProfiler)
+library(enrichplot)
+library(ggplot2)
+
+setwd("~/Documents/R/drugseq_test")
+
+knitr::opts_chunk$set(warning = FALSE, message = FALSE)
+```
+
+Set the global ggplot theme
+```{r}
+theme_set(theme_bw() + theme(axis.text = element_text(size=12), 
+                             axis.title = element_text(size=14),
+                             plot.title = element_text(size = 15, hjust =0.5, face="bold")))
+```
+
+# Load data of batch1new and patient annotation
+```{r}
+load("~/Documents/R/drugseq_test/output/ddsDrug_htseq_batch1new_20211125.RData")
+load("~/Documents/R/drugseq_test/data/patmeta_210324.RData")
+ddsDrug <- ddsDrug[,ddsDrug$batch == "batch1"]
+ddsDrug$diagnosis <- patMeta[match(ddsDrug$patID, patMeta$Patient.ID),]$diagnosis
+```
+
+Include only CLL samples in analysis
+```{r}
+ddsAll <- ddsDrug[rowData(ddsDrug)$biotype %in% "protein_coding" & !rowData(ddsDrug)$symbol %in% c(NA, ""),
+                  ddsDrug$diagnosis %in% "CLL"] #only use one of the replicated sample
+keep <- apply(counts(ddsAll), 1, function(x) any(x >= 10))  # min 10 counts
+ddsAll <- ddsAll[keep,]
+dim(ddsAll)
+```
+
+# Differential expression test using DESeq
+
+## Created design matrix
+```{r}
+patAnno <- colData(ddsAll) %>% data.frame() %>% 
+  select(patID, treatment) %>%
+  mutate(treatment = str_replace_all(treatment,"[- ]","_")) %>%
+  mutate(treatment = factor(treatment,
+                          levels = c("DMSO",setdiff(unique(treatment),"DMSO"))))
+designMat <- model.matrix(~ 0 + treatment + patID, patAnno)
+```
+
+## Run DESeq
+```{r}
+ddsAll$condi <- factor(str_replace_all(ddsAll$treatment,"[- ]","_"))
+ddsAll$condi <- factor(ddsAll$condi,
+                       levels = c("DMSO",setdiff(levels(ddsAll$condi),c("DMSO"))))
+ddsAll$patID <- factor(ddsAll$patID)
+design(ddsAll) <- ~ patID + condi
+```
+
+```{r, eval=FALSE}
+DEres <- DESeq(ddsAll)
+save(DEres, file = "~/Documents/R/drugseq_test/output/DEres_batch1new_htseq_20211126.RData")
+```
+
+```{r}
+load("~/Documents/R/drugseq_test/output/DEres_batch1new_htseq_20211126.RData")
+```
+
+Get results
+```{r}
+allTreat <- patAnno %>% filter(! treatment %in% c("DMSO")) %>%
+  distinct(treatment) %>%
+  pull(treatment)
+
+allRes <- lapply(allTreat, function(tr) {
+  resTab <- results(DEres, 
+                    name = paste0("condi_",tr,"_vs_DMSO"),
+                    tidy = TRUE) %>% mutate(treatment = tr)
+}) %>% bind_rows() %>% mutate(symbol = rowData(ddsDrug)[row,]$symbol)
+```
+
+
+## P-value histogram
+
+```{r, fig.height=6, fig.width=10}
+ggplot(allRes, aes(x=pvalue)) + geom_histogram() +
+  facet_wrap(~treatment) +
+  xlim(0,1)
+```
+
+## Number of significant DE genes 
+
+10% FDR
+```{r,fig.height=5, fig.width=6}
+sumTab <- filter(allRes, padj < 0.1) %>%
+  group_by(treatment) %>% summarise(n=length(row)) %>%
+  arrange(desc(n)) %>% mutate(treatment = factor(treatment, levels = treatment))
+ggplot(sumTab, aes(x=treatment, y=n)) +
+  geom_bar(stat = "identity") +
+  theme(axis.text.x = element_text(angle = 90, vjust=0.5, hjust=1))
+```
+
+
+25% FDR
+```{r,fig.height=5, fig.width=6}
+sumTab <- filter(allRes, padj < 0.25) %>%
+  group_by(treatment) %>% summarise(n=length(row)) %>%
+  arrange(desc(n)) %>% mutate(treatment = factor(treatment, levels = treatment))
+ggplot(sumTab, aes(x=treatment, y=n)) +
+  geom_bar(stat = "identity") +
+  theme(axis.text.x = element_text(angle = 90, vjust=0.5, hjust=1))
+```
+
+## Table of significant associations
+```{r}
+allRes %>% filter(padj <0.10) %>% select(row, symbol, log2FoldChange, pvalue, padj, treatment) %>%
+  mutate_if(is.numeric, formatC, digits=2) %>%
+  DT::datatable()
+```
+## Prepare gene lists
+```{r}
+geneList_all <- unique(allRes$row)  # all genes included in data
+
+# Gene list with significant genes per treatment
+allRes.sig <- filter(allRes, padj < 0.25)
+geneList <- lapply(unique(allRes.sig$treatment), function(tr) {
+  filter(allRes.sig, treatment == tr)$row
+})
+names(geneList) <- unique(allRes.sig$treatment)
+
+```
+
+## Overlap of differentially expressed genes
+```{r, fig.height=10, fig.width=15}
+UpSetR::upset(UpSetR::fromList(geneList), nsets = 50)
+```
+There is not much overlap. Ibrutinib has larger overlap with Duvelisib than with other drugs. 
+
+# Pathway enrichment analysis
+
+## Gene Set Enrichment Analysis with ClusterProfiler
+
+```{r}
+# Load the annotation for homo sapiens
+organism = "org.Hs.eg.db"
+BiocManager::install(organism, character.only = TRUE)
+library(organism, character.only = TRUE)
+
+# Check which source of annotations (gene ids) are available 
+keytypes(org.Hs.eg.db) 
+
+# Prepare the input for ClusterProfiler
+geneList_LFC <- lapply(unique(allRes$treatment), function(tr) {
+  filter(allRes, treatment == tr)$log2FoldChange
+  })
+names(geneList_LFC) <- unique(allRes$treatment)
+
+gseGO_results <- vector("list", length(geneList_LFC))
+j <- 1
+
+for(tr in names(geneList_LFC)) {
+  names(geneList_LFC[[tr]]) <- filter(allRes, treatment == tr)$row  # or $symbol
+  geneList_LFC[[tr]] <- na.omit(geneList_LFC[[tr]]) 
+  geneList_LFC[[tr]] <- sort(geneList_LFC[[tr]], decreasing = TRUE) 
+  
+  # Run ClusterProfiler on every treatment
+  gseGO_results[[j]] <- gseGO(geneList=geneList_LFC[[tr]], 
+             ont ="ALL", 
+             keyType = "ENSEMBL", 
+             minGSSize = 3,      # minimal size of each geneSet
+             maxGSSize = 800,    # maximal size of each geneSet
+             pvalueCutoff = 0.05, 
+             verbose = TRUE, 
+             OrgDb = organism, 
+             pAdjustMethod = "BH")
+  names(gseGO_results)[j] <- tr
+  j <- j + 1
+}
+
+# Check first and last elements of treatment list for one drug
+head(geneList_LFC$Duvelisib, 10)
+tail(geneList_LFC$Duvelisib, 10)
+```
+
+# Output
+##Table of results
+```{r}
+head(gseGO_results$Duvelisib@result)
+```
+
+##Barplot
+```{r echo=TRUE, fig.width=15, fig.height=8}
+
+# Define function for barplot
+plot_significant_pathways <- function(enrichmentDF, score, title){
+
+  ##Filter interesting pathways by using the enrichment score
+  top_pathways <- enrichmentDF[enrichmentDF$NES <= -score | enrichmentDF$NES >= score, ]
+
+  plot <- ggplot(top_pathways,
+                 aes(x = reorder(Description,-NES), y = NES, fill = p.adjust)) +
+          geom_bar(stat = "identity") +
+          coord_flip() +
+          ggtitle(title) +
+          xlab("Pathway") +
+          scale_colour_gradient2(low="darkblue", mid="whitesmoke", high="indianred",
+                                 midpoint = 0.01, aesthetics="fill") +
+          theme(plot.title.position = "plot",
+                axis.title.x=element_text(size=14,face="bold"),
+                axis.title.y=element_text(size=14,face="bold"),
+                axis.text.y=element_text(size=10,face="bold"))
+
+  return(plot)
+}
+
+
+# Plot most important pathways of every drug treatment as barplot
+j <- 1
+for(i in gseGO_results) {
+  print(head(i@result))
+  if (nrow(i@result)) {
+    barplot <- plot_significant_pathways(i@result, score = 1.0, title=paste("Barplot", names(gseGO_results)[j],sep=" "))
+    print(barplot)
+  }
+  j <- j+1
+}
+
+```
+
+
+##Dotplot
+```{r echo=TRUE, fig.width=15, fig.height=8}
+j <- 1
+for(i in gseGO_results) {
+  if (nrow(i@result)) {
+    print(dotplot(i, showCategory=10, split=".sign") + facet_grid(.~.sign) +
+            ggtitle(paste("Most significant pathways after", names(gseGO_results)[j], "treatment")))
+  }
+  j <- j+1
+}
+```
+
+##Encrichment plot map:
+Enrichment map organizes enriched terms into a network with edges connecting overlapping gene sets. In this way, mutually overlapping gene sets are tend to cluster together, making it easy to identify functional modules.
+
+Params:
+**showCategory** Select the displayed terms. It can be a number of a vector of terms.
+**layout** change the layout of map, e.g. layout = 'star', 'circle', 'gem', 'dh', 'graphopt', 'grid', 'mds', 'randomly', 'fr', 'kk', 'drl' or 'lgl'.
+
+```{r echo=TRUE}
+for(i in gseGO_results) {
+  if (nrow(i@result)) {
+    map <- pairwise_termsim(i)
+    print(emapplot(map, showCategory = 10))
+  }
+}
+```
+
+##Category Netplot
+The cnetplot depicts the linkages of genes and biological concepts (e.g. GO terms or KEGG pathways) as a network (helpful to see which genes are involved in enriched pathways and genes that may belong to multiple annotation categories).
+```{r fig.width=18}
+library(ggnewscale)
+cnetplot1 <- cnetplot(gseGO_results$Ibrutinib, categorySize="pvalue", foldChange=geneList_LFC$Ibrutinib, showCategory = 3)
+cnetplot2 <- cnetplot(gseGO_results$Duvelisib, categorySize="pvalue", foldChange=geneList_LFC$Duvelisib, showCategory = 3)
+cnetplot3 <- cnetplot(gseGO_results$MK2206, categorySize="pvalue", foldChange=geneList_LFC$MK2206, showCategory = 3)
+cnetplot4 <- cnetplot(gseGO_results$Nutlin_3a, categorySize="pvalue", foldChange=geneList_LFC$Nutlin_3a, showCategory = 3)
+cnetplot5 <- cnetplot(gseGO_results$Everolimus, categorySize="pvalue", foldChange=geneList_LFC$Everolimus, showCategory = 3)
+cnetplot6 <- cnetplot(gseGO_results$Trametinib, categorySize="pvalue", foldChange=geneList_LFC$Trametinib, showCategory = 3)
+cnetplot7 <- cnetplot(gseGO_results$C26, categorySize="pvalue", foldChange=geneList_LFC$C26, showCategory = 3)
+cnetplot8 <- cnetplot(gseGO_results$Selinexor, categorySize="pvalue", foldChange=geneList_LFC$Selinexor, showCategory = 3)
+
+cowplot::plot_grid(cnetplot1, cnetplot2, cnetplot3, cnetplot4, cnetplot5, cnetplot6, cnetplot7, cnetplot8, ncol=2, labels="AUTO")
+```
+
+## Ridgeplot
+Helpful to interpret up/down-regulated pathways.
+```{r fig.width=18, fig.height=12, message=FALSE, warning=FALSE}
+library(ggridges)
+for(i in gseGO_results) {
+  if (nrow(i@result)) {
+    print(ridgeplot(i) + labs(x = "enrichment distribution"))
+  }
+}
+```
+
+## GSEA Plot  
+Traditional method for visualizing GSEA result.  
+Plot of the Running Enrichment Score (green line) for a gene set as the analysis walks down the ranked gene list, including the location of the maximum enrichment score (the red line). The black lines in the Running Enrichment Score show where the members of the gene set appear in the ranked list of genes, indicating the leading edge subset.
+
+The Ranked list metric shows the value of the ranking metric (log2 fold change) as you move down the list of ranked genes. The ranking metric measures a gene’s correlation with a phenotype.
+  
+```{r fig.height=6}
+gseaplot(gseGO_results$Duvelisib, by = "all", title = gseGO_results$Duvelisib$Description[1], geneSetID = 1)
+```
+
+## PubMed trend of enriched terms
+Plots the number of publications trend based on the query result from PubMed Central.
+```{r fig.width=10}
+library("europepmc")
+terms <- gseGO_results$Ibrutinib$Description[1:6]
+pmcplot(terms, 2010:2020, proportion=FALSE)
+```
+
+
+# KEGG Gene Set Enrichment Analysis
+For KEGG pathway enrichment using the `gseKEGG()` function, the id types need to be converted by using the `bitr` function (included in clusterProfiler).
+In the `bitr` function, the parameter `fromType` should be the same as `keyType` from the `gseGO` function above (the annotation source).
+`toType` in the `bitr` function has to be one of the available options from `keyTypes(org.Dm.eg.db)` and must map to one of 'kegg', 'ncbi-geneid', 'ncib-proteinid' or 'uniprot' because `gseKEGG()` only accepts one of these 4 options as it's `keytype` parameter. In the case of org.Dm.eg.db, none of those 4 types are available, but 'ENTREZID' are the same as ncbi-geneid for org.Dm.eg.db so we use this for `toType`. 
+
+**organism** KEGG Organism Code (https://www.genome.jp/kegg/catalog/org_list.html (need the 3 letter code)). 
+**minGSSize** minimal size of each geneSet for analyzing.   
+**maxGSSize** maximal size of genes annotated for testing.   
+**pvalueCutoff** pvalue Cutoff.   
+**pAdjustMethod** one of "holm", "hochberg", "hommel", "bonferroni", "BH", "BY", "fdr", "none".  
+**keyType** one of 'kegg', 'ncbi-geneid', 'ncib-proteinid' or 'uniprot'.  
+
+## Prepare Input
+```{r, warning=FALSE, message=FALSE}
+### ID table will be the same for every drug. Thus, it is sufficient to do the following 2 operations for only one drug.
+
+# Convert gene IDs for gseKEGG function (some genes will get lost as not all IDs will be converted)
+id_table <- bitr(names(geneList_LFC$Ibrutinib), fromType = "ENSEMBL", toType = "ENTREZID", OrgDb=organism)
+id_table_dup <- id_table[!duplicated(id_table[c("ENSEMBL")]),]   # remove duplicate IDS
+
+### Create a new dataframe containing only genes and corresponding ENTREZ IDs which were successfully mapped
+kegg_df <- lapply(names(geneList_LFC), function(tr) {
+  allRes %>%
+    filter(treatment == tr, row %in% id_table_dup$ENSEMBL) %>%
+    add_column(ENTREZID = id_table_dup$ENTREZID)
+})
+names(kegg_df) <- names(geneList_LFC)
+
+### Create a vector of the gene universe for every drug
+geneList_KEGG <- lapply(names(geneList_LFC), function(tr) {
+  kegg_df[[tr]]$log2FoldChange
+})
+names(geneList_KEGG) <- names(geneList_LFC)
+
+### Prepare KEGG results list
+gseKEGG_results <- vector("list", length(geneList_KEGG))
+j <- 1
+
+for(tr in names(geneList_KEGG)) {
+  names(geneList_KEGG[[tr]]) <- kegg_df[[tr]]$ENTREZID    # name vector with ENTREZ ids
+  geneList_KEGG[[tr]] <- na.omit(geneList_KEGG[[tr]])    # omit any NA values 
+  geneList_KEGG[[tr]] <- sort(geneList_KEGG[[tr]], decreasing = TRUE)  # sort list in decreasing order
+  
+  ### Create gseKEGG object
+  gseKEGG_results[[j]] <- gseKEGG(geneList = geneList_KEGG[[tr]],
+               organism     = "hsa",  # Homo sapiens
+               minGSSize    = 3,
+               maxGSSize    = 800,
+               pvalueCutoff = 0.3,
+               pAdjustMethod = "BH",
+               keyType       = "kegg")
+  names(gseKEGG_results)[j] <- tr
+  j <- j + 1
+}
+
+```
+
+```{r}
+head(dplyr::arrange(gseKEGG_results$Ibrutinib, p.adjust), 10)
+```
+
+# Barplots of most important pathways per drug treatment
+```{r echo=TRUE}
+j <- 1
+for(i in gseKEGG_results) {
+  if (nrow(i@result)) {
+    barplot <- plot_significant_pathways(i@result, score = 1.0,
+                                         title=paste("Barplot", names(gseKEGG_results)[j],sep=" "))
+    print(barplot)
+  }
+  j <- j+1
+}
+```
+
+
+## Dotplot
+```{r echo=TRUE}
+dotplot(gseKEGG_results$Ibrutinib, showCategory = 10, title = "Enriched Pathways" , split=".sign") + facet_grid(.~.sign)
+```
+## Encrichment plot map:
+Enrichment map organizes enriched terms into a network with edges connecting overlapping gene sets. In this way, mutually overlapping gene sets are tend to cluster together, making it easy to identify functional modules.
+```{r echo=TRUE}
+Ibrutinib_mod <- pairwise_termsim(gseKEGG_results$Ibrutinib)
+ emapplot(Ibrutinib_mod, showCategory = 10, layout='star')
+```
+## Category Netplot:
+The cnetplot depicts the linkages of genes and biological concepts (e.g. GO terms or KEGG pathways) as a network (helpful to see which genes are involved in enriched pathways and genes that may belong to multiple annotation categories).
+```{r fig.width=12}
+# categorySize can be either 'pvalue' or 'geneNum'
+cnetplot(gseKEGG_results$Ibrutinib, categorySize="pvalue", foldChange=geneList_KEGG$Ibrutinib)
+```
+## Ridgeplot
+Helpful to interpret up/down-regulated pathways.
+```{r fig.width=18, fig.height=12}
+ridgeplot(gseKEGG_results$Ibrutinib) + labs(x = "enrichment distribution")
+```
+# GSEA Plot  
+Traditional method for visualizing GSEA result.  
+  
+Params:  
+**Gene Set** Integer. Corresponds to gene set in the gse object. The first gene set is 1, second gene set is 2, etc. Default: 1  
+```{r fig.height=6}
+# Use the `Gene Set` param for the index in the title, and as the value for geneSetId
+gseaplot(gseKEGG_results$Ibrutinib, by = "all", title = gseKEGG_results$Ibrutinib$Description[1], geneSetID = 1)
+```
+#Pathview
+This will create a PNG of the enriched KEGG pathway. The enriched pathways & the pathway ID are provided in the kegg_results output table (above).
+Here, we have chosen the most enriched pathway after treatment with Ibrutinib, the phagosome pathway (id: hsa04145). 
+```{r, message=F, warning=F, echo = TRUE}
+library(pathview)
+# Produce the native KEGG plot (PNG)
+dme <- pathview(gene.data=geneList_KEGG$Ibrutinib, pathway.id="hsa04145", species = "hsa")
+```
+```{r pressure, echo=TRUE, fig.cap="KEGG Native Enriched Pathway Plot", out.width = '100%'}
+knitr::include_graphics("hsa04145.pathview.png")
+```

@@ -1,0 +1,165 @@
+---
+title: "Quality assessment of drug perturbation RNAseq data (batch2 Salmon trimmed)"
+author: "Caroline Lohoff"
+date: "December 13 2021"
+output:
+  BiocStyle::html_document:
+    toc_float: true
+---
+
+# Load data and packages
+
+Set global options
+```{r setup, include=FALSE, cache = FALSE}
+#knitr::opts_knit$set(root.dir = rprojroot::find_rstudio_root_file())
+knitr::opts_knit$set(root.dir = "~/Documents/R/drugseq_test")
+knitr::opts_chunk$set(warning = FALSE, message = FALSE)
+```
+
+Load packages
+```{r, message=FALSE, warning=FALSE}
+library(DESeq2)
+library(RColorBrewer)
+library(pheatmap)
+library(tidyverse)
+```
+
+Load data
+```{r}
+load("./output/ddsDrug_trimmed_batch2_20211213.RData")
+load("./data/patmeta_210324.RData")
+```
+
+Set global ggplot variables
+```{r}
+theme_set(theme_bw() + theme(axis.text = element_text(size=12), 
+                             axis.title = element_text(size=14),
+                             plot.title = element_text(size = 15,
+                                                       hjust =0.5,
+                                                       face="bold")))
+```
+
+# Distribution of raw counts
+
+## Before normalization
+
+Define function for raw counts box plot
+```{r}
+raw_counts_plot <- function(inputTable){
+  plot <- ggplot(inputTable, aes(x= ID, y= log10(count), fill = batch)) +
+    geom_boxplot() + theme_bw() + 
+    theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1))
+  return(plot)
+}
+```
+
+Plot data
+```{r, fig.width=20, fig.height=5}
+patAnno <- colData(ddsDrug) %>% as_tibble()
+plotTab <- data.frame(counts(ddsDrug)) %>% 
+  rownames_to_column("id") %>%
+  gather(key= "ID", value = "count",-id) %>%
+  dplyr::filter(count > 0) %>%
+  mutate(batch = patAnno[match(ID, patAnno$ID),]$batch)
+
+raw_counts_plot(plotTab)
+```
+
+## After normalization
+
+All samples
+```{r,fig.width=15, fig.height=5}
+plotTab <- data.frame(counts(ddsDrug, normalized = TRUE)) %>% 
+  rownames_to_column("id") %>%
+  gather(key= "ID", value = "count",-id) %>%
+  dplyr::filter(count > 0) %>%
+  mutate(batch = patAnno[match(ID, patAnno$ID),]$batch)
+
+raw_counts_plot(plotTab)
+```
+
+Batch 1 old and batch 1 new
+```{r,fig.width=15, fig.height=5}
+plotTab_batch1 <- dplyr::filter(plotTab, batch == c("batch1", "batch1old"))
+
+raw_counts_plot(plotTab_batch1)
+```
+
+Pilot batch and batch 2
+```{r,fig.width=15, fig.height=5}
+plotTab_batch2 <- dplyr::filter(plotTab, batch == c("pilot", "batch2"))
+
+raw_counts_plot(plotTab_batch2)
+```
+
+# Check ECDFs
+
+```{r}
+# Remove rows/genes with too few counts
+keep <- apply(counts(ddsDrug), 1, function(x) any(x >= 10))
+ddsAll <- ddsDrug[keep,]
+# Only use protein coding genes
+ddsAll <- ddsAll[rowData(ddsAll)$biotype %in% "protein_coding",]
+# Remove sex chromosome genes
+ddsAll <- ddsAll[!rowData(ddsAll)$chromosome %in% c("X","Y")]
+#Variance stabilization transformation of the raw data
+RNAnorm.all <- vst(ddsAll)
+```
+
+```{r, fig.width=15, fig.height=7, cache=TRUE}
+# Successful normalization should lead to overlapped curves
+par(mfrow = c(1,2))
+geneplotter::multidensity(assay(RNAnorm.all), xlim = c(0,30), legend = F, xlab = "mean counts")
+geneplotter::multiecdf(assay(RNAnorm.all), legend = F, xlab="mean counts")
+```
+
+
+# Clustering
+
+## PCA
+
+### Calculate PCA
+```{r, fig.height=6, fig.width=8}
+#invariant filtering
+exprMat <- assay(RNAnorm.all)
+sds <- rowSds(exprMat)
+exprMat <- exprMat[order(sds, decreasing  = T)[1:5000],]
+
+#calculate pca 
+pcaRes <- prcomp(t(exprMat), scale. = TRUE, center=TRUE)
+varExp <- (pcaRes$sdev^2 / sum(pcaRes$sdev^2))*100
+pcaTab <- data.frame(pcaRes$x[,1:10]) %>% rownames_to_column("ID") %>%
+  left_join(patAnno)
+names(varExp) <- colnames(pcaRes$x)
+```
+
+### PCA colored by batch
+```{r}
+ggplot(pcaTab, aes(x=PC1,y=PC2, col = batch)) + geom_point() + theme_bw() + 
+  xlab(sprintf("PC1 (%2.1f%%)",varExp[1])) + ylab(sprintf("PC2 (%2.1f%%)",varExp[2])) 
+```
+There is a clear separation within the batches, which is explained by PC1. 
+
+### PCA colored by treatment
+```{r}
+ggplot(pcaTab, aes(x=PC1,y=PC2, col = treatment)) + geom_point() + theme_bw() + 
+  xlab(sprintf("PC1 (%2.1f%%)",varExp[1])) + ylab(sprintf("PC2 (%2.1f%%)",varExp[2])) 
+```
+The treatments are not separated by the principal components. Only the baseline samples of batch1, batch1old, and batch2 are separated by PC2. 
+
+### PCA colored by patientID
+```{r}
+ggplot(pcaTab, aes(x=PC1,y=PC2, col = patID)) + geom_point() + theme_bw() + 
+  xlab(sprintf("PC1 (%2.1f%%)",varExp[1])) + ylab(sprintf("PC2 (%2.1f%%)",varExp[2])) 
+```
+
+### PCA colored by sampleID
+```{r}
+ggplot(pcaTab, aes(x=PC1,y=PC2, col = sampleID)) + geom_point() + theme_bw() + 
+  xlab(sprintf("PC1 (%2.1f%%)",varExp[1])) + ylab(sprintf("PC2 (%2.1f%%)",varExp[2])) 
+```
+
+# Session Info Details
+```{r, echo=FALSE, eval=TRUE}
+sessionInfo()
+```

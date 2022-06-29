@@ -1,0 +1,137 @@
+---
+title: "Check alignment quality by STAR"
+author: "Junyan Lu"
+date: "2020 Nov. 5"
+output:
+  BiocStyle::html_document:
+    toc_float: true
+---
+
+```{r}
+library(tidyverse)
+```
+
+
+# Quality information from STAR alignment (genome mapping)
+
+```{r}
+processLog <- function(fileName) {
+    outTab <- tibble(allLine = read_lines(fileName)) %>%
+      separate(allLine, c("entry","value"),"[|]", remove = FALSE) %>%
+      mutate(value = str_remove_all(value, "[\t%]"),
+             entry = str_trim(entry,"both")) %>%
+      mutate(value = as.numeric(value)) %>%
+      filter(!is.na(value)) %>% select(-allLine)
+    
+    outTab
+}
+```
+
+```{r, warning=FALSE, error=FALSE}
+allFiles <- list.files("../../data/HAP1_test/star_log/",recursive = TRUE, full.names = TRUE)
+allRecord <- lapply(allFiles, function(fileName){
+  baseName <- basename(fileName)
+  processLog(fileName) %>%
+    mutate(filename = str_remove(baseName, "_Log.final.out"))
+}) %>% bind_rows()
+```
+
+Annotate samples
+```{r}
+allRecord <- separate(allRecord, filename, c("Gene","other"), "---",remove = FALSE) %>%
+  mutate(Gene = str_remove_all(Gene,"CAY6PACXX_")) %>%
+  filter(str_detect(entry, "%"))
+```
+
+
+```{r}
+diagBoxPlots <- lapply(unique(allRecord$entry), function(n) {
+  plotTab <- filter(allRecord, entry == n)
+  ggplot(plotTab, aes(x=Gene, y=value, fill = Gene)) +
+    geom_boxplot() +
+    geom_point() +
+    theme_bw() + theme(legend.position = "none",
+                       axis.text.x = element_text(angle = 90, hjust = 1, vjust = 0.5)) +
+    xlab("Knockouts") +
+    ggtitle(n)
+})
+```
+
+```{r, fig.width=15, fig.height=15}
+cowplot::plot_grid(plotlist = diagBoxPlots, ncol=2)
+```
+
+
+# Quality information from HTseq (gene counting)
+
+```{r}
+rawFolder = "../../data/HAP1_test/htseq/"
+fileTab <- tibble(filePath = list.files(rawFolder, full.names = TRUE, recursive = TRUE)) %>%
+                    mutate(fileName = basename(filePath)) %>%
+                    mutate(fileName = str_remove(fileName,"_Aligned_counts.out"))
+
+countTab <- lapply(seq(nrow(fileTab)), function(i) {
+  rec <- fileTab[i,]
+  eachTab <- read_delim(rec$filePath, col_names = FALSE, col_types = "ci") %>%
+    mutate(filename = rec$fileName)
+}) %>% bind_rows() %>%
+  dplyr::rename(feature = "X1", count = "X2")
+
+
+mappedTab <- filter(countTab, !str_detect(feature,"__")) %>%
+  group_by(filename) %>% summarise(count = sum(count)) %>%
+  mutate(feature = "total mapped")
+ 
+ummapedTab <- filter(countTab, str_detect(feature, "__")) %>%
+  mutate(feature = str_remove_all(feature,"__")) 
+```
+
+```{r}
+htTab <- bind_rows(ummapedTab, mappedTab) %>%
+  group_by(filename) %>% mutate(total = sum(count)) %>%
+  ungroup() %>% mutate(percent = count/total*100) %>%
+  mutate(Gene = allRecord[match(filename, allRecord$filename),]$Gene) 
+```
+
+```{r}
+diagBoxPlots <- lapply(unique(htTab$feature), function(n) {
+  plotTab <- filter(htTab, feature == n)
+  ggplot(plotTab, aes(x=Gene, y=percent, fill = Gene)) +
+    geom_boxplot() +
+    geom_point() +
+    ylab("Percentage") + xlab("Knockouts") +
+    theme_bw() + theme(legend.position = "none",
+                       axis.text.x = element_text(angle = 90, hjust = 1, vjust = 0.5)) +
+    ggtitle(n)
+})
+```
+
+```{r, fig.width=10, fig.height=8}
+cowplot::plot_grid(plotlist = diagBoxPlots, ncol=2)
+```
+
+
+# Salmon results
+
+```{r}
+allDir <- list.dirs("../../data/HAP1_test/salmon/", recursive = FALSE)
+salmonOut <- lapply(allDir, function(n) {
+  filename <- basename(n)
+  allLines <- read_lines(paste0(n,"/logs/salmon_quant.log"))
+  allLines <- allLines[str_detect(allLines, "Mapping rate =")]
+  mapRate <- str_split(allLines, "=")[[1]][2] %>% str_remove_all("[ %]") %>% as.numeric()
+  tibble(filename = filename, value = mapRate)
+}) %>%
+  bind_rows() %>%
+  mutate(Gene = allRecord[match(filename, allRecord$filename),]$Gene) 
+```
+
+```{r, fig.height=5, fig.width=10}
+ggplot(salmonOut, aes(x=Gene, y=value, fill = Gene)) +
+  geom_boxplot() +
+  geom_point() +
+  ylab("Percentage") + xlab("Knockouts") +
+  theme_bw() + theme(legend.position = "none", 
+                     axis.text.x = element_text(angle = 90, hjust = 1, vjust = 0.5)) +
+  ggtitle("Salmon map rate")
+```

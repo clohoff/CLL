@@ -1,0 +1,593 @@
+---
+title: "DE with all drugs and all batches, pre-processed with STAR + HTSeq"
+author: "Caroline Lohoff"
+date: "February 14 2022"
+output:
+  BiocStyle::html_document:
+    toc_float: true
+---
+
+# Description
+A differential gene expression was conducted using all drug treatments. 
+The design formula was ~ patID + condi
+
+Only protein-coding genes were used, but all chromosomes. 
+
+# Load data and packages
+
+Set global options
+```{r setup, include=FALSE, cache = FALSE}
+knitr::opts_knit$set(root.dir = "~/Documents/R/drugseq_test")
+knitr::opts_chunk$set(warning = FALSE, message = FALSE)
+```
+
+Load packages
+```{r}
+suppressPackageStartupMessages({
+  library(DESeq2)
+  library(tidyverse)
+  library(sjmisc)
+  library(RColorBrewer)
+  library(pheatmap)
+  library(cowplot)
+  library(scales)
+  library(ggrepel)
+  library(BiocParallel)
+})
+```
+
+Set global ggplot variables
+```{r}
+theme_set(theme_bw() + theme(axis.text = element_text(size=12), 
+                             axis.title = element_text(size=16),
+                             legend.title = element_text(size=16),
+                             legend.text = element_text(size=14),
+                             plot.title = element_text(size=18,
+                                                       hjust=0.5,face="bold")))
+```
+
+Load data and add annotations
+```{r}
+load("./output/ddsDrug_htseq_batchPilot1c234_20220207.RData")
+load("./data/patmeta_210324.RData")
+
+# Add information about mutations
+ddsDrug$diagnosis <- patMeta[match(ddsDrug$patID, patMeta$Patient.ID),]$diagnosis
+ddsDrug$TP53 <- patMeta[match(ddsDrug$patID, patMeta$Patient.ID),]$TP53
+ddsDrug$trisomy12 <- patMeta[match(ddsDrug$patID, patMeta$Patient.ID),]$trisomy12
+ddsDrug$IGHVpat <- patMeta[match(ddsDrug$patID, patMeta$Patient.ID),]$IGHV.status
+ddsDrug$IGHV <- ifelse(is.na(ddsDrug$IGHV), ddsDrug$IGHVpat, ddsDrug$IGHV)
+```
+
+Filter samples and genes
+```{r}
+ddsAll <- ddsDrug[rowData(ddsDrug)$biotype %in% "protein_coding",
+                  ddsDrug$diagnosis %in% "CLL" & ddsDrug$treatment != "Baseline" & ddsDrug$Replicate == 1]
+
+table(ddsAll$treatment)
+table(rowData(ddsAll)$chromosome)
+dim(ddsAll)
+
+# Extract count matrix
+counts_df <- as.data.frame(assay(ddsAll))
+```
+
+## Statistics (variance and mean)
+
+The aim of DE analysis is to determine whether a gene’s mean expression between sample groups is different given the variation within groups. This is determined by testing the probability of the log2 fold changes between groups being significantly different from zero:
+
+Log2(mean(treatment)/mean(control)) = 0
+
+To explore the variation in the data, we will observe the variance in gene expression relative to the mean. Variance is the square of the standard deviation, representing how far away the expression of the individual samples are from the means. For RNA-Seq data the variance is expected to increase with the genes mean expression.
+```{r}
+DMSO <- ddsAll[, ddsAll$treatment == "DMSO"]
+DMSO_samples <- DMSO$ID
+
+# Calculate mean for each gene of DMSO samples
+mean_counts <- apply(counts_df[, DMSO_samples], 1, mean)
+# Calculate variance for each gene of DMSO samples
+variance_counts <- apply(counts_df[, DMSO_samples], 1, var)
+# Create a data frame
+statistics_df <- data.frame(mean_counts, variance_counts)
+# Plot the statistics
+ggplot(statistics_df) +
+  geom_point(aes(x=mean_counts, y=variance_counts)) +
+               scale_x_log10() +
+               scale_y_log10() +
+               labs(x="Mean counts per gene", y="Variance per gene") +
+               ggtitle("Statistics for DMSO samples")
+```
+Usually, this plot shows a diagonal for RNA-Seq data. Also, the range for variance is greater for lower mean counts than for higher mean counts.
+
+# Differential expression 
+
+## Run DESeq2
+Create design matrix
+```{r}
+ddsAll$condi <- factor(str_replace_all(ddsAll$treatment,"[- ]","."))
+ddsAll$condi <- factor(ddsAll$condi,
+                       levels = c("DMSO",setdiff(levels(ddsAll$condi),c("DMSO"))))
+ddsAll$patID <- factor(ddsAll$patID)
+design(ddsAll) <- ~ patID + condi
+```
+
+Set parallelization parameters
+```{r, eval=FALSE}
+register(SnowParam(12))
+bpparam()
+```
+
+Run DESeq and save object
+```{r, eval=FALSE}
+DEres <- DESeq(ddsAll,parallel=TRUE)
+
+# Save dds object
+save(DEres, file = "./output/Combined_CLL_DEres_HTSeq_batchPilot1c234_20220213.RData")
+
+bpstop()
+```
+
+## Load results and apply LFC shrinkage
+
+Load results
+```{r}
+load(file="./output/Combined_CLL_DEres_HTSeq_batchPilot1c234_20220213.RData")
+```
+
+Create one table with results
+```{r, eval=FALSE}
+# Extract vector with treatments
+allTreat <- patAnno %>% filter(treatment != "DMSO") %>%
+  distinct(treatment) %>% pull(treatment)
+
+# Create one results table with shrinked LFC values
+allRes_LFC <- lapply(allTreat, function(tr) {
+  resTab <- lfcShrink(DEres, 
+                    coef = paste0("condi_",tr,"_vs_DMSO"),
+                    parallel = TRUE, type = "apeglm") %>%
+    data.frame() %>% rownames_to_column(var = "row") %>%
+    mutate(treatment = tr)}) %>%
+  bind_rows() %>% mutate(symbol = rowData(DEres)[row,]$symbol,
+                         chromosome = rowData(DEres)[row,]$chromosome)
+
+# Rename treatments
+levels(allRes_LFC$treatment)[levels(allRes_LFC$treatment) == "Ibr.x.C26"] <- "Ibr x C26"
+levels(allRes_LFC$treatment)[levels(allRes_LFC$treatment) == "Nutlin.3a"] <- "Nutlin-3a"
+
+# Caluclate Benjamini-Hochberg adjusted p-values
+allRes_LFC$padj <- p.adjust(allRes_LFC$pvalue, method="BH")
+
+# Give p-values that were rounded to 0 the smallest floating point value in R
+allRes_LFC <- allRes_LFC %>% mutate(pvalue = ifelse(pvalue == 0, 5e-324,pvalue),
+                            padj = ifelse(padj == 0, 5e-324,padj))
+
+# Save results
+save(allRes_LFC, file = "./output/allRes_alldrugs_LFCshrink_20220213.RData")
+```
+
+# Visualize results
+
+Load table with LFCShrink results
+```{r}
+load(file="./output/allRes_alldrugs_LFCshrink_20220213.RData")
+
+# Extract vector with treatments
+allTreat <- allRes_LFC %>% filter(treatment != "DMSO") %>%
+  distinct(treatment) %>% pull(treatment)
+```
+
+## Number of significant DE genes
+```{r, fig.width=20, fig.height=6}
+# 1%
+sumTab <- filter(allRes_LFC, padj < 0.01) %>%
+  group_by(treatment) %>% summarise(n=length(row)) %>%
+  arrange(desc(n)) %>% mutate(treatment = factor(treatment, levels = treatment))
+p1 <- ggplot(sumTab, aes(x=treatment, y=n)) + theme_bw() +
+  geom_bar(color="black",fill=muted("blue"),stat = "identity") +
+  theme(axis.text.x = element_text(angle = 90, vjust=0.5, hjust=1)) +
+  ylab("# of signif. DE genes") +
+  theme(axis.title.x = element_blank()) +
+  ggtitle("1% FDR") +
+  geom_text(aes(label=n),vjust=-0.25,size=3) +
+  coord_cartesian(ylim=c(NA,1974))
+
+# 5%
+sumTab <- filter(allRes_LFC, padj < 0.05) %>%
+  group_by(treatment) %>% summarise(n=length(row)) %>%
+  arrange(desc(n)) %>% mutate(treatment = factor(treatment, levels = treatment))
+p2 <- ggplot(sumTab, aes(x=treatment, y=n)) + theme_bw() +
+  geom_bar(color="black",fill=muted("blue"),stat = "identity") +
+  theme(axis.text.x = element_text(angle = 90, vjust=0.5, hjust=1)) +
+  ylab("# of signif. DE genes") +
+  theme(axis.title.x = element_blank()) +
+  ggtitle("5% FDR") +
+  geom_text(aes(label=n),vjust=-0.25,size=3) +
+  coord_cartesian(ylim=c(NA,3186))
+
+# 10%
+sumTab <- filter(allRes_LFC, padj < 0.1) %>%
+  group_by(treatment) %>% summarise(n=length(row)) %>%
+  arrange(desc(n)) %>% mutate(treatment = factor(treatment, levels = treatment))
+p3 <- ggplot(sumTab, aes(x=treatment, y=n)) + theme_bw() +
+  geom_bar(color="black",fill=muted("blue"),stat = "identity") +
+  theme(axis.text.x = element_text(angle = 90, vjust=0.5, hjust=1)) +
+  ylab("# of signif. DE genes") +
+  theme(axis.title.x = element_blank()) +
+  ggtitle("10% FDR") +
+  geom_text(aes(label=n),vjust=-0.25,size=3) +
+  coord_cartesian(ylim=c(NA,4048))
+
+# 25%
+sumTab <- filter(allRes_LFC, padj < 0.25) %>%
+  group_by(treatment) %>% summarise(n=length(row)) %>%
+  arrange(desc(n)) %>% mutate(treatment = factor(treatment, levels = treatment))
+p4 <- ggplot(sumTab, aes(x=treatment, y=n)) + theme_bw() +
+  geom_bar(color="black",fill=muted("blue"),stat = "identity") +
+  theme(axis.text.x = element_text(angle = 90, vjust=0.5, hjust=1)) +
+  ylab("# of signif. DE genes") +
+  theme(axis.title.x = element_blank()) +
+  ggtitle("25% FDR") +
+  geom_text(aes(label=n),vjust=-0.25,size=3) +
+  coord_cartesian(ylim=c(NA,5729))
+
+cowplot::plot_grid(p1,p2,p3,p4, ncol=4)
+```
+
+## P-value histogram
+
+```{r, fig.width=15, fig.height=5}
+allRes_LFC$treatment <- factor(allRes_LFC$treatment,
+                               levels=c("Duvelisib","Ibr x C26","Ibrutinib","Everolimus",
+                                        "Trametinib","MK2206","Nutlin-3a",
+                                        "IBET762","Selinexor","C26"))
+  
+ggplot(allRes_LFC, aes(x=pvalue)) + geom_histogram(fill="lightblue",color="black",binwidth=0.025) + theme_bw() +
+  geom_vline(xintercept=0.05,color="red",linetype="longdash") +
+  facet_wrap(~ treatment,nrow=2) +
+  scale_x_continuous(breaks = seq(0,1,by=0.2)) +
+  ylab("# of genes") +
+  ggtitle("P-value histogram") +
+  theme(plot.title = element_text(face="bold",hjust=0.5))
+```
+
+## Table of significant associations (all treatments)
+```{r}
+names(allRes_LFC)[names(allRes_LFC) == "row"] <- "Ensembl"
+names(allRes_LFC)[names(allRes_LFC) == "log2FoldChange"] <- "LFC"
+
+allRes_LFC %>% filter(padj < 0.1) %>%
+  dplyr::select(Ensembl, symbol, chromosome, LFC, pvalue, padj, treatment) %>%
+  mutate_if(is.numeric, formatC, digits=2) %>%
+  DT::datatable()
+```
+
+## Overlap of differentially expressed genes (general)
+
+Prepare gene lists with all significant genes per treatment
+```{r}
+allRes.sig <- filter(allRes_LFC, padj < 0.05)
+geneList <- lapply(allTreat, function(tr) {
+  filter(allRes.sig, treatment == tr)$Ensembl
+  })
+names(geneList) <- allTreat
+```
+
+```{r, fig.height=10, fig.width=15}
+UpSetR::upset(UpSetR::fromList(geneList), nsets = 50)
+```
+Duvelisib has the largest overlap with Ibr x C26, followed by Ibrutinib. Ibrutinib has a larger overlap with Duvelisib than with other drugs, including Ibr x C26.
+
+## Overlap of upregulated differentially expressed genes
+
+```{r}
+# Subset allRes data frame and retrieve only upregulated genes
+allRes.up <- filter(allRes_LFC, LFC > 0)
+
+# Prepare gene lists with all significant genes per treatment
+allRes.up.sig <- filter(allRes.up, padj < 0.05)
+geneList.up <- lapply(allTreat, function(tr) {
+  filter(allRes.up.sig, treatment == tr)$symbol
+  })
+names(geneList.up) <- allTreat
+```
+
+```{r, fig.height=8, fig.width=12}
+UpSetR::upset(UpSetR::fromList(geneList.up), nsets = 30)
+```
+
+Table with most significant upregulated DE genes
+```{r}
+allRes_LFC %>% filter(LFC > 0) %>% filter(padj < 0.05) %>%
+  dplyr::select(Ensembl, symbol, chromosome, LFC, pvalue, padj, treatment) %>%
+  mutate_if(is.numeric, formatC, digits=2) %>%
+  DT::datatable()
+```
+
+## Overlap of downregulated differentially expressed genes
+
+```{r}
+# Subset allRes data frame and retrieve only downregulated genes
+allRes.down <- filter(allRes_LFC, LFC < 0)
+
+# Prepare gene lists with all significant genes per treatment
+allRes.down.sig <- filter(allRes.down, padj < 0.05)
+geneList.down <- lapply(allTreat, function(tr) {
+  filter(allRes.down.sig, treatment == tr)$symbol
+  })
+names(geneList.down) <- allTreat
+```
+
+```{r, fig.height=8, fig.width=12}
+UpSetR::upset(UpSetR::fromList(geneList.down), nsets = 30)
+```
+Interestingly, not Duvelisib but IBET762 has the most downregulated differentially expressed genes. The overlap of downregulated genes is largest for Duvelisib and Ibr x C26, followed by Duvelisib and Everolimus and then by Duvelisib and MK2206
+
+Table with most significant downregulated DE genes
+```{r}
+allRes_LFC %>% filter(LFC < 0) %>% filter(padj < 0.05) %>%
+  dplyr::select(Ensembl, symbol, chromosome, LFC, pvalue, padj, treatment) %>%
+  mutate_if(is.numeric, formatC, digits=2) %>%
+  DT::datatable()
+```
+
+## Venn diagram of downregulated DE genes
+```{r, fig.height=6, fig.width=8}
+library(ggvenn)
+color_vec <- colorRampPalette(brewer.pal(9,"Set1"))(10)
+ggvenn(geneList.down,
+       columns = c("Ibrutinib", "Duvelisib", "IBET762", "Ibr_x_C26"),
+  fill_color = color_vec,
+  fill_alpha = 0.5,
+  stroke_alpha = 0.5,
+  stroke_size = 0.4,
+  text_size = 6, set_name_size = 8)
+```
+
+## Volcano plot
+
+Remove genes with non-calculated adjusted p-values
+```{r}
+allRes_LFCna <- allRes_LFC[!is.na(allRes_LFC$padj),]
+```
+
+Create 1 data frame per treatment
+```{r}
+allRes_drug <- lapply(allTreat, function(tr) {
+  drug_df <- allRes_LFCna[allRes_LFCna$treatment == tr,]
+})
+names(allRes_drug) <- allTreat
+```
+
+Function for volcano plot
+```{r}
+create_volcano <- function(df, title){
+  plot <- ggplot(df, aes(x=LFC, y=-log10(padj))) +
+    geom_vline(xintercept = 0, color="black", linetype="solid", size=0.25) +
+    geom_vline(xintercept = 0.5, color="darkgrey", linetype="dashed") +
+    geom_vline(xintercept =-0.5, color="darkgrey", linetype="dashed") +
+    geom_hline(yintercept = -log10(0.01), color="darkgrey", linetype="dashed") +  # = 2.0
+    #annotate(x=-2.5, y=2.3, label=paste("p-adjusted = ", 0.01), geom="text", size=3, color="darkgrey") +
+    geom_hline(yintercept = -log10(0.25), color="darkgrey", linetype="dashed") +  # = 0.6
+    #annotate(x=-2.5, y=0.9, label=paste("p-adjusted = ", 0.25), geom="text", size=3, color="darkgrey") +
+    geom_point(data=df[df$LFC >= 0 & df$padj <= 0.25,],
+              color="firebrick3", size=0.9) +
+    geom_point(data=df[df$LFC <= 0 & df$padj <= 0.25,],
+              color="navy", size=0.9) +
+    geom_point(data=df[df$padj >= 0.25,], color="darkgrey", size=0.9) +
+    ggrepel::geom_label_repel(data=df[df$LFC > 0 & df$padj <= 0.05,],
+                              aes(label=symbol), color="firebrick3", size=2,
+                              label.padding=0.2, max.overlaps=35) +
+    ggrepel::geom_label_repel(data=df[df$LFC < 0 & df$padj <= 0.05,],
+                              aes(label=symbol), color="navy", size=2,
+                              label.padding=0.2, max.overlaps=40) +
+    ggtitle(title) +
+    theme(plot.title = element_text(hjust=0.5, face="bold"))
+  return(plot)
+}
+```
+
+```{r, fig.height=18, fig.width=15}
+p1 <- create_volcano(allRes_drug$Duvelisib, "Duvelisib")
+p2 <- create_volcano(allRes_drug$`Ibr x C26`, "Ibr x C26")
+p3 <- create_volcano(allRes_drug$Ibrutinib, "Ibrutinib")
+p4 <- create_volcano(allRes_drug$Everolimus, "Everolimus")
+p5 <- create_volcano(allRes_drug$Trametinib, "Trametinib")
+p6 <- create_volcano(allRes_drug$MK2206, "MK2206")
+p7 <- create_volcano(allRes_drug$`Nutlin-3a`, "Nutlin-3a")
+p8 <- create_volcano(allRes_drug$IBET762, "IBET762")
+p9 <- create_volcano(allRes_drug$Selinexor, "Selinexor")
+p10 <- create_volcano(allRes_drug$C26, "C26")
+plot_grid(p1, p2, p3, p4, p5, p6,
+          p7, p8, p9, p10, ncol=3)
+```
+
+## Heatmap of most significant genes 
+
+Filtering the top genes of every drug: First, we filter the log fold change values and then, we select the smallest p-values.
+```{r}
+ngenes <- 60
+lfc <- 1
+
+# Extract annotation data frame
+patAnno <- as.data.frame(colData(ddsAll))
+
+allTreatnorm <- patAnno %>%
+  distinct(treatment) %>% pull(treatment)
+treatments <- allTreatnorm[allTreatnorm != "DMSO"]
+
+# Get vector with top 100 genes per treatment with lowest adj. p-value, pre-filtered by LFC
+top_genes <- lapply(treatments, function(tr) {
+  allRes_sub <- allRes_LFC %>% dplyr::filter(treatment == tr) %>%
+    filter(LFC < -lfc | LFC > lfc) %>%
+    dplyr::select(Ensembl, padj, LFC) %>% arrange(padj) %>% slice(1:ngenes)
+  vec <- allRes_sub$Ensembl
+  })
+
+all_top_genes <- unique(unlist(top_genes))
+```
+
+Variance stabilizing transformation
+```{r}
+ddsAllnorm <- vst(ddsAll)
+ddsAllnorm$treatment <- factor(ddsAllnorm$treatment, levels = allTreatnorm)
+```
+
+Preparations
+```{r}
+# Define annotations
+annoCol <- patAnno %>%
+  dplyr::select(patID, FSC.SSC, treatment, IGHV, TP53, trisomy12, batch) %>%
+  mutate(treatment = str_replace_all(treatment,"[- ]","_"))
+
+annoCol$trisomy12 <- as.character(annoCol$trisomy12)
+annoCol$TP53 <- as.character(annoCol$TP53)
+annoCol$trisomy12[annoCol$trisomy12 == 0] <- "wt"
+annoCol$trisomy12[annoCol$trisomy12 == 1] <- "m"
+annoCol$TP53[annoCol$TP53 == 0] <- "wt"
+annoCol$TP53[annoCol$TP53 == 1] <- "m"
+
+# Define colors
+color_fill <- colorRampPalette( rev(brewer.pal(9,"RdBu")) )(255)
+color_anno = list(
+  batch = c(pilot="#F8F417", batch1="#B5E222", batch2="#76EE3D", batch3="#07D256", batch4="#0A9C43"),
+  IGHV = c(U="#ECB3EE", M="#A201B5"),
+  TP53 = c(wt="#D5B97B", m="#B07900"),
+  trisomy12 = c(wt="#7BF6F5", m="#08B8B7"),
+  treatment = c(DMSO="#FFFFFF", C26="#E41A1C", Duvelisib="#4A72A6", Everolimus="#7E6E85",
+                IBET762="#D16948", Ibr_x_C26="#FFB716", Ibrutinib="#E1C62F", MK2206="#B75F49",
+                Nutlin_3a = "#EC83BA", Selinexor="#999999", Trametinib="#48A462"))
+```
+
+### Before patient adjustment
+
+Extract and subset normalized expression matrix
+```{r}
+exprMat <- assay(ddsAllnorm)
+exprMatsub <- exprMat[rownames(exprMat) %in% all_top_genes,]
+```
+
+Show heatmap colored with normalized counts
+```{r, fig.width=16, fig.height=13}
+exprMatsub <- jyluMisc::mscale(exprMatsub, censor=2)
+
+pheatmap(exprMatsub, color = color_fill, annotation_col = annoCol,
+         annotation_colors = color_anno, clustering_method = "ward.D2", fontsize=13,
+         labels_col = paste0(patAnno[colnames(exprMatsub),]$patID,"_",
+                             patAnno[colnames(exprMatsub),]$treatment),
+         show_rownames=T, fontsize_row=3, show_colnames=T, fontsize_col=2,
+         main = "Heatmap of top 60 genes per treatment (without patient correction)")
+```
+
+### After patient adjustment
+
+Extract and subset normalized expression matrix
+```{r}
+# Remove patient effect
+exprMat <- limma::removeBatchEffect(assay(ddsAllnorm), batch=factor(ddsAllnorm$patID))
+exprMatsub <- exprMat[rownames(exprMat) %in% all_top_genes,]
+```
+
+Show heatmap colored with normalized counts
+```{r, fig.width=16, fig.height=13}
+exprMatsub <- jyluMisc::mscale(exprMatsub, censor=2)
+
+pheatmap(exprMatsub, color = color_fill, annotation_col = annoCol,
+         annotation_colors = color_anno, clustering_method = "ward.D2", fontsize=13,
+         labels_col = paste0(patAnno[colnames(exprMatsub),]$patID,"_",
+                             patAnno[colnames(exprMatsub),]$treatment),
+         show_rownames=T, fontsize_row=3, show_colnames=T, fontsize_col=2,
+         main = "Heatmap of top 60 genes per treatment (after patient correction)")
+```
+
+### After patient adjustment and clustering columns by drug
+
+```{r}
+patAnnoOrder <- patAnno[order(patAnno$treatment, patAnno$IGHV),]
+
+#expMatorder <- exprMatsub[,colnames(exprMatsub) %in% patAnnoOrder$ID]
+expMatorder <- exprMatsub[,patAnnoOrder$ID]
+```
+
+
+```{r, fig.width=16, fig.height=13}
+expMatorder <- jyluMisc::mscale(expMatorder, censor=2)
+
+pheatmap(expMatorder, color=color_fill, annotation_col=annoCol,
+         annotation_colors=color_anno, cluster_rows=T, cluster_cols=F,
+         labels_col = paste0(patAnno[colnames(expMatorder),]$patID,"_",
+                             patAnno[colnames(expMatorder),]$treatment),
+         fontsize=13, show_rownames=T, fontsize_row=3,
+         show_colnames=T, fontsize_col=2,
+         main = "Heatmap of top 60 genes per treatment (after patient correction)")
+```
+
+### Calculate differences of LFC values between drug and DMSO
+
+With patient adjustment
+```{r}
+# Create 1 normalized counts matrix per treatment
+matrix_tr <- lapply(allTreatnorm, function(tr) {
+  df <- patAnno %>% filter(treatment == tr)
+  sample_names <- df$ID
+  mat <- exprMatsub[,colnames(exprMatsub) %in% sample_names]
+})
+names(matrix_tr) <- allTreatnorm
+
+
+# Prepare the matrices for calculating the LFCs
+df_info <- patAnno %>% dplyr::select(ID, patID)
+
+DMSO_smp <- colnames(matrix_tr$DMSO)
+df_DMSO <- data.frame(DMSO_smp)
+DMSO_joined <- dplyr::left_join(df_DMSO, df_info, by = c("DMSO_smp" = "ID"))
+
+matrix_adj <- lapply(treatments, function(tr) {
+  
+  drug_smp <- colnames(matrix_tr[[tr]])
+  df_drug <- data.frame(drug_smp)
+  drug_joined <- dplyr::left_join(df_drug, df_info, by = c("drug_smp" = "ID"))
+
+  diffDMSO <- setdiff(DMSO_joined$patID, drug_joined$patID)
+  diffDrug <- setdiff(drug_joined$patID, DMSO_joined$patID)
+  diffDMSOdf <- data.frame(diffDMSO)
+  diffDrugdf <- data.frame(diffDrug)
+
+  diffDMSOdfjoin <- dplyr::left_join(diffDMSOdf, DMSO_joined, by = c("diffDMSO" = "patID"))
+  diffDrugdfjoin <- dplyr::left_join(diffDrugdf, drug_joined, by = c("diffDrug" = "patID"))
+
+  matDMSO <- matrix_tr$DMSO[,!colnames(matrix_tr$DMSO) %in% diffDMSOdfjoin$DMSO_smp]
+  matdrug <- matrix_tr[[tr]][,!colnames(matrix_tr[[tr]]) %in% diffDrugdfjoin$drug_smp]
+
+  # Check whether patient IDs are the same in same order
+  DMSO_testdf <- DMSO_joined[!DMSO_joined$patID %in% diffDMSO,]
+  drug_testdf <- drug_joined[!drug_joined$patID %in% diffDrug,]
+  print(identical(DMSO_testdf$patID, drug_testdf$patID))
+
+  # Calculate the LFC values by subtracting the DMSO matrix from the treatment matrices
+  matLFC <- matdrug - matDMSO
+})
+names(matrix_adj) <- treatments
+```
+
+Show heatmap colored by logFC values
+```{r, fig.width=16, fig.height=13}
+matLFC_alltr <- cbind(matrix_adj$Ibrutinib, matrix_adj$Duvelisib, matrix_adj$MK2206,
+                      matrix_adj$Everolimus, matrix_adj$Trametinib, matrix_adj$C26,
+                      matrix_adj$Selinexor, matrix_adj$`Nutlin-3a`, matrix_adj$IBET762,
+                      matrix_adj$`Ibr x C26`)
+
+exprMat <- jyluMisc::mscale(matLFC_alltr, censor=2)
+
+pheatmap(exprMat, color = color_fill, annotation_col = annoCol,
+         annotation_colors = color_anno, cluster_cols = T, cluster_rows = T,
+         clustering_method = "ward.D2", fontsize=13,
+         labels_col = paste0(patAnno[colnames(exprMat),]$patID,"_",
+                             patAnno[colnames(exprMat),]$treatment),
+         show_rownames=T, fontsize_row=2, show_colnames=T, fontsize_col=2,
+         main = "Heatmap of top 60 genes per treatment (DMSO vs treatment)")
+```
+
+# Session Info Details
+```{r, echo=FALSE, eval=TRUE}
+sessionInfo()
+```

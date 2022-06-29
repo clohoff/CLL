@@ -1,0 +1,78 @@
+---
+title: "fastQC analysis of batch 1 old, new, and combined"
+author: "Caroline Lohoff"
+date: "01/10/2022"
+output:
+  BiocStyle::html_document:
+    toc_float: true
+---
+
+# What is FastQC
+Modern high throughput sequencers can generate hundreds of millions of sequences in a single run. Before analyzing these sequences to draw biological conclusions one should always perform some quality control to ensure that the raw data is homogeneous and there are no biases which may affect the usability.
+
+FastQC aims to provide a QC report which can spot problems which originate either in the sequencer or in the starting library material. One should keep in mind that FastQC is most reliable for whole genome shotgun DNA sequencing data and less reliable for mRNA-Seq, methyl-seq, etc. 
+
+Andrews S. (2010). FastQC: a quality control tool for high throughput sequence data. Available online at: http://www.bioinformatics.babraham.ac.uk/projects/fastqc
+
+# Running FastQC and processing
+
+## Running FastQC
+The FastQC output used in this analysis was generated with the non-interactive mode on the command line which is suitable for the systematic processing of large numbers of files (fastqc seqfile -o outputdir -f fastq|bam). Another option would be to run FastQC as a stand alone interactive application.
+
+For the pilot batch and batches 1 old and new the raw FASTQ files were used as input for FastQC, whereas for batch 1 combined .bam files were used as input.
+
+## Processing the fastqc.zip files
+
+For processing the FastQC output files (fastqc.zip) we use the MultiQC package for Python (https://multiqc.info/docs/#using-multiqc).
+In the terminal we go to the folder where we have all the "_fastqc.zip" files. After activating python, we run:
+
+* multiqc data/*_fastqc.zip --filename multiqc_report_batch1.html --data-format json --export plots --interactive 
+
+As output we get a report in interactive html format, several plots and a multiqc_data.json file.
+
+
+# Load data and packages
+We use the R package TidyMultiqc to gather the results of all batches (https://cran.r-project.org/web/packages/TidyMultiqc/vignettes/TidyMultiqc.html).
+
+Set global options
+```{r setup, include=FALSE, cache = FALSE}
+knitr::opts_knit$set(root.dir = "~/Documents/drugSeq/fastQC/")
+knitr::opts_chunk$set(warning = FALSE, message = FALSE)
+```
+
+Load packages
+```{r}
+library(TidyMultiqc)
+library(magrittr)
+library(stringr)
+library(HistDat)
+```
+
+## Load data
+First, we load the data for the pilot batch.
+```{r}
+df_pilot = TidyMultiqc::load_multiqc("./pilot/multiqc_report_pilot_data/multiqc_data.json")
+df_pilot$metadata.sample_id <- str_extract(df_pilot$metadata.sample_id, "(?<=lane1).*(?=_)")  # make names shorter
+df_pilot
+```
+
+Batch 1 old
+```{r}
+df_batch1old <- TidyMultiqc::load_multiqc("./batch1_old/multiqc_report_batch1old_data/multiqc_data.json")
+df_batch1old$metadata.sample_id <- paste("P0", str_extract(df_batch1old$metadata.sample_id, "(?<=P0).*(?=_)"), sep="")
+df_batch1old
+```
+
+Batch 1 new
+```{r, message=FALSE, warning=FALSE}
+df_batch1new <- TidyMultiqc::load_multiqc("./batch1_new/multiqc_report_batch1new_data/multiqc_data.json")
+df_batch1new$metadata.sample_id <- paste("P0", str_extract(df_batch1new$metadata.sample_id, "(?<=P0).*(?=_)"), sep="")
+df_batch1new
+```
+
+Batch 1 combined
+```{r}
+df_batch1c <- TidyMultiqc::load_multiqc("./batch1_combined/multiqc_report_batch1c_data/multiqc_data.json")
+df_batch1c$metadata.sample_id <- paste("P0", str_extract(df_batch1c$metadata.sample_id, "(?<=P0).*(?=_)"), sep="")
+df_batch1c
+```

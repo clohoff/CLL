@@ -1,0 +1,544 @@
+---
+title: "DE of IGHV and viability of DMSO samples, pre-processed with STAR + HTSeq"
+author: "Caroline Lohoff"
+date: "May 11 2022"
+output:
+  BiocStyle::html_document:
+    toc_float: true
+---
+
+# Description
+
+Differential gene expression analysis of IGHV and viability of DMSO samples. The aim is to find genes that are associated to viability as well genes that show a different expression pattern between U-CLL and M-CLL in an untreated cell.
+The differences between U-CLL and M-CLL need further be examined in a DE analysis of cells treated with Ibrutinib and Duvelisib in order to assess the response patterns of treated cells subdivided into U-CLL and M-CLL. 
+PatID does not need to be included in design formula, as we don't have a pairwise t-test, only DMSO samples. Furthermore, we use one sample per patient, so it is adjusted anyways for the different samples. 
+
+Design formula: ~ IGHV + FSC.SSC  (only for DMSO samples)
+
+# Preparations
+
+## Load libraries and set options
+
+Set global options
+```{r setup, include=FALSE, cache = FALSE}
+knitr::opts_knit$set(root.dir = "~/Documents/R/drugseq_test")
+knitr::opts_chunk$set(warning = FALSE, message = FALSE)
+```
+
+Load libraries
+```{r}
+suppressPackageStartupMessages({
+  library(DESeq2)
+  library(tidyverse)
+  library(RColorBrewer)
+  library(cowplot)
+  library(BiocParallel)
+})
+register(MulticoreParam(2))
+```
+
+Set global ggplot variables
+```{r}
+theme_set(theme_bw() + theme(axis.text = element_text(size=12), 
+                             axis.title = element_text(size=14),
+                             legend.title = element_text(size=14),
+                             legend.text = element_text(size=12),
+                             plot.title = element_text(size=16,
+                                                       hjust=0.5,face="bold")))
+```
+
+## Load data and add annotations
+```{r}
+# Load dds data set containing 1106 samples and count matrix
+load("./output/ddsDrug_htseq_batchPilot1c234_20220426.RData")
+
+# Load meta data including genotyping info
+load("./data/patmeta_210324.RData")
+
+# Add columns to DESeq object using patient meta data
+col_vec <- c("diagnosis", "gender", "Methylation_Cluster", "trisomy12", "NOTCH1", "TP53")
+ddsDrug@colData@listData <- lapply(col_vec, function(n) {
+  ddsDrug[[n]] <- patMeta[match(ddsDrug$patID, patMeta$Patient.ID), n]
+}) %>% bind_cols() %>% sjmisc::add_columns(ddsDrug@colData@listData)
+
+names(ddsDrug@colData@listData)[names(ddsDrug@colData@listData) == "Methylation_Cluster"] <- "Methylation"
+ddsDrug$IGHVpat <- patMeta[match(ddsDrug$patID, patMeta$Patient.ID),]$IGHV.status
+ddsDrug$IGHV <- ifelse(is.na(ddsDrug$IGHV), ddsDrug$IGHVpat, ddsDrug$IGHV)
+
+# Add meta data to the samples from the pilot batch
+ddsDrug$diagnosis[ddsDrug$batch == "pilot"] <- "CLL" 
+ddsDrug$trisomy12[ddsDrug$batch == "pilot"] <- 0
+ddsDrug$NOTCH1[ddsDrug$batch == "pilot"] <- 0
+ddsDrug$TP53[ddsDrug$batch == "pilot"] <- 0
+ddsDrug$IGHV[ddsDrug$batch == "pilot" & ddsDrug$patID %in% c("PID1095", "PID1222")] <- "U"
+ddsDrug$IGHV[ddsDrug$batch == "pilot" & ddsDrug$patID %in% c("PID1177", "PID1210")] <- "M"
+ddsDrug$gender[ddsDrug$batch == "pilot" & ddsDrug$patID %in% c("PID1095", "PID1222")] <- "f"
+ddsDrug$gender[ddsDrug$batch == "pilot" & ddsDrug$patID %in% c("PID1177", "PID1210")] <- "m"
+
+# Rename IGHV status from 'U' and 'M' to 0 and 1
+ddsDrug$IGHV[ddsDrug$IGHV == "U"] <- 0
+ddsDrug$IGHV[ddsDrug$IGHV == "M"] <- 1
+ddsDrug$IGHV <- as.factor(ddsDrug$IGHV)
+ddsDrug$IGHVpat <- NULL
+
+dim(ddsDrug)
+```
+
+Filter genes, counts and diagnosis
+```{r}
+# Only use protein coding genes and include only CLL samples in analysis
+ddsAll <- ddsDrug[rowData(ddsDrug)$biotype == "protein_coding" & !rowData(ddsDrug)$symbol %in% c(NA, ""),
+                  ddsDrug$diagnosis == "CLL" & ddsDrug$treatment != "Baseline" & ddsDrug$Replicate == 1]
+
+# Remove all mitochondrial and artificial chromosomes
+ddsAll <- ddsAll[rowData(ddsAll)$chromosome %in% c(1:22,"X","Y")]
+
+# Remove genes on Y chromosome which could introduce some bias
+ddsAll <- ddsAll[rowData(ddsAll)$chromosome != "Y"]
+# ddsAll <- ddsAll[!rowData(ddsAll)$chromosome %in% c("X","Y")]
+
+# Keep only genes with a minimum of 10 counts in any sample
+keep_counts <- apply(counts(ddsAll), 1, function(x) any(x >= 10))
+ddsAll <- ddsAll[keep_counts,]
+
+# Keep only genes expressed in at least 30% of all samples, 
+# since most genes have a basal expression. 
+# With this function the sparsity of the expression matrix is reduced.
+expr_min <- round(ncol(counts(ddsAll)) * 0.7)
+keep_counts_expr <- apply(counts(ddsAll), 1, function(x) sum(x == 0) < expr_min)
+ddsAll <- ddsAll[keep_counts_expr,]
+dim(ddsAll)
+```
+
+Print number of zero counts per patient
+```{r, fig.height=5, fig.width=14}
+# Extract count matrix
+counts_df <- data.frame(assay(ddsAll))
+
+# Loop through patients
+zeroCounts <- lapply(unique(ddsAll$patID), function(pat) {
+
+  smpPat <- ddsAll$ID[ddsAll$patID == pat]
+
+  zeroCountsPat <- lapply(smpPat, function(smp) {
+    df <- as.data.frame(table(counts_df[[smp]]))
+    value <- df$Freq[df$Var1 == 0]
+  })
+  zeroCountsPatMean <- mean(unlist(zeroCountsPat))
+})
+names(zeroCounts) <- unique(ddsAll$patID)
+
+# Create data frame from list
+patExpr <- data.frame(patient = unlist(names(zeroCounts)),
+                      meanZero = unlist(zeroCounts))
+
+# Plot mean zero expression per patient as bar plot
+ggplot(patExpr, aes(x=reorder(patient, meanZero), y=meanZero)) +
+  geom_bar(stat="identity", fill="steelblue") +
+  geom_text(aes(label=round(meanZero, digits=0)),
+            angle=90, vjust=-0.3, hjust=-0.5, size=2.5) +
+  theme_minimal() +
+  theme(axis.title.x=element_blank(),
+        axis.text.x = element_text(angle=90, vjust=0.5, hjust=1))
+```
+The patient with the highest number of genes with zero counts is P0437. This patient contributes most to PC1 and has a DMSO viability after unfreezing of 52.3%. This patient is clearly an outlier and is therefore removed from the dds object. This patient strongly contributes to the sparsity of the expression matrix, and thus disrupts the size factor estimation, leading to a reduced quality of the overall result. 
+
+Filter patients
+```{r}
+# Remove patients without DMSO sample, since no comparison is possible
+patIDs <- unique(ddsAll$patID)
+vec <- c()
+
+for(id in patIDs){
+  if(ddsDrug$treatment[ddsDrug$patID == id] == "DMSO"){
+    vec <- append(vec, id)
+  }
+}
+removepat <- setdiff(patIDs, vec)
+ddsAll <- ddsAll[, !ddsAll$patID %in% removepat]
+
+# Remove patients with a DMSO viability after unfreezing below 70%
+## see script Viability_analysis_20220411.html
+patLowViab <- c("P0645", "P0437", "P0067", "P0035",
+                "P0604", "P0494", "P0051")
+
+# Remove patients who are outliers in PCA plots and
+# correlation plot size factors vs normalized counts (scTransform script)
+remPat <- c("P0029", "P0583", "P0880")
+patLowViab <- c(patLowViab, remPat)
+ddsAll <- ddsAll[, !ddsAll$patID %in% patLowViab]
+
+# Replace spaces in treatment names
+ddsAll$treatment <- str_replace_all(ddsAll$treatment,"[- ]","_")
+
+# Extract count matrix
+counts_df <- data.frame(assay(ddsAll))
+
+# Extract patient annotation
+patAnno <- data.frame(colData(ddsAll))
+dim(ddsAll)
+```
+The pre-filtered data set contains 13510 genes and 896 samples. 
+
+
+# Differential expression using DESeq2
+
+Differential expression analysis of genomic data types uses linear models to determine the size and direction of the changes in gene expression.
+
+## Preparations
+
+Correct count matrix with scTransform and create new dds object
+(Resulting counts are integers and can be used as input for DESeq2)
+```{r, results=FALSE}
+countMat <- counts(ddsAll)
+scModel <- sctransform::vst(countMat,
+                            return_corrected_umi = TRUE)
+
+# Extract normalized counts matrix
+countMat.norm <- as.matrix(scModel$umi_corrected)
+
+# Create new ddsAll object with norm. counts matrix and colData from ddsDrug
+ddsAll.adj <- DESeqDataSetFromMatrix(countMat.norm,
+                                       colData = colData(ddsAll), design = ~1)
+rowData(ddsAll.adj) <- rowData(ddsAll[rownames(countMat.norm)],)
+
+# Reset size factors before running DESeq2
+ddsAll.adj$sizeFactor <- 1
+```
+
+Subset dds object to only include DMSO 
+```{r}
+ddsAllsub <- ddsAll.adj[,ddsAll.adj$treatment == "DMSO"]
+
+# Remove patients with unknown IGHV status
+ddsAllsub <- ddsAllsub[, !is.na(ddsAllsub$IGHV)]
+```
+
+Add design to dds objects
+```{r}
+ddsAllsub$IGHV <- factor(ddsAllsub$IGHV)
+design(ddsAllsub) <- ~ IGHV + FSC.SSC
+```
+
+## Run DESeq2
+
+The DESeq function fits the counts to the negative binomial model. The final dds object contains all the information needed for performing DE testing between specific sample groups. New information such as shrunken dispersions, model coefficients, Wald test results, and gene-wise dispersions will be added to the dds object.
+```{r, echo=TRUE, eval=FALSE}
+DEres <- DESeq(ddsAllsub, parallel=TRUE)
+save(DEres, file = "./output/DEres_allbatches_DMSOIGHVviab_STAR_20220511.RData")
+```
+
+## Load DESeq2 result
+
+Load dds object
+```{r}
+load("./output/DEres_allbatches_DMSOIGHVviab_STAR_20220511.RData")
+```
+
+## Inspect results 
+
+Extract results names
+```{r}
+resultsNames(DEres)
+```
+
+Inspect results table for IGHV with log2 fold changes, p values and adjusted p values
+```{r}
+results(DEres, name="IGHV_1_vs_0")
+```
+
+Inspect results table for viability with log2 fold changes, p values and adjusted p values
+```{r}
+results(DEres, name="FSC.SSC")
+```
+
+## Log fold change shrinkage
+
+Shrinkage of effect size (LFC estimates) is useful for visualization and ranking of genes. 
+
+The results for IGHV mutated vs unmutated are extracted with prior shrinkage of LFC values using the [apeglm estimator](https://academic.oup.com/bioinformatics/article/35/12/2084/5159452), which improves on the previous estimator.
+```{r}
+resIGHV <- lfcShrink(DEres[which(mcols(DEres)$betaConv),],
+                     coef="IGHV_1_vs_0", type="apeglm", parallel=TRUE)
+resIGHV
+```
+
+We can order our results table by the smallest p value
+```{r}
+resIGHVordered <- resIGHV[order(resIGHV$pvalue),]
+summary(resIGHVordered)
+```
+
+The results for viability are extracted with prior shrinkage of LFC values using the apeglm estimator.
+```{r}
+resViab <- lfcShrink(DEres[which(mcols(DEres)$betaConv),],
+                     coef="FSC.SSC", type="apeglm", parallel=TRUE)
+resViab
+```
+
+## Create resulting data frames 
+
+Combine results of IGHV and viability in a list
+```{r}
+allResShrink <- list(resIGHV, resViab)  
+names(allResShrink) <- c("IGHV", "Viability")
+```
+
+Create data frame
+```{r}
+allResdf <- lapply(allResShrink, function(res) {
+  resTab <- data.frame(res@listData) %>%
+      rownames_to_column(var = "Ensembl") %>%
+      mutate(symbol = rowData(ddsDrug)[Ensembl,]$symbol) %>%
+      mutate(chromosome = rowData(ddsDrug)[Ensembl,]$chromosome)
+  names(resTab)[names(resTab) == "log2FoldChange"] <- "LFC"
+  resTab_final <- resTab
+})
+names(allResdf) <- names(allResShrink)
+
+allResdf$IGHV <- mutate(allResdf$IGHV, variable = "IGHV")
+allResdf$Viability <- mutate(allResdf$Viability, variable = "FSC.SSC")
+```
+
+The data frames with the results of IGHV and viability are combined
+```{r}
+# Add IGHV or viability to column names
+colname <- c("IGHV", "Viab")
+name <- 0
+
+allResdf.names <- lapply(allResdf, function(df) {
+  name <<- name + 1
+  dfsub <- dplyr::select(df, c(-treatment, -symbol, -chromosome))
+  colnames(dfsub) <- paste(colnames(dfsub),colname[name],sep="_")
+  df_new <- dfsub
+})
+names(allResdf.names) <- names(allResdf)
+
+
+# Create one df with the results of all treatments
+allResdf.combined <- allResdf$IGHV %>%
+  dplyr::select(Ensembl, symbol, chromosome)
+
+coljoin <- c("Ensembl_IGHV", "Ensembl_Viab")
+enumerator <- 0
+
+for(df in allResdf.names){
+  enumerator <- enumerator + 1
+  allResdf.combined <- full_join(allResdf.combined, df,
+                             by=c("Ensembl" = coljoin[enumerator]), keep=FALSE)
+}
+```
+
+Save combined data frame as csv file
+```{r}
+write.csv(allResdf.combined, file="./output/DEgenes_DMSOViabIGHV_20220511.csv", sep="\t")
+save(allResdf.combined, file = "./output/DEgenes_DMSOViabIGHV_20220511.RData")
+```
+
+# Analyzing results
+
+## Dispersion of results before shrinkage
+
+A measure of the variance for a given mean is described by a metric called dispersion. The DESeq2 model uses dispersion to assess the variability expression when modelling the counts. The dispersion is indirectly related to the mean and the variance of the data using the following formula, with alpha denoting the dispersion and mu the mean:
+
+Dispersion formula: Var = mu + alpha * mu^2
+
+An increase in variance will increase dispersion, while an increase in mean will decrease dispersion. Thus, for any two genes with the same mean expression a difference in dispersion will be caused by a difference in variance.
+
+The dispersion estimates are used to model the raw counts. If the dispersions do not follow the assumptions made by DESeq2, then the variation in the data could be poorly estimated and the DE results could be less accurate.
+```{r}
+DEres_disp <- DEres[which(mcols(DEres)$betaConv),]
+plotDispEsts(DEres_disp)
+```
+This plot looks very good, as we expect the dispersion values to decrease with increasing mean and that they cluster around the fitted maximum likelihood line. Larger numbers of replicates can estimate the mean and variation more accurately, so yield less shrinkage.
+
+Each black dot is a gene with an associated mean and dispersion value. The red line represents information used across all genes to determine the most likely estimates of dispersion for a given gene expression value. Genes with inaccurately small estimates of variation could yield many false positive genes identified as DE although there are not. Therefore, the original gene-wise dispersion estimates (black dots) are shrunken toward the curve to yield more accurate estimates of dispersion (blue dots), which are used to model the counts for determining the DE genes. Extremely high dispersion values surrounded by blue circles are not shrunken due to the likelihood that the gene may have higher variability than other genes for biological or technical reasons. Reducing the variation could result in false positives.
+
+## MA-plot
+Plot the log2 fold changes attributable to a given variable over the mean of normalized counts for all the samples in the dds object. Points will be colored red if the adjusted p value is less than 0.1. Points which fall out of the window are plotted as open triangles pointing either up or down.
+We visualize the MA-plot for the shrunken log2 fold changes, which remove the noise associated with log2 fold changes from low count genes without requiring arbitrary filtering thresholds.
+
+MA-plot for IGHV
+```{r}
+plotMA(resIGHV, ylim=c(-1,1), cex=.8, main="IGHV mutated vs wild type")
+abline(h=c(-1,1), col="dodgerblue", lwd=2)
+```
+
+MA-plot for viability
+```{r}
+plotMA(resViab, ylim=c(-0.05,0.05), cex=.8, main="Viability")
+abline(h=c(-0.05,0.05), col="dodgerblue", lwd=2)
+```
+
+## P-value histogram
+
+```{r, fig.height=4, fig.width=8}
+hist_list <- lapply(allResdf, function(res) {
+ ggplot(res, aes(x=pvalue)) +
+    geom_histogram(fill="lightblue", color="black",binwidth=0.025) +
+    geom_vline(xintercept=0.05,color="red",linetype="longdash") +
+    facet_wrap(~ variable) +
+    scale_x_continuous(breaks = seq(0,1,by=0.2)) +
+    ylab("# of genes") +
+    theme(plot.title = element_text(face="bold",hjust=0.5))
+})
+
+plot_grid(plotlist=hist_list, ncol=2)
+```
+Both p-value histograms look very good. 
+
+## Number of significant DE genes 
+
+### Preparation
+Function for creating a df with significant up- or downregulated genes
+```{r}
+object_names <- names(allResdf)
+
+sig_genes_df <- function(gle, fdr){
+  # Create new df with number of sign. genes for IGHV and viability
+  genes_df <- setNames(data.frame(matrix(ncol = 2, nrow = 0)),
+                         c("variable", "sig_genes"))
+  compare <- match.fun(gle)
+
+  for(df in allResdf){
+    n_genes <- filter(df, compare(LFC,0) & padj < fdr) %>% 
+      summarise(n=length(Ensembl)) %>% pull(n)
+    variable <- unique(df$variable)
+  
+    new_row <- c(variable, n_genes)
+    genes_df[nrow(genes_df) + 1, ] <- new_row
+  }
+  genes_df$sig_genes <- as.numeric(genes_df$sig_genes)
+  genes_df$variable <- factor(genes_df$variable)
+  return(genes_df)
+}
+```
+
+Function for plotting number of significant genes for IGHV and viability
+```{r}
+sigDEgenes <- function(df, title){
+  plot <- ggplot(df, aes(x=variable, y=sig_genes)) +
+    geom_bar(stat = "identity", color="black", fill="#0C3C9F") +
+    theme(axis.text.x = element_text(angle = 90, vjust=0.5, hjust=1)) +
+    ylab("# significant DE genes") +
+    theme(axis.title.x = element_blank()) +
+    ggtitle(title) +
+    geom_text(aes(label=sig_genes),vjust=1.5,size=4,color="white")
+  return(plot)
+}
+```
+
+#### 5% FDR
+```{r,fig.height=4, fig.width=8}
+# Upregulated
+sig_genes_df_up <- sig_genes_df(gle=">", fdr=0.05)
+genes_5FDRup <- sigDEgenes(df=sig_genes_df_up, title="5% FDR upregulated")
+
+# Downregulated
+sig_genes_df_down <- sig_genes_df(gle="<", fdr=0.05)
+genes_5FDRdown <- sigDEgenes(df=sig_genes_df_down, title="5% FDR downregulated")
+
+plot_grid(genes_5FDRup, genes_5FDRdown, ncol=2)
+```
+
+#### 10% FDR
+```{r,fig.height=4, fig.width=8}
+# Upregulated
+sig_genes_df_up <- sig_genes_df(gle=">", fdr=0.1)
+genes_10FDRup <- sigDEgenes(df=sig_genes_df_up, title="10% FDR upregulated")
+
+# Downregulated
+sig_genes_df_down <- sig_genes_df(gle="<", fdr=0.1)
+genes_10FDRdown <- sigDEgenes(df=sig_genes_df_down, title="10% FDR downregulated")
+
+plot_grid(genes_10FDRup, genes_10FDRdown, ncol=2)
+```
+
+#### 25% FDR
+```{r,fig.height=4, fig.width=8}
+# Upregulated
+sig_genes_df_up <- sig_genes_df(gle=">", fdr=0.25)
+genes_25FDRup <- sigDEgenes(df=sig_genes_df_up, title="25% FDR upregulated")
+
+# Downregulated
+sig_genes_df_down <- sig_genes_df(gle="<", fdr=0.25)
+genes_25FDRdown <- sigDEgenes(df=sig_genes_df_down, title="25% FDR downregulated")
+
+plot_grid(genes_25FDRup, genes_25FDRdown, ncol=2)
+```
+
+## Table of significant associations
+
+```{r}
+allResdf.combined %>%
+  dplyr::select(Ensembl, symbol, chromosome,
+                LFC_IGHV, padj_IGHV,
+                LFC_Viab, padj_Viab) %>%
+  mutate_if(is.numeric, formatC, digits=2) %>%
+  DT::datatable()
+```
+The log fold change values for viability have a different meaning than the ones obtained from the DESeq analysis of IGHV mutated vs wild type. In the IGHV analysis the LFCs compare the gene expression between two conditions (mutated vs wild type). In the viability analysis they describe the transformation. 
+
+## Volcano plots
+
+Function for creating volcano plot
+```{r}
+volcano <- function(res, title, vline){
+  plot <- ggplot(res, aes(x=LFC, y=-log10(padj))) +
+    geom_vline(xintercept = 0, color="black", linetype="solid", size=0.25) +
+    geom_hline(yintercept = -log10(0.01), color="darkgrey", linetype="dashed") +
+    geom_hline(yintercept = -log10(0.10), color="darkgrey", linetype="dashed") +
+    geom_vline(xintercept = vline, color="darkgrey", linetype="dashed") +
+    geom_vline(xintercept =-vline, color="darkgrey", linetype="dashed") +
+    geom_point(data=res[res$LFC >= 0 & res$padj <= 0.1,],
+              color="firebrick3", size=0.9) +
+    geom_point(data=res[res$LFC <= 0 & res$padj <= 0.1,],
+              color="navy", size=0.9) +
+    geom_point(data=res[res$padj >= 0.1,], color="darkgrey", size=0.9) +
+    ggrepel::geom_label_repel(data=res[res$LFC > 0 & res$padj <= 0.001,],
+                              aes(label=symbol), color="firebrick3", size=2,
+                              max.overlaps=20) +
+    ggrepel::geom_label_repel(data=res[res$LFC < 0 & res$padj <= 0.001,],
+                              aes(label=symbol), color="navy", size=2,
+                              max.overlaps=20) +
+    ggtitle(title) +
+    theme(plot.title = element_text(hjust=0.5, face="bold"))
+  return(plot)
+}
+```
+
+Remove genes with non-calculated adjusted p-values
+```{r}
+allResdf.na<- lapply(allResdf, function(df) {
+  df <- df[!is.na(df$padj),]
+  })
+names(allResdf.na) <- names(allResdf)
+```
+
+Show volcano plot for all conditions
+```{r, fig.height=6, fig.width=12}
+p1 <- volcano(allResdf.na$IGHV, title="IGHV mutated vs wild type", vline=1)
+p2 <- volcano(allResdf.na$Viability, title="FSC.SSC", vline=0.1)
+
+plot_grid(p1, p2, ncol=2)
+```
+The downregulated genes in the volcano plot for viability match the genes identified in the viability analysis. In the viability analysis script, Pearson correlation was used to calculate the correlation between viability and DMSO gene expression. 
+
+
+## Plot counts
+
+Examine the counts of reads for a single gene across the groups.
+```{r}
+plotCounts(DEres, gene=which.min(resIGHV$padj), intgroup="IGHV")
+```
+
+# Comparison with deep sequencing
+
+For the shallow sequencing data we have extracted the genes associated with IGHV mutation. 
+With the deep sequencing data we could do the same. Then, the genes can be compared. If the gene lists are comparable, this would demonstrate that shallow sequencing is a cheap alternative to deep sequencing.
+
+
+# Session Info Details
+```{r, echo=FALSE, eval=TRUE}
+sessionInfo()
+```

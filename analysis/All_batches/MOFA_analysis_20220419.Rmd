@@ -1,0 +1,2016 @@
+---
+title: "MOFA+ applied to RNASeq data"
+author: "Caroline Lohoff"
+date: "4/19/2022"
+output:
+  BiocStyle::html_document:
+    toc_float: true
+---
+
+# Introduction
+
+MOFA+ is optimised for single-cell data, but can also be used for bulk data. 
+The inputs to MOFA+ are multiple datasets where features have been aggregated into non-overlapping sets of modalities (also called views) and where cells have been aggregated into non-overlapping sets of groups (Fig 1a) in [MOFA+ paper](https://genomebiology.biomedcentral.com/track/pdf/10.1186/s13059-020-02015-1.pdf). Data modalities typically correspond to different omics (i.e., RNA expression), and groups to different experiments, batches, or conditions.
+Thus, we have only 1 data modality and 11 different groups (treatments and DMSO).
+Note that if using a single group, the generative model of MOFA+ reduces to the previous MOFA model (but with faster inference). 
+During model training, MOFA+ infers K latent factors with associated feature weight matrices (per data modality) that explain the major axes of variation across the datasets. 
+After training, the model output enables a wide range of downstream analyses, including variance decomposition, inspection of feature weights, inference of differentiation trajectories, and clustering (Fig 1b).
+
+![Figure 1: MOFA+ explanation](/Users/carolinelohoff/Documents/Batch4_knit/MOFA_fig1.png){#id .class width=90% height=90%}
+
+Due to the different effects of the treatments, we consider them as different groups in the MOFA+ model. 
+The aim of this MOFA+analysis is to identify biologically relevant structure in the drug-perturbed RNA-seq datasets with multiple groups. Interpretability is achieved at the expense of reduced information content per factor (due to the linearity assumption of the model). 
+The way of analysis is similar to the one in the [CLL MOFA vignette](https://huber-group-embl.github.io/mofaCLL/analysisProcedure.html).
+
+The goal is to see differences between the various treatments. Thus, we are looking for factors that explain specific characteristics of one treatment. 
+The approaches to use a variance of >2% explained by on factor and treatments as groups did not work. Futhermore, using all treatments in one group and look if one factor distinguishes the treatments did not work as well. 
+
+Other approaches used in this analysis are: 
+* Reducing the variance cutoff to 1%
+* Remove gene mutation view, only use gene expression matrices
+* Before MOFA, remove influence of DMSO viability
+* Use treatments as views, not as groups
+
+The last approach is the most promising one.
+
+# Preparations
+
+## Load packages
+
+Set global options
+```{r setup, include=FALSE, cache = FALSE}
+knitr::opts_knit$set(root.dir = "~/Documents/R/drugseq_test")
+knitr::opts_chunk$set(warning = FALSE, message = FALSE)
+```
+
+Load libraries
+```{r}
+suppressPackageStartupMessages({
+  library(DESeq2)
+  library(tidyverse)
+  library(MOFA2)
+  library(RColorBrewer)
+  library(cowplot)
+  library(corrplot)
+  library(pheatmap)
+})
+```
+
+## Load data and configure annotations
+
+Load dds data set containing 1106 samples and count matrix
+```{r}
+# Load meta data including genotyping info
+load("./data/patmeta_210324.RData")
+patMeta$pretreated <- patMeta$treatment
+
+# Load dds data set containing 1106 samples and count matrix
+load("./output/ddsDrug_htseq_batchPilot1c234_20220426.RData")
+dim(ddsDrug)
+
+# Add meta data to the samples from the pilot batch
+#ddsDrug$age <- patMeta[match(ddsDrug$patID, patMeta$Patient.ID),]$age
+ddsDrug$diagnosis <- patMeta[match(ddsDrug$patID, patMeta$Patient.ID),]$diagnosis
+ddsDrug$diagnosis[ddsDrug$batch == "pilot"] <- "CLL" 
+```
+
+Filter genes, counts and diagnosis
+```{r}
+# Only use protein coding genes and include only CLL samples in analysis
+ddsAll <- ddsDrug[rowData(ddsDrug)$biotype == "protein_coding" & !rowData(ddsDrug)$symbol %in% c(NA, ""),
+                  ddsDrug$diagnosis == "CLL" & ddsDrug$treatment != "Baseline" & ddsDrug$Replicate == 1]
+
+# Remove all mitochondrial and artificial chromosomes
+ddsAll <- ddsAll[rowData(ddsAll)$chromosome %in% c(1:22,"X","Y")]
+
+# Remove genes on Y chromosome which could introduce some bias
+ddsAll <- ddsAll[rowData(ddsAll)$chromosome != "Y"]
+# ddsAll <- ddsAll[!rowData(ddsAll)$chromosome %in% c("X","Y")]
+
+# Keep only genes with a minimum of 10 counts in any sample
+keep_counts <- apply(counts(ddsAll), 1, function(x) any(x >= 10))
+ddsAll <- ddsAll[keep_counts,]
+
+# Keep only genes expressed in at least 30% of all samples, 
+# since most genes have a basal expression. 
+# With this function the sparsity of the expression matrix is reduced.
+expr_min <- round(ncol(counts(ddsAll)) * 0.7)
+keep_counts_expr <- apply(counts(ddsAll), 1, function(x) sum(x == 0) < expr_min)
+ddsAll <- ddsAll[keep_counts_expr,]
+dim(ddsAll)
+
+# Replace spaces in treatment names
+ddsAll$treatment <- str_replace_all(ddsAll$treatment,"[- ]","_")
+```
+
+Modify patient meta data
+```{r}
+# Rename IGHV status from 'U' and 'M' to 0 and 1
+patMeta$IGHV <- patMeta$IGHV.status
+patMeta$IGHV[patMeta$IGHV.status == "U"] <- 0
+patMeta$IGHV[patMeta$IGHV.status == "M"] <- 1
+patMeta$IGHV <- as.factor(patMeta$IGHV)
+
+patMeta_sub <- patMeta %>%
+  select(-HIPO.ID, -diagnosis, -project,
+         -date.of.diagnosis, -date.of.first.treatment,
+         -Methylation_Cluster, -IGHV.status)
+
+patID_df <- as.data.frame(ddsAll@colData@listData) %>%
+  select(patID, ID, batch)
+
+genes_df <- left_join(patID_df, patMeta_sub, by = c("patID" = "Patient.ID"))
+
+# Add meta data to the samples from the pilot batch
+genes_df$trisomy12[genes_df$batch == "pilot"] <- 0
+genes_df$NOTCH1[genes_df$batch == "pilot"] <- 0
+genes_df$TP53[genes_df$batch == "pilot"] <- 0
+genes_df$IGHV[genes_df$batch == "pilot" & genes_df$patID %in% c("PID1095", "PID1222")] <- 0
+genes_df$IGHV[genes_df$batch == "pilot" & genes_df$patID %in% c("PID1177", "PID1210")] <- 1
+genes_df$gender[genes_df$batch == "pilot" & genes_df$patID %in% c("PID1095", "PID1222")] <- 0
+genes_df$gender[genes_df$batch == "pilot" & genes_df$patID %in% c("PID1177", "PID1210")] <- 1
+genes_df$gender[genes_df$gender == "f"] <- 0
+genes_df$gender[genes_df$gender == "m"] <- 1
+# female = 0, male = 1
+
+genes_df <- select(genes_df, -patID, -batch)
+genes_df <- column_to_rownames(genes_df, "ID")
+
+genes_df_sub <- genes_df %>%
+  select(pretreated, gender, IGHV, trisomy12, NOTCH1, TP53, ATM,
+         FBXW7, MED12, BRAF, SF3B1, NRAS, PIK3CA, del11q, del17p, del13q)
+```
+
+## Extract matrices used as input for MOFA
+
+Extract a matrix with information about mutations
+```{r}
+geneMat_prep <- t(as.matrix(genes_df_sub))
+
+# Convert matrix to numeric
+geneMat <- matrix(as.numeric(geneMat_prep),
+                  ncol = ncol(geneMat_prep))
+rownames(geneMat) <- rownames(geneMat_prep)
+colnames(geneMat) <- colnames(geneMat_prep)
+```
+
+Extract normalized count matrix and select 5000 most variant genes
+```{r}
+ddsAll.vst <- varianceStabilizingTransformation(ddsAll)
+exprMat <- assay(ddsAll.vst)
+sds <- genefilter::rowSds(exprMat)
+exprMat <- exprMat[order(sds, decreasing = T)[1:5000],]
+```
+
+## Define functions
+
+Function for running MOFA 
+```{r}
+running_mofa <- function(obj, var){
+  
+  ### Setup MOFA training parameters
+  # Define data options
+  DataOptions <- get_default_data_options(obj)
+
+  #Define model options
+  ModelOptions <- get_default_model_options(obj)
+  # number of factors to start with
+  # (in each iteration number of factors is tried to be reduced)
+  ModelOptions$num_factors <- 30
+  #ModelOptions
+
+  # Define training options
+  TrainOptions <- get_default_training_options(obj)
+
+  # Automatically drop factors that explain less than x% of variance
+  TrainOptions$drop_factor_threshold <- var
+  
+  ### Run MOFA model
+  obj_prep <- prepare_mofa(
+    obj, 
+    data_options = DataOptions,
+    model_options = ModelOptions,
+    training_options = TrainOptions
+  )
+
+  obj_res <- run_mofa(obj_prep)
+  return(obj_res)
+}
+```
+
+Function for creating meta data
+```{r}
+create_anno <- function(){
+  patAnno <- as.data.frame(colData(ddsAll))
+  patAnno$TP53 <- patMeta[match(patAnno$patID, patMeta$Patient.ID),]$TP53
+  patAnno$Methylation <- patMeta[match(patAnno$patID, patMeta$Patient.ID),]$Methylation_Cluster
+  patAnno$IGHV <- patMeta[match(patAnno$patID, patMeta$Patient.ID),]$IGHV
+  patAnno$trisomy12 <- patMeta[match(patAnno$patID, patMeta$Patient.ID),]$trisomy12
+
+  patAnno$TP53[patAnno$batch == "pilot"] <- 0
+  patAnno$trisomy12[patAnno$batch == "pilot"] <- 0
+  patAnno$IGHV[patAnno$batch == "pilot" & patAnno$patID %in% c("PID1095", "PID1222")] <- 0
+  patAnno$IGHV[patAnno$batch == "pilot" & patAnno$patID %in% c("PID1177", "PID1210")] <- 1
+  patAnno$IGHV <- as.character(patAnno$IGHV)
+  patAnno$IGHV[patAnno$IGHV == 0] <- "U"
+  patAnno$IGHV[patAnno$IGHV == 1] <- "M"
+  return(patAnno)
+}
+```
+
+
+# MOFA 2 views without multi-grouping
+
+## Prepare and run MOFA object
+
+Assemble multiAssayExperiment object
+```{r}
+# Create object
+mofaData <- list(mRNA = exprMat,
+                 Mutations = geneMat)
+
+# Create MultiAssayExperiment object 
+mofaData <- MultiAssayExperiment::MultiAssayExperiment(
+  experiments = mofaData)
+
+# Only keep samples that have at least three assays
+useSamples <- MultiAssayExperiment::sampleMap(mofaData) %>%
+  as_tibble() %>% group_by(primary) %>% summarise(n=length(assay)) %>%
+  filter(n >= 2) %>% pull(primary)
+mofaData <- mofaData[,useSamples]
+
+# Number of views and samples
+table(table(MultiAssayExperiment::sampleMap(mofaData)$primary))
+```
+
+Build MOFA object from multiAssayExperiment object. 
+```{r}
+MOFAobject <- create_mofa_from_MultiAssayExperiment(mofaData)
+MOFAobject
+
+# Overview of data
+plot_data_overview(MOFAobject)
+```
+
+Run and save MOFA model
+```{r, eval=FALSE, include=TRUE}
+MOFAobject_res <- running_mofa(obj=MOFAobject, var=0.02)
+
+save(MOFAobject_res, file = "./output/MOFAres_STAR_woGrouping_20220423.RData")
+# converged after 46 iterations (ELBO=-1157869.08, deltaELBO=224.382 (0.00024245%), Factors=5)
+```
+
+## Overview of MOFA output
+
+### Variance explained by MOFA for each omic data
+
+```{r}
+load("./output/MOFAres_STAR_woGrouping_20220423.RData")
+
+# Calculate the variance explained (R2) per factor in each view 
+r2 <- calculate_variance_explained(MOFAobject_res)
+r2$r2_total
+
+# Plot variance explained
+varExpPlot <- plot_variance_explained(MOFAobject_res, min_r2 = 0.25) 
+varExpPlot 
+```
+
+Add meta data to the trained model
+```{r}
+patAnno <- create_anno()
+
+sample_metadata <- patAnno
+sample_metadata$sample <- sample_metadata$ID
+
+# The number of rows must match the total number of samples in the model
+sum(MOFAobject_res@dimensions$N) == nrow(sample_metadata)
+
+# Add meta data to MOFA result
+model <- MOFAobject_res
+samples_metadata(model) <- sample_metadata
+head(model@samples_metadata, n=5)
+views_names(model)
+```
+
+#### Viability
+```{r}
+plot_factor(model, 
+  factor = 1:3,
+  color_by = "FSC.SSC"
+)
+```
+Factor 1 is viability. 
+```{r}
+plot_factors(model, 
+  factors = 1:3,
+  color_by = "FSC.SSC"
+)
+```
+
+#### IGHV
+```{r}
+plot_factor(model, 
+  factor = 1:3,
+  color_by = "IGHV"
+)
+```
+IGHV is factor 2. 
+
+```{r}
+plot_factors(model, 
+  factors = 1:3,
+  color_by = "IGHV"
+)
+```
+
+#### Methylation cluster
+```{r}
+plot_factor(model, 
+  factor = 1:3,
+  color_by = "Methylation"
+)
+```
+Methylation clusters also describe to some extend factor 2. 
+Thus, factor 2 represents the cell-of-origin axis in CLL.
+
+***Show here TTT and OS plot for M-highF2, M-lowF2, U-highF2, U-lowF2. ***
+Does other factors show association with clinical outcome?
+
+```{r}
+plot_factors(model, 
+  factors = 1:3,
+  color_by = "Methylation"
+)
+```
+
+#### Treatment
+```{r}
+plot_factor(model, 
+  factor = 1:5,
+  color_by = "treatment"
+)
+```
+
+```{r}
+plot_factors(model, 
+  factors = 1:5,
+  color_by = "treatment"
+)
+```
+
+
+# Focus on Ibrutinib, Duvelisib (without multi-grouping)
+In this analysis, we focus only on Ibrutinib and Duvelisib.
+
+Subset gene expression matrix and mutation matrix
+```{r}
+patAnno <- as.data.frame(ddsAll@colData@listData)
+treatments <- c("Ibrutinib", "Duvelisib")
+IDs <- patAnno[patAnno$treatment %in% treatments, ]$ID
+exprMat.sub <- exprMat[, colnames(exprMat) %in% IDs]
+geneMat.sub <- geneMat[, colnames(geneMat) %in% IDs]
+```
+
+Create MOFA object
+```{r}
+# Create data object
+data.sub <- list(exprMat.sub, geneMat.sub)
+names(data.sub) <- c("RNA_expr", "mutations")
+lapply(data.sub,dim)
+
+# Create MOFA object
+MOFAobject <- create_mofa(data.sub)
+
+# Visualize structure of data
+plot_data_overview(MOFAobject)
+```
+
+Run MOFA model
+```{r, eval=FALSE, include=TRUE}
+MOFAobject_res <- running_mofa(obj=MOFAobject, var=0.02)
+
+save(MOFAobject_res, file = "./output/MOFAres_STAR_focusIbrDuv_20220423.RData")
+# converged after 86 iterations (ELBO=-466841.46, deltaELBO=101.848 (0.00027573%), Factors=6)
+```
+
+Load MOFA model
+```{r}
+load("./output/MOFAres_STAR_focusIbrDuv_20220423.RData")
+```
+
+Add meta data to the trained model
+```{r}
+patAnno <- create_anno()
+
+treatments <- c("Ibrutinib", "Duvelisib")
+sample_metadata <- patAnno[patAnno$treatment %in% treatments, ]
+sample_metadata$sample <- sample_metadata$ID
+
+# The number of rows must match the total number of samples in the model
+Nsamples = sum(MOFAobject_res@dimensions$N)
+Nsamples == nrow(sample_metadata)
+
+# Add meta data to MOFA result
+model <- MOFAobject_res
+samples_metadata(model) <- sample_metadata
+head(model@samples_metadata, n=5)
+views_names(model)
+```
+
+Total variance explained per view and group
+```{r}
+head(model@cache$variance_explained$r2_total[[1]])
+```
+
+Variance decomposition
+```{r}
+plot_variance_explained(model, x="view", y="factor")
+```
+
+## Visualisation of samples in the latent space
+
+### IGHV
+```{r}
+plot_factor(model, 
+  factor = 1:5,
+  color_by = "IGHV",
+  shape_by = "group"
+)
+```
+Factor 2 is the IGHV status
+
+```{r}
+p <- plot_factor(model, 
+  factors = 2,
+  color_by = "IGHV",
+  dot_size = 3,        # change dot size
+  dodge = T,           # dodge points with different colors
+  legend = F,          # remove legend
+  add_violin = T,      # add violin plots,
+  violin_alpha = 0.25  # transparency of violin plots
+)
+
+# The output of plot_factor is a ggplot2 object that we can edit
+p <- p + 
+  scale_color_manual(values=c("M"="red", "U"="green")) +
+  scale_fill_manual(values=c("M"="red", "U"="green"))
+
+print(p)
+```
+
+```{r}
+plot_factors(model, 
+  factors = 1:5,
+  color_by = "IGHV"
+)
+```
+
+### Methylation cluster
+```{r}
+plot_factor(model, 
+  factor = 1:5,
+  color_by = "Methylation",
+  shape_by = "group"
+)
+```
+
+### Viability
+```{r}
+plot_factor(model, 
+  factor = 1:5,
+  color_by = "FSC.SSC"
+)
+```
+
+```{r}
+plot_factors(model, 
+  factors = 1:2,
+  color_by = "FSC.SSC"
+)
+```
+
+### Treatment
+```{r}
+plot_factor(model, 
+  factor = 1:5,
+  color_by = "treatment"
+)
+```
+
+```{r}
+plot_factors(model, 
+  factors = 1:5,
+  color_by = "treatment"
+)
+```
+
+t-SNE
+```{r}
+set.seed(42)
+model_tsne <- run_tsne(model)
+
+plot_dimred(model_tsne,
+  method = "TSNE",
+  color_by = "treatment"
+)
+```
+
+UMAP
+```{r}
+set.seed(42)
+model_umap <- run_umap(model)
+
+plot_dimred(model_umap,
+  method = "UMAP",
+  color_by = "treatment"
+)
+```
+
+
+# Multi-grouping of treatments using 2 views
+
+## Prepare and run MOFA object
+
+In this analysis, we focus only on DMSO, Nutlin, Ibrutinib and Duvelisib. 
+```{r}
+# Subset gene expression matrix and mutation matrix
+patAnno <- as.data.frame(colData(ddsAll))
+treatments <- c("DMSO", "Ibrutinib", "Duvelisib", "Nutlin_3a")
+IDs <- patAnno[patAnno$treatment %in% treatments, ]$ID
+exprMat.sub <- exprMat[, colnames(exprMat) %in% IDs]
+geneMat.sub <- geneMat[, colnames(geneMat) %in% IDs]
+```
+
+```{r}
+# Create data object
+data.sub <- list(exprMat.sub, geneMat.sub)
+names(data.sub) <- c("RNA_expr", "mutations")
+
+lapply(data.sub,dim)
+
+# Define groups based on treatments
+groups_tr <- patAnno[patAnno$treatment %in% treatments, ]$treatment
+
+# Create MOFA object
+MOFAobject <- create_mofa(data.sub, groups=groups_tr)
+
+# Visualize structure of data
+plot_data_overview(MOFAobject)
+```
+
+Prepare and run MOFA model
+```{r, eval=FALSE, include=TRUE}
+MOFAobject_res <- running_mofa(obj=MOFAobject, var=0.01)
+
+save(MOFAobject_res, file = "./output/MOFAres_STAR_groupingIbrDuvNutDMSO_20220423.RData")
+# converged after 76 iterations (ELBO=-466711.69, deltaELBO=149.012 (0.00040595%), Factors=16)
+```
+
+Load MOFA model
+```{r}
+load("./output/MOFAres_STAR_groupingIbrDuvNutDMSO_20220423.RData")
+```
+
+Add meta data to the trained model
+```{r}
+patAnno <- create_anno()
+
+treatments <- c("DMSO", "Ibrutinib", "Duvelisib", "Nutlin_3a")
+sample_metadata <- patAnno[patAnno$treatment %in% treatments, ]
+sample_metadata$sample <- sample_metadata$ID
+sample_metadata$group <- sample_metadata$treatment
+
+sample_metadata <- sample_metadata %>%
+  select(sample, group, FSC.SSC, FSC.SSC.norm, patID, batch,
+         IGHV, TP53, Methylation, trisomy12) # add age
+
+# The number of rows must match the total number of samples in the model
+sum(MOFAobject_res@dimensions$N) == nrow(sample_metadata)
+
+# Add meta data to MOFA result
+model <- MOFAobject_res
+samples_metadata(model) <- sample_metadata
+head(model@samples_metadata, n=5)
+```
+
+Total variance explained per view and group
+```{r}
+# DMSO
+head(model@cache$variance_explained$r2_total[[1]])
+
+# Ibutinib
+head(model@cache$variance_explained$r2_total[[2]])
+
+# Duvelisib
+head(model@cache$variance_explained$r2_total[[3]])
+
+# Nutlin
+head(model@cache$variance_explained$r2_total[[4]])
+```
+
+Variance decomposition
+```{r}
+plot_variance_explained(model, x="view", y="factor", split_by="group")
+```
+
+## Visualisation of samples in the latent space
+Each MOFA factor captures a different dimension of heterogeneity in the data. Mathematically, each factor ordinates cells along a one-dimensional axis centered at zero. Samples with different signs manifest opposite phenotypes along the inferred axis of variation, with higher absolute value indicating a stronger effect. Note that the interpretation of factors is analogous to the interpretation of the principal components in PCA.
+
+Visualisation of single factors as beeswarm plots and vicualisation of combinations of factors as scatter plots
+
+### IGHV
+```{r}
+plot_factor(model, 
+  factor = 1:3,
+  color_by = "IGHV",
+  shape_by = "group"
+)
+```
+Factor 1 is IGHV status
+
+```{r}
+p <- plot_factor(model, 
+  factors = 1,
+  color_by = "IGHV",
+  dot_size = 3,        # change dot size
+  dodge = T,           # dodge points with different colors
+  legend = F,          # remove legend
+  add_violin = T,      # add violin plots,
+  violin_alpha = 0.25  # transparency of violin plots
+)
+
+# The output of plot_factor is a ggplot2 object that we can edit
+p <- p + 
+  scale_color_manual(values=c("M"="red", "U"="green")) +
+  scale_fill_manual(values=c("M"="red", "U"="green"))
+  #scale_color_manual(values=c("DMSO"="red", "Duvelisib"="green", "Ibrutinib"="Blue", "Nutlin_3a"="Purple")) +
+  #scale_fill_manual(values=c("DMSO"="red", "Duvelisib"="green", "Ibrutinib"="Blue", "Nutlin_3a"="Purple"))
+
+print(p)
+```
+
+```{r}
+plot_factors(model, 
+  factors = 1:3,
+  color_by = "IGHV"
+)
+```
+
+### Methylation cluster
+```{r}
+plot_factor(model, 
+  factor = 1:3,
+  color_by = "Methylation",
+  shape_by = "group"
+)
+```
+Factor 1 describes also the Methylation cluster
+
+```{r}
+plot_factors(model, 
+  factors = 1:3,
+  color_by = "Methylation"
+)
+```
+
+### Viability
+```{r}
+plot_factor(model, 
+  factor = 1:3,
+  color_by = "FSC.SSC",
+  shape_by = "group"
+)
+```
+Factor 2 is viability.
+
+```{r}
+plot_factors(model, 
+  factors = 1:3,
+  color_by = "FSC.SSC"
+)
+```
+
+### Trisomy 12
+```{r}
+plot_factor(model, 
+  factor = 1:3,
+  color_by = "trisomy12",
+  shape_by = "group"
+)
+```
+Factor 1 describes also the Methylation cluster
+
+```{r}
+plot_factors(model, 
+  factors = 1:3,
+  color_by = "trisomy12"
+)
+```
+Trisomy 12 describes to some extend factor 3.
+
+### TP53
+```{r}
+plot_factor(model, 
+  factor = 1:3,
+  color_by = "TP53",
+  shape_by = "group"
+)
+```
+```{r}
+plot_factors(model, 
+  factors = 1:3,
+  color_by = "TP53"
+)
+```
+
+### Patient ID
+```{r, fig.height=8, fig.weight=24}
+plot_factor(model, 
+  factor = 1:3,
+  color_by = "patID",
+  shape_by = "group"
+)
+```
+
+Plot scatter plots for factor combinations
+```{r}
+plot_factors(model, 
+  factors = 1:3,
+  color_by = "group"
+)
+```
+The differences between the treatment groups are rather small.
+
+## Visualisation of feature weights
+
+### Factor 1
+```{r}
+plot_weights(model,
+  view = "RNA_expr",
+  factor = 1,
+  nfeatures = 10,     # Number of features to highlight
+  scale = T,          # Scale weights from -1 to 1
+  abs = F             # Take the absolute value?
+)
+```
+```{r}
+plot_top_weights(model,
+  view = "RNA_expr",
+  factor = 1,
+  nfeatures = 10
+)
+```
+
+```{r}
+plot_weights(model,
+  view = "mutations",
+  factor = 1,
+  nfeatures = 10,     # Number of features to highlight
+  scale = T,          # Scale weights from -1 to 1
+  abs = F             # Take the absolute value?
+)
+```
+
+```{r}
+plot_top_weights(model,
+  view = "mutations",
+  factor = 1,
+  nfeatures = 10
+)
+```
+
+### Factor 3
+```{r}
+plot_weights(model,
+  view = "mutations",
+  factor = 3,
+  nfeatures = 10,     # Number of features to highlight
+  scale = T,          # Scale weights from -1 to 1
+  abs = F             # Take the absolute value?
+)
+```
+
+```{r}
+plot_top_weights(model,
+  view = "mutations",
+  factor = 3,
+  nfeatures = 10
+)
+```
+
+## Visualisation of patterns in the input data
+
+```{r, fig.weight=28, fig.height=14}
+plot_data_heatmap(model,
+  view = "RNA_expr",         # view of interest
+  factor = 1,             # factor of interest
+  features = 30,          # number of features to plot (they are selected by weight)
+  
+  # extra arguments that are passed to the `pheatmap` function
+  cluster_rows = TRUE, cluster_cols = TRUE,
+  show_rownames = TRUE, show_colnames = TRUE
+)
+```
+
+```{r, fig.weight=34, fig.height=8}
+plot_data_heatmap(model,
+  view = "mutations",         # view of interest
+  factor = 1,             # factor of interest
+  features = 14,          # number of features to plot (they are selected by weight)
+  
+  # extra arguments that are passed to the `pheatmap` function
+  cluster_rows = TRUE, cluster_cols = FALSE,
+  show_rownames = TRUE, show_colnames = TRUE
+)
+```
+
+## Scatter plots
+Scatter plots of observations vs factor values. It is useful to add a linear regression estimate to visualise if the relationship between (top) features and factor values is linear.
+```{r, fig.weight=6, fig.height=6}
+plot_data_scatter(model,
+  view = "RNA_expr",      # view of interest
+  factor = 1,             # factor of interest
+  features = 9,           # number of features to plot (selected by weight)
+  add_lm = TRUE,          # add linear regression
+  color_by = "IGHV"
+)
+```
+
+```{r, fig.weight=9, fig.height=9}
+plot_data_scatter(model,
+  view = "RNA_expr",      # view of interest
+  factor = 2,             # factor of interest
+  features = 9,           # number of features to plot (selected by weight)
+  add_lm = TRUE,          # add linear regression
+  color_by = "FSC.SSC"
+)
+```
+
+## Non-linear dimensionality reduction
+
+The MOFA factors are linear (as in Principal Component analysis). Nevertheless, the MOFA factors can be used as input to other methods that learn compact nonlinear manifolds (t-SNE or UMAP).
+
+t-SNE
+```{r}
+set.seed(42)
+model_tsne <- run_tsne(model)
+
+plot_dimred(model_tsne,
+  method = "TSNE",
+  color_by = "IGHV"
+)
+```
+
+UMAP
+```{r}
+set.seed(42)
+model_umap <- run_umap(model)
+
+plot_dimred(model_umap,
+  method = "UMAP",
+  color_by = "IGHV"
+)
+```
+
+
+# Multi-grouping of treatments using 1 view
+
+Only gene expression data are used.
+
+## Prepare and run MOFA object
+
+In this analysis, we focus only on DMSO, Nutlin, Ibrutinib and Duvelisib. 
+```{r}
+# Subset gene expression matrix and mutation matrix
+patAnno <- as.data.frame(colData(ddsAll))
+treatments <- c("DMSO", "Ibrutinib", "Duvelisib", "Nutlin_3a")
+IDs <- patAnno[patAnno$treatment %in% treatments, ]$ID
+exprMat.sub <- exprMat[, colnames(exprMat) %in% IDs]
+```
+
+```{r}
+# Create data object
+data.sub <- list(exprMat.sub)
+names(data.sub) <- c("RNA_expr")
+
+lapply(data.sub,dim)
+
+# Define groups based on treatments
+groups_tr <- patAnno[patAnno$treatment %in% treatments, ]$treatment
+
+# Create MOFA object
+MOFAobject <- create_mofa(data.sub, groups=groups_tr)
+
+# Visualize structure of data
+plot_data_overview(MOFAobject)
+```
+
+Prepare and run MOFA model
+```{r, eval=FALSE, include=TRUE}
+MOFAobject_res <- running_mofa(obj=MOFAobject, var=0.01)
+
+save(MOFAobject_res, file = "./output/MOFAres_STAR_groupingIbrDuvNutDMSO1view_20220423.RData")
+# converged after 76 iterations (ELBO=-470712.44, deltaELBO=152.251 (0.00041629%), Factors=15)
+```
+
+Load MOFA model
+```{r}
+load("./output/MOFAres_STAR_groupingIbrDuvNutDMSO1view_20220423.RData")
+```
+
+Add meta data to the trained model
+```{r}
+patAnno <- create_anno()
+
+treatments <- c("DMSO", "Ibrutinib", "Duvelisib", "Nutlin_3a")
+sample_metadata <- patAnno[patAnno$treatment %in% treatments, ]
+sample_metadata$sample <- sample_metadata$ID
+sample_metadata$group <- sample_metadata$treatment
+
+sample_metadata <- sample_metadata %>%
+  select(sample, group, FSC.SSC, FSC.SSC.norm, patID, batch,
+         IGHV, TP53, Methylation, trisomy12) # add age
+
+# The number of rows must match the total number of samples in the model
+Nsamples = sum(MOFAobject_res@dimensions$N)
+Nsamples == nrow(sample_metadata)
+
+# Add meta data to MOFA result
+model <- MOFAobject_res
+samples_metadata(model) <- sample_metadata
+head(model@samples_metadata, n=5)
+```
+
+Total variance explained per view and group
+```{r}
+# DMSO
+head(model@cache$variance_explained$r2_total[[1]])
+
+# Ibutinib
+head(model@cache$variance_explained$r2_total[[2]])
+
+# Duvelisib
+head(model@cache$variance_explained$r2_total[[3]])
+
+# Nutlin
+head(model@cache$variance_explained$r2_total[[4]])
+```
+
+Variance decomposition
+```{r}
+plot_variance_explained(model, x="view", y="factor", split_by="group")
+```
+The MOFA factors do not differ between the treatments. 
+Excluding the view with the mutations has no advantages. 
+
+
+# Multi-grouping of treatments with viability correction
+
+## Prepare and run MOFA object
+In this analysis, we focus only on DMSO, Nutlin, Ibrutinib and Duvelisib.
+First, we adjust for inter-patient viability using the DMSO samples
+```{r}
+# Add column to ddsAll with DMSO viability
+ddsAll$FSC.SSC.DMSO <- ddsAll$FSC.SSC
+patIDs <- data.frame(ddsAll@colData@listData) %>%
+  filter(treatment == "DMSO") %>% pull(patID)
+
+for(id in patIDs){
+  viability <- ddsAll$FSC.SSC[ddsAll$patID == id & ddsAll$treatment == "DMSO"]
+  ddsAll$FSC.SSC.DMSO[ddsAll$patID == id] <- viability
+}
+
+# Subset gene expression matrix and mutation matrix
+patAnno <- as.data.frame(ddsAll@colData@listData)
+treatments <- c("DMSO", "Ibrutinib", "Duvelisib", "Nutlin_3a")
+IDs <- patAnno[patAnno$treatment %in% treatments, ]$ID
+patAnno.sub <- patAnno[patAnno$ID %in% IDs,]
+exprMat.sub <- exprMat[, colnames(exprMat) %in% IDs]
+geneMat.sub <- geneMat[, colnames(geneMat) %in% IDs]
+
+# Adjust normalized counts for DMSO viability
+exprMat.subnorm <- limma::removeBatchEffect(exprMat.sub,
+                                             batch=factor(patAnno.sub$FSC.SSC.DMSO))
+```
+
+```{r}
+# Create data object
+data.sub <- list(exprMat.subnorm, geneMat.sub)
+names(data.sub) <- c("RNA_expr", "mutations")
+
+lapply(data.sub,dim)
+
+# Define groups based on treatments
+groups_tr <- patAnno[patAnno$treatment %in% treatments, ]$treatment
+
+# Create MOFA object
+MOFAobject <- create_mofa(data.sub, groups=groups_tr)
+
+# Visualize structure of data
+plot_data_overview(MOFAobject)
+```
+
+Prepare and run MOFA model
+```{r, eval=FALSE, include=TRUE}
+MOFAobject_res <- running_mofa(obj=MOFAobject, var=0.01)
+
+save(MOFAobject_res, file = "./output/MOFAres_STAR_groupingIbrDuvNutDMSO2views_adjViab_20220423.RData")
+# converged after 41 iterations (ELBO=223958.92, deltaELBO=91.895 (0.00026241%), Factors=11)
+```
+
+Load MOFA model
+```{r}
+load("./output/MOFAres_STAR_groupingIbrDuvNutDMSO2views_adjViab_20220423.RData")
+```
+
+Add meta data to the trained model
+```{r}
+patAnno <- create_anno()
+
+treatments <- c("DMSO", "Ibrutinib", "Duvelisib", "Nutlin_3a")
+sample_metadata <- patAnno[patAnno$treatment %in% treatments, ]
+sample_metadata$sample <- sample_metadata$ID
+sample_metadata$group <- sample_metadata$treatment
+
+sample_metadata <- sample_metadata %>%
+  select(sample, group, FSC.SSC, FSC.SSC.norm, patID, batch,
+         IGHV, TP53, Methylation, trisomy12) # add age
+
+# The number of rows must match the total number of samples in the model
+sum(MOFAobject_res@dimensions$N) == nrow(sample_metadata)
+
+# Add meta data to MOFA result
+model <- MOFAobject_res
+samples_metadata(model) <- sample_metadata
+head(model@samples_metadata, n=5)
+```
+
+Total variance explained per view and group
+```{r}
+# DMSO
+head(model@cache$variance_explained$r2_total[[1]])
+
+# Ibutinib
+head(model@cache$variance_explained$r2_total[[2]])
+
+# Duvelisib
+head(model@cache$variance_explained$r2_total[[3]])
+
+# Nutlin
+head(model@cache$variance_explained$r2_total[[4]])
+```
+
+Variance decomposition
+```{r}
+plot_variance_explained(model, x="view", y="factor", split_by="group")
+```
+
+
+# Multi-viewing of treatments with DMSO viability adjustment
+
+The gene expression matrices per treatment are used as separate views in the MOFA+ model.
+
+## Prepare and run MOFA object
+
+In this analysis, we focus only on DMSO, Nutlin, Ibrutinib and Duvelisib. 
+```{r}
+# Add column to ddsAll with DMSO viability
+ddsAll$FSC.SSC.DMSO <- ddsAll$FSC.SSC
+patIDs <- data.frame(ddsAll@colData@listData) %>%
+  filter(treatment == "DMSO") %>% pull(patID)
+
+for(id in patIDs){
+  viability <- ddsAll$FSC.SSC[ddsAll$patID == id & ddsAll$treatment == "DMSO"]
+  ddsAll$FSC.SSC.DMSO[ddsAll$patID == id] <- viability
+}
+
+# Include only patients that have samples for all drugs of interest
+patAnno <- as.data.frame(colData(ddsAll))
+treatments <- c("DMSO", "Ibrutinib", "Duvelisib", "Nutlin_3a")
+
+ID_list <- lapply(treatments, function(tr) {
+  patIDs <- patAnno %>% filter(treatment == tr) %>% pull(patID)
+})
+names(ID_list) <- treatments
+
+patIDsallTr <- Reduce(intersect, ID_list)
+patAnno <- patAnno[patAnno$patID %in% patIDsallTr,]
+
+# Rename genes in expression matrix
+gene_names_df <- data.frame(Ensembl = rownames(exprMat)) %>%
+  mutate(symbol = rowData(ddsDrug)[Ensembl,]$symbol)
+# Check if there are any duplicates gene names
+any(duplicated(gene_names_df$symbol))
+
+exprMat.symbols <- exprMat
+rownames(exprMat.symbols) <- gene_names_df$symbol
+
+# Create data object
+data.sub <- lapply(treatments, function(tr) {
+  IDs <- patAnno[patAnno$treatment == tr, ]$ID
+  patAnno.sub <- patAnno[patAnno$ID %in% IDs,]
+  # Subset gene expression matrix for each treatment
+  exprMat.sub <- exprMat.symbols[, colnames(exprMat.symbols) %in% IDs]
+  # Adjust for DMSO viability
+  exprMat.subnorm <- limma::removeBatchEffect(exprMat.sub,
+                                              batch=factor(patAnno.sub$FSC.SSC.DMSO))
+  # Rename matrix columns to patient IDs
+  colnames(exprMat.subnorm) <- patAnno.sub$patID
+  exprMat.final <- exprMat.subnorm
+})
+names(data.sub) <- treatments
+
+# View dimensions
+lapply(data.sub,dim)
+
+# Create MOFA object
+MOFAobject <- create_mofa(data.sub)
+
+# Visualize structure of data
+plot_data_overview(MOFAobject)
+```
+
+Prepare and run MOFA model
+```{r, eval=FALSE, include=TRUE}
+MOFAobject_res <- running_mofa(obj=MOFAobject, var=0.005)
+
+save(MOFAobject_res, file = "./output/MOFAres_STAR_viewingIbrDuvNutDMSO_20220423.RData")
+# converged after 481 iterations (ELBO=5334289.17, deltaELBO=68.488 (0.00020890%), Factors=9)
+```
+
+Load MOFA model
+```{r}
+load("./output/MOFAres_STAR_viewingIbrDuvNutDMSO_20220423.RData")
+```
+
+Total variance explained per view
+```{r}
+model <- MOFAobject_res
+head(model@cache$variance_explained$r2_total[[1]])
+```
+
+Variance decomposition
+```{r}
+plot_variance_explained(model, x="view", y="factor")
+```
+
+Factor correlation
+```{r, fig.weight=4, fig.height=4}
+plot_factor_cor(model, method="pearson", "pie")
+```
+
+Add meta data to the trained model
+```{r}
+patAnno <- create_anno()
+
+sample_metadata <- patAnno
+sample_metadata$sample <- sample_metadata$patID
+
+# Filter metadata by patIDs
+sample_metadata <- sample_metadata[sample_metadata$sample %in% model@samples_metadata$sample,]
+sample_metadata <- sample_metadata[!duplicated(sample_metadata$sample), ]
+
+# The number of rows must match the total number of samples in the model
+sum(model@dimensions$N) == nrow(sample_metadata)
+
+# Add meta data to MOFA result
+samples_metadata(model) <- sample_metadata
+```
+
+#### patID
+```{r, fig.weight=12, fig.height=3}
+plot_factor(model, 
+  factors = 1:9,
+  color_by = "patID"
+)
+```
+
+#### Viability
+```{r}
+plot_factor(model, 
+  factors = 1:9,
+  color_by = "FSC.SSC"
+)
+```
+
+#### IGHV
+```{r}
+plot_factor(model, 
+  factor = 1:9,
+  color_by = "IGHV"
+)
+```
+
+
+# Multi-viewing of treatments without viability adjustment
+
+The gene expression matrices per treatment are used as separate views in the MOFA+ model.
+
+## Prepare and run MOFA object
+
+In this analysis, we focus only on DMSO, Nutlin, Ibrutinib and Duvelisib. 
+```{r}
+# Add column to ddsAll with DMSO viability
+ddsAll$FSC.SSC.DMSO <- ddsAll$FSC.SSC
+patIDs <- data.frame(colData(ddsAll)) %>%
+  filter(treatment == "DMSO") %>% pull(patID)
+
+for(id in patIDs){
+  viability <- ddsAll$FSC.SSC[ddsAll$patID == id & ddsAll$treatment == "DMSO"]
+  ddsAll$FSC.SSC.DMSO[ddsAll$patID == id] <- viability
+}
+
+# Include only patients that have samples for all drugs of interest
+patAnno <- as.data.frame(colData(ddsAll))
+treatments <- c("DMSO", "Ibrutinib", "Duvelisib", "Nutlin_3a")
+
+ID_list <- lapply(treatments, function(tr) {
+  patIDs <- patAnno %>% filter(treatment == tr) %>% pull(patID)
+})
+names(ID_list) <- treatments
+
+patIDsallTr <- Reduce(intersect, ID_list)
+patAnno <- patAnno[patAnno$patID %in% patIDsallTr,]
+
+# Rename genes in expression matrix
+gene_names_df <- data.frame(Ensembl = rownames(exprMat)) %>%
+  mutate(symbol = rowData(ddsDrug)[Ensembl,]$symbol)
+# Check if there are any duplicates gene names
+any(duplicated(gene_names_df$symbol))
+
+exprMat.symbols <- exprMat
+rownames(exprMat.symbols) <- gene_names_df$symbol
+
+# Create data object
+data.sub <- lapply(treatments, function(tr) {
+  IDs <- patAnno[patAnno$treatment == tr, ]$ID
+  patAnno.sub <- patAnno[patAnno$ID %in% IDs,]
+  # Subset gene expression matrix for each treatment
+  exprMat.sub <- exprMat.symbols[, colnames(exprMat.symbols) %in% IDs]
+  # Rename matrix columns to patient IDs
+  colnames(exprMat.sub) <- patAnno.sub$patID
+  exprMat.final <- exprMat.sub
+})
+names(data.sub) <- treatments
+
+# View dimensions
+lapply(data.sub,dim)
+
+# Create MOFA object
+MOFAobject <- create_mofa(data.sub)
+
+# Visualize structure of data
+plot_data_overview(MOFAobject)
+```
+
+Prepare and run MOFA model
+```{r, eval=FALSE, include=TRUE}
+MOFAobject_res <- running_mofa(obj=MOFAobject, var=0.01)
+
+save(MOFAobject_res, file = "./output/MOFAres_STAR_viewingIbrDuvNutDMSOwoViab_20220423.RData")
+# converged after 101 iterations (ELBO=-500700.21, deltaELBO=102.631 (0.00032925%), Factors=17)
+```
+
+## Inspect results
+
+Load MOFA model
+```{r}
+load("./output/MOFAres_STAR_viewingIbrDuvNutDMSOwoViab_20220423.RData")
+```
+
+Total variance explained per view
+```{r}
+model <- MOFAobject_res
+head(model@cache$variance_explained$r2_total[[1]])
+```
+
+Variance decomposition
+```{r}
+plot_variance_explained(model, x="view", y="factor")
+```
+
+Variance decomposition of latter factors
+```{r}
+plot_variance_explained(model, x="view", y="factor",
+                        factors=c(6:17))
+```
+Factor 17 is very specific for DMSO and factor 7 for Ibrutinib.
+
+Factor correlation
+```{r, fig.weight=4, fig.height=4}
+plot_factor_cor(model, method="pearson", "number")
+```
+Factors 1, 2, 3, and 5 show a strong Pearson correlation (factor1-factor2: 0.62, factor1-factor3: 0.69, factor1-factor5: 0.56, factor2-factor3: 0.74, factor2-factor5: 0.46, factor3-factor5: 0.60). This should not be the case in the MOFA result, as the correlation trend of treatment viability vs DMSO viability is similar for all three treatments. Thus, there should be only one factor in MOFA that explains the viability.  
+
+
+Add meta data to the trained model
+```{r}
+sample_metadata <- create_anno()
+sample_metadata$sample <- sample_metadata$patID
+
+# Filter metadata by patIDs
+sample_metadata <- sample_metadata[sample_metadata$sample %in% model@samples_metadata$sample,]
+sample_metadata <- sample_metadata[!duplicated(sample_metadata$sample), ]
+
+# The number of rows must match the total number of samples in the model
+sum(model@dimensions$N) == nrow(sample_metadata)
+
+# Add meta data to MOFA result
+samples_metadata(model) <- sample_metadata
+```
+
+
+### Factors colored by meta data
+
+Viability
+```{r}
+plot_factor(model, 
+  factors = 1:7,
+  color_by = "FSC.SSC")
+```
+
+DMSO Viability
+```{r}
+plot_factor(model, 
+  factors = 1:7,
+  color_by = "FSC.SSC.DMSO")
+```
+
+IGHV
+```{r}
+plot_factor(model, 
+  factors = 1:7,
+  color_by = "IGHV")
+```
+IGHV is factor 4
+
+Methylation cluster
+```{r}
+plot_factor(model, 
+  factors = 1:7,
+  color_by = "Methylation")
+```
+IGHV is also methylation cluster
+
+### Feature weights (genes)
+
+Factor 1 is Nutlin 3a
+```{r}
+plot_top_weights(model,
+  view = "Nutlin_3a",
+  factor = 1,
+  nfeatures = 10)
+```
+
+Factor 2 is Ibrutinib
+```{r}
+plot_top_weights(model,
+  view = "Ibrutinib",
+  factor = 2,
+  nfeatures = 10)
+```
+
+Factor 3 is Duvelisib
+```{r}
+plot_top_weights(model,
+  view = "Duvelisib",
+  factor = 3,
+  nfeatures = 10)
+```
+
+Factor 5 is DMSO
+```{r}
+plot_top_weights(model,
+  view = "DMSO",
+  factor = 5,
+  nfeatures = 10)
+```
+
+The top genes in each factor are similar across treatments. 
+
+***Conclusion: If we do not correct for viability, the genes contributing most to the factors of each treatment are very similar. Thus, viability controls these factors. If we correct for viability, there are no distinct factors for the individual treatments. Thus, the differences in gene expression are too small.***
+
+
+## Correlation of treatment viability with DMSO viability
+
+Function for correlation plot
+```{r}
+cor_plot_tr <- function(drug, xcor, ycor){
+  df_tr <- filter(patAnno, treatment == drug)
+  plot <- ggplot(df_tr, aes(x=FSC.SSC.DMSO, y=FSC.SSC)) +
+    scattermore::geom_scattermore(pointsize=3, alpha=0.9) +
+    ggtitle(drug) +
+    geom_smooth(method="glm") +
+    annotate(x=xcor, y=ycor,
+             label=paste("R = ", round(cor(df_tr$FSC.SSC.DMSO,
+                                         df_tr$FSC.SSC,
+                                         method = "spearman"),2)), 
+             geom="text", size=5)
+  return(plot)
+}
+```
+
+```{r, fig.height=3, fig.width=9}
+IbrDuvNut <- c("Ibrutinib", "Duvelisib", "Nutlin_3a")
+
+plot_list <- lapply(IbrDuvNut, function(tr) {
+  cor_plot_tr(drug=tr, xcor=25, ycor=75)
+})
+
+plot_grid(plotlist = plot_list, ncol=3)
+```
+
+Create separate patAnno with patients that have samples from all treatments
+```{r}
+# Extract a vector with the names of all drug treatments
+allTreat <- patAnno %>% filter(treatment != "IBET762") %>%
+  distinct(treatment) %>% pull(treatment)
+
+patIDs <- patAnno[patAnno$treatment %in% allTreat, ]$patID
+
+# count if patID appears 10 times (in all treatments)
+occurence <- table(patIDs)
+patIDs.allTreat <- names(occurence[occurence==10])
+
+# Subset patAnno by these patients
+patAnno.sub <- patAnno[patAnno$patID %in% patIDs.allTreat, ]
+```
+
+Preparations for correlation plot
+```{r}
+# Define names of new columns
+colnames_viab <- c("FSC.SSC.DMSO", "FSC.SSC.Ibr", "FSC.SSC.Duv", "FSC.SSC.MK", "FSC.SSC.Ev",
+           "FSC.SSC.Tra", "FSC.SSC.C26", "FSC.SSC.Sel", "FSC.SSC.Nut", "FSC.SSC.comb")
+
+viab_col <- lapply(allTreat, function(drug) {
+  
+  # Add new column to patAnno
+  patAnno.sub$new <- patAnno.sub$FSC.SSC
+  
+  # Get IDs for one drug
+  patIDs <- filter(patAnno.sub, treatment == drug) %>% pull(patID)
+  
+  # Extract viability values for each ID and add to new column for specific patient
+  for(id in patIDs){
+    viability <- patAnno.sub$FSC.SSC[patAnno.sub$patID == id & patAnno.sub$treatment == drug]
+    patAnno.sub$new[patAnno.sub$patID == id] <- viability
+  }
+  vec <- patAnno.sub$new
+})
+names(viab_col) <- colnames_viab
+
+# Add generated vectors to patAnno as columns
+for(viab_vec in names(viab_col)){
+  patAnno.sub[[viab_vec]] <- viab_col[[viab_vec]]
+}
+
+# Create correlation data frame
+cor_df <- filter(patAnno.sub, treatment == "DMSO") %>%
+  select(c(FSC.SSC.DMSO, FSC.SSC.Ibr, FSC.SSC.Duv, FSC.SSC.Nut))
+
+cor_dfall <- filter(patAnno.sub, treatment == "DMSO") %>%
+  select(c(FSC.SSC.DMSO, FSC.SSC.Ibr, FSC.SSC.Duv, FSC.SSC.MK, FSC.SSC.Ev,
+           FSC.SSC.Tra, FSC.SSC.C26, FSC.SSC.Sel, FSC.SSC.Nut, FSC.SSC.comb))
+```
+
+Correlation of all treatments with viability
+```{r, fig.height=5, fig.width=5}
+colnames(cor_dfall) <- allTreat
+cor_matall <- cor(cor_dfall)
+corrplot.mixed(cor_matall)
+```
+The viability effect is quite similar between the treatments. The combination of Ibrutinib and C26 has the lowest correlation with the DMSO samples, followed by Ibrutinib, Duvelisib and Nutlin. C26 and MK2206 have the highest correlation with DMSO samples. Thus, these two drugs have the smallest effect on cell viability. 
+
+
+## Extracting data for downstream analysis
+
+Extract the feature weights, the data and the factors as data frames.
+```{r}
+# Contribution of each patient to factors
+factors <- get_factors(model, as.data.frame = T)
+
+# Contribution of each gene to factors
+weights <- get_weights(model, as.data.frame = T)
+weights$feature <- gsub("\\_.*","",weights$feature)
+
+# Contribution of gene per sample in each view
+data <- get_data(model, as.data.frame = T)
+```
+
+
+### Correlation of factors with viability
+
+Find the specificity of treatments by calculating the asociation of the vectors with DMSO viability after 48 hours of incubation.
+
+Subset factor df by factors
+```{r}
+fac_df <- filter(factors, factor == "Factor1") %>%
+  select(sample, value) %>%
+  rename(patID = sample) %>%
+  rename(factor1 = value)
+
+# Add columns with factor values
+fac_df$factor2 <- factors[factors$factor == "Factor2",]$value
+fac_df$factor3 <- factors[factors$factor == "Factor3",]$value
+fac_df$factor4 <- factors[factors$factor == "Factor4",]$value
+fac_df$factor5 <- factors[factors$factor == "Factor5",]$value
+fac_df$factor6 <- factors[factors$factor == "Factor6",]$value
+fac_df$factor7 <- factors[factors$factor == "Factor7",]$value
+
+# Subset factors by IDs in patAnno.sub
+fac_df.sub <- fac_df[fac_df$patID %in% patAnno.sub$patID,]
+
+# Add viability column
+viab_df <- filter(patAnno.sub, treatment == "DMSO") %>%
+  select(patID, FSC.SSC.DMSO, FSC.SSC.Ibr, FSC.SSC.Duv, FSC.SSC.Nut)
+fac_df.sub <- left_join(fac_df.sub, viab_df, by="patID") %>%
+  column_to_rownames("patID")
+```
+
+Correlation plot
+```{r, fig.height=8, fig.width=8}
+cor_matall <- cor(fac_df.sub)
+corrplot.mixed(cor_matall)
+```
+The correlation of factors 1, 2, and 3 with DMSO viability is quite strong. However, the correlation of factor 2 with Ibrutinib is even stronger. Thus, the factors are specific for the viability of one treatment. 
+
+
+### Find MOFA factors related to CLL-PD
+
+It is expected that there is an association between CLL-PD and the factor which describes the cell of origin (IGHV and methylation cluster).
+CLL-PD values can be calculated with the function "CLLPDestimate" from the R package mofaCLL. 
+As input, a gene expression matrix with variance stabilized counts is required. 
+
+If we find factors that represent CLL-PD, we can demonstrate that the gene expression data from shallow sequencing capture the most important dimensions and can be used as a cheaper alternative to deep sequencing. 
+
+```{r, eval=FALSE, include=FALSE}
+CLLPD_allTr <- CLLPDestimate(
+  exprMatrix = exprMat,
+  identifier = "ensembl_gene_id",
+  topVariant = 5000,
+  normalize = TRUE,
+  repeats = 20
+  )
+```
+
+To see the correlation between CLL-PD and viability, we create a data frame as input for a correlation plot
+```{r, eval=FALSE, include=FALSE}
+plotTab <- tibble(cllpd = CLLPD_allTr$estimated_CLLPD,
+                  viability48 = patAnno$FSC.SSC,
+                  viability0 = patAnno$FSC.SSC.d0)
+```
+
+Function for correlation plot
+```{r, eval=FALSE, include=FALSE}
+plot_corPD <- function(column, ytitle){
+  cor_res <- cor.test(plotTab$cllpd, plotTab[[column]],
+                      method="spearman")
+
+  annoCoef <- paste("'coefficient ='~",format(cor_res$estimate, digits=2))
+  annoP <- paste("italic(P)~'='~",formatNum(cor_res$p.value, digits=1, format="e"))
+
+  plot <- ggplot(plotTab, aes(x = cllpd, y = .data[[column]])) + 
+    geom_point(shape = 21, fill =colList[3], size=3) + 
+    geom_smooth(method = "lm", se=FALSE, color = "grey50", linetype ="dashed" ) + 
+    annotate("text", x = 2, y = Inf, label = annoCoef,
+           hjust=1, vjust =1.5, size = 5, parse = TRUE, col= colList[1]) +
+    annotate("text", x = 2, y = Inf, label = annoP,
+             hjust=1, vjust =3, size = 5, parse = TRUE, col= colList[1]) +
+    ylab(ytitle) + xlab("CLL-PD") +
+    theme_full 
+
+  return(plot)
+}
+```
+
+Correlation of CLL-PD with viability after 48 hours
+```{r, eval=FALSE, include=FALSE}
+plotViabPD <- plot_corPD(column="viability48",
+                         ytitle="Viability after 48h")
+plotViabPD
+```
+
+
+Estimate CLL-PD for DMSO and each treatment separately
+```{r, fig.weight=14, fig.height=20, eval=FALSE, include=FALSE}
+allTreatDMSO <- patAnno %>%
+  distinct(treatment) %>% pull(treatment)
+
+
+plot_list_cllpd <- lapply(allTreatDMSO, function(tr) {
+  
+  # Extract sample IDs for each treatment
+  ids <- patAnno[patAnno$treatment == tr,]$ID
+  
+  # Subset expression matrix
+  exprMat_sub <- exprMat[,colnames(exprMat) %in% ids]
+  
+  # Estimate CLL-PD values
+  cllpd_est <- CLLPDestimate(exprMatrix = exprMat_sub, identifier = "ensembl_gene_id",
+                           topVariant = 5000, normalize = TRUE, repeats = 50)
+
+  # Extract viability values for that treatment
+  viab <- patAnno[patAnno$treatment == tr,]$FSC.SSC
+  
+  # Create inputs for correlation plot
+  plotTab <- data.frame(x=cllpd_est$estimated_CLLPD, y=viab)
+
+  # Calculate Spearman correlation coefficient
+  cor_res <- cor.test(plotTab$x, plotTab$y,
+                      method="spearman")
+
+  annoCoef <- paste("'coefficient ='~",
+                    format(cor_res$estimate, digits=2))
+  annoP <- paste("italic(P)~'='~",
+                 formatNum(cor_res$p.value, digits=1, format="e"))
+
+  # Create correlation plot
+  plot <- ggplot(plotTab, aes(x = x, y = y)) + 
+    geom_point(shape = 21, fill =colList[3], size=3) + 
+    geom_smooth(method = "lm", se=FALSE, color = "grey50", linetype ="dashed" ) + 
+    annotate("text", x = 2, y = Inf, label = annoCoef,
+           hjust=1, vjust =1.5, size = 5, parse = TRUE, col= colList[1]) +
+    annotate("text", x = 2, y = Inf, label = annoP,
+             hjust=1, vjust =3, size = 5, parse = TRUE, col= colList[1]) +
+    ylab("Viability") + xlab("CLL-PD") +
+    theme_full 
+  plot
+})
+names(plot_list_cllpd) <- allTreatDMSO
+
+plot_grid(plotlist=plot_list_cllpd, ncol=3,
+          labels=allTreatDMSO)
+```
+
+By plotting the correlation of the viability values of each treatment with the CLL-PD values of the respective treatment, we can see whether there is an association between the effect of a particular treatment with CLL-PD. 
+
+
+### Top 10 patients contributing most to the factors
+```{r}
+fac_names <- c("Factor1", "Factor2", "Factor3", "Factor4", "Factor5",
+             "Factor6", "Factor7", "Factor8", "Factor9", "Factor10")
+
+patdf_pos <- data.frame(1:10)
+patdf_neg <- data.frame(1:10)
+
+for(fac in fac_names){
+
+  # top 10 patients with positive value
+  pat_pos <- filter(factors, factor == fac) %>%
+    arrange(desc(value)) %>%
+    slice_head(n=10) %>% pull(sample)
+  patdf_pos[fac] <- pat_pos
+
+  # top 10 patients with negative value
+  pat_neg <- filter(factors, factor == fac) %>%
+    arrange(-desc(value)) %>%
+    slice_head(n=10) %>% pull(sample)
+  patdf_neg[fac] <- pat_neg
+}
+patdf_pos <- patdf_pos[ -c(1) ]
+patdf_neg <- patdf_neg[ -c(1) ]
+
+patdf_pos %>% DT::datatable()
+patdf_neg %>% DT::datatable()
+```
+
+### Overlap of top genes
+
+Extract the top genes of each treatment (regardless of positive or negative weight)
+```{r}
+n_genes <- 60
+
+top_genes <- function(tr, fac){
+  genes <- filter(weights, view == tr) %>%
+    filter(factor == fac) %>%
+    arrange(desc(abs(value))) %>%
+    slice_head(n=n_genes) %>% pull(feature)
+  return(genes)
+}
+
+Nutlin_genes <- top_genes(tr="Nutlin_3a", fac="Factor1")
+Ibrutinib_genes <- top_genes(tr="Ibrutinib", fac="Factor2")
+Duvelisib_genes <- top_genes(tr="Duvelisib", fac="Factor3")
+DMSO_genes <- top_genes(tr="DMSO", fac="Factor5")
+```
+
+```{r}
+# Create list with top genes per treatment
+geneList <- list(DMSO_genes, Ibrutinib_genes,
+                 Duvelisib_genes, Nutlin_genes)
+names(geneList) <- treatments
+
+# Show overlap
+UpSetR::upset(UpSetR::fromList(geneList), nsets = 15)
+```
+Although factors 2, 3, 4, and 5 are associated with viability, they are also associated with different treatments. Hence, these factors show the viability effect associated with one treatment, respectively. The cells show different response patterns with interesting genes mostly upstream. The common genes with an upregulated gene expression pattern due to apoptosis are expected to be mostly downstream. 
+
+Genes only associated to one treatment
+```{r}
+genes_unique <- lapply(1:length(geneList), function(n) setdiff(geneList[[n]], unlist(geneList[-n])))
+names(genes_unique) <- treatments
+
+# Genes unique for Ibrutinib
+genes_unique$Ibrutinib
+
+# Genes unique for Duvelisib
+genes_unique$Duvelisib
+
+# Genes unique for Nutlin
+genes_unique$Nutlin
+```
+
+gene KCTD16 (Potassium Channel Tetramerization Domain Containing 16), ENSG00000183775
+
+Predicted to be involved in protein homooligomerization. Predicted to act upstream of or within regulation of G protein-coupled receptor signaling pathway. Predicted to be located in cell projection.
+```{r}
+exprMat.DMSO <- data.sub$DMSO[rownames(data.sub$DMSO) == "KCTD16",]
+exprMat.Ibr <- data.sub$Ibrutinib[rownames(data.sub$Ibrutinib) == "KCTD16",]
+patID1 <- colnames(data.sub$DMSO)
+patID2 <- colnames(data.sub$Ibrutinib)
+trDMSO <- rep("DMSO",times=length(exprMat.DMSO))
+trIbr <- rep("Ibrutinib",times=length(exprMat.DMSO))
+
+plotTab <- tibble(expression = c(exprMat.DMSO, exprMat.Ibr),
+                    treatment = c(trDMSO, trIbr),
+                    patID = c(patID1, patID2))
+
+ggplot(plotTab, aes(x=treatment, y=expression, fill=treatment)) +
+  geom_boxplot() +
+  geom_line(aes(group=patID), position=position_dodge(0.2),
+            linetype="dotted", col="grey50") +
+  geom_point(aes(fill=treatment, group=patID), size=2, shape=21, position=position_dodge(0.2)) +
+  theme(legend.position = "none")
+```
+
+Top genes as data table
+```{r}
+all_top_genes <- unique(c(Nutlin_genes, Ibrutinib_genes, Duvelisib_genes, DMSO_genes))
+
+top_genes_df <- weights[weights$feature %in% all_top_genes, ]
+
+Nutlin_fac1 <- top_genes_df[top_genes_df$factor == "Factor1" & top_genes_df$view == "Nutlin_3a",]
+Nutlin_fac1 <- Nutlin_fac1[match(all_top_genes, Nutlin_fac1$feature),]
+Ibr_fac2 <- top_genes_df[top_genes_df$factor == "Factor2" & top_genes_df$view == "Ibrutinib",]
+Ibr_fac2 <- Ibr_fac2[match(all_top_genes, Ibr_fac2$feature),]
+Duv_fac3 <- top_genes_df[top_genes_df$factor == "Factor3" & top_genes_df$view == "Duvelisib",]
+Duv_fac3 <- Duv_fac3[match(all_top_genes, Duv_fac3$feature),]
+DMSO_fac5 <- top_genes_df[top_genes_df$factor == "Factor5" & top_genes_df$view == "DMSO",]
+DMSO_fac5 <- DMSO_fac5[match(all_top_genes, DMSO_fac5$feature),]
+
+
+top_genes_df_comb <- data.frame(all_top_genes, Nutlin_fac1$value,
+                                Ibr_fac2$value, Duv_fac3$value, DMSO_fac5$value)
+
+top_genes_df_comb %>% DT::datatable()
+```
+
+
+### Heatmap
+
+Define annotations and colors
+```{r}
+# Define annotations
+ddsAll$TP53 <- patMeta[match(ddsAll$patID, patMeta$Patient.ID),]$TP53
+ddsAll$trisomy12 <- patMeta[match(ddsAll$patID, patMeta$Patient.ID),]$trisomy12
+ddsAll$trisomy12[ddsAll$batch == "pilot"] <- 0
+ddsAll$TP53[ddsAll$batch == "pilot"] <- 0
+ddsAll$IGHVpat <- patMeta[match(ddsAll$patID, patMeta$Patient.ID),]$IGHV.status
+ddsAll$IGHV <- ifelse(is.na(ddsAll$IGHV), ddsAll$IGHVpat, ddsAll$IGHV)
+
+annoCol <- as.data.frame(ddsAll@colData) %>%
+  dplyr::select(patID, FSC.SSC, treatment,
+                IGHV, TP53, trisomy12, batch)
+
+annoCol$TP53 <- as.character(annoCol$TP53)
+annoCol$TP53[annoCol$TP53 == "0"] <- "wt"
+annoCol$TP53[annoCol$TP53 == "1"] <- "m"
+annoCol$trisomy12 <- as.character(annoCol$trisomy12)
+annoCol$trisomy12[annoCol$trisomy12 == "0"] <- "wt"
+annoCol$trisomy12[annoCol$trisomy12 == "1"] <- "m"
+
+# Define colors of annotations
+color_anno = list(
+  batch = c(pilot="#F8F417", batch1="#B5E222", batch2="#76EE3D", batch3="#07D256", batch4="#0A9C43"),
+  trisomy12 = c(wt = "#DB86C6", m = "#9E137B"),
+  TP53 = c(wt = "#F0C538", m = "#AC8400"),
+  IGHV = c(U="#A4FFF4", M="#17C6B1"),
+  treatment = c(DMSO="#A1A1A1", Duvelisib="#F133B7", 
+                Ibrutinib="#F17B33", Nutlin_3a="#3C33F1"))
+
+# Define fill colors of heatmap
+color_fill <- colorRampPalette( rev(brewer.pal(9,"RdBu")) )(255)
+```
+
+Prepare gene expression matrix
+```{r}
+# Subset normalized expression matrix by using only top genes
+exprMatsub <- exprMat.symbols[rownames(exprMat.symbols) %in% all_top_genes,]
+
+# Subset columns by only using treatments of interest
+smp <- unique(ddsAll$ID[ddsAll$treatment %in% treatments])
+exprMatsub <- exprMatsub[,colnames(exprMatsub) %in% smp]
+
+# Scale expression matrix
+exprMatsub.scale <- jyluMisc::mscale(exprMatsub, censor=2)
+```
+
+Show heatmap with normalized ounts
+```{r, fig.weight=15, fig.height=10}
+pheatmap(exprMatsub.scale, color = color_fill, annotation_col = annoCol,
+         annotation_colors = color_anno, clustering_method = "ward.D2", fontsize=13,
+         labels_col = paste0(patAnno[colnames(exprMatsub),]$patID,"_",
+                             patAnno[colnames(exprMatsub),]$treatment),
+         show_rownames=T, fontsize_row=4, show_colnames=T, fontsize_col=2,
+         main = "Heatmap of top genes from MOFA factors")
+```
+Genes in first block are CACNA1A, WDR87, GRIK2, CNKSR3, SCN2A, RUNX1T1, ATP10A, DAPK2, RELN, GABRG2, GREM1, GABRB1, SRGAP1, SOX6, SH3TC2, NOS1, PLAT, FLRT2, TMC1, MAPK10,
+CADPS, TRPM3, NKAIN3, NHLH2, PCDH7, ANK2, NFIA, SORBS2, KCTD16, VLDLR, CACNA1C, TENM3, CFAP46, SLC22A14, PCSK2, IGHF1, TF, NEDD4L, CELF5, IRX2, CACNB4, CTCFL, ZC2HC1C, AGBL1, KCNMB1, OPRM1, PAPPA, NTRK3, DOCK5, and CACNG8. 
+
+
+Adjust for DMSO viability
+```{r}
+exprMat.norm <- limma::removeBatchEffect(exprMat.symbols,
+                                         batch=factor(ddsAll$FSC.SSC.DMSO))
+
+# Subset normalized expression matrix by using only top genes
+exprMatsub <- exprMat.norm[rownames(exprMat.norm) %in% all_top_genes,]
+
+# Subset columns of expression matrix
+exprMatsub <- exprMatsub[,colnames(exprMatsub) %in% smp]
+
+# Scale expression matrix
+exprMatsub.scale <- jyluMisc::mscale(exprMatsub, censor=2)
+```
+
+Show heatmap with DMSO adjusted counts
+```{r, fig.weight=15, fig.height=10}
+pheatmap(exprMatsub.scale, color = color_fill, annotation_col = annoCol,
+         annotation_colors = color_anno, clustering_method = "ward.D2", fontsize=13,
+         labels_col = paste0(patAnno[colnames(exprMatsub),]$patID,"_",
+                             patAnno[colnames(exprMatsub),]$treatment),
+         show_rownames=T, fontsize_row=4, show_colnames=T, fontsize_col=2,
+         main = "Heatmap of top genes from MOFA factors")
+```
+
+
+# Multi-viewing of treatments with DMSO subtraction
+
+The gene expression matrices per treatment are used as separate views in the MOFA+ model.
+The gene expression matrix of the DMSO samples is subtracted from the expression matrices of the drugs to calculate the difference. 
+
+## Prepare and run MOFA object
+
+In this analysis, we focus only on DMSO, Nutlin, Ibrutinib and Duvelisib. 
+```{r}
+# Add column to ddsAll with DMSO viability
+ddsAll$FSC.SSC.DMSO <- ddsAll$FSC.SSC
+patIDs <- data.frame(colData(ddsAll)) %>%
+  filter(treatment == "DMSO") %>% pull(patID)
+
+for(id in patIDs){
+  viability <- ddsAll$FSC.SSC[ddsAll$patID == id & ddsAll$treatment == "DMSO"]
+  ddsAll$FSC.SSC.DMSO[ddsAll$patID == id] <- viability
+}
+
+# Include only patients that have samples for all drugs of interest
+patAnno <- as.data.frame(colData(ddsAll))
+treatments <- c("DMSO", "Ibrutinib", "Duvelisib", "Nutlin_3a")
+
+ID_list <- lapply(treatments, function(tr) {
+  patIDs <- patAnno %>% filter(treatment == tr) %>% pull(patID)
+})
+names(ID_list) <- treatments
+
+patIDsallTr <- Reduce(intersect, ID_list)
+patAnno <- patAnno[patAnno$patID %in% patIDsallTr,]
+
+# Rename genes in expression matrix
+gene_names_df <- data.frame(Ensembl = rownames(exprMat)) %>%
+  mutate(symbol = rowData(ddsDrug)[Ensembl,]$symbol)
+# Check if there are any duplicates gene names
+any(duplicated(gene_names_df$symbol))
+
+exprMat.symbols <- exprMat
+rownames(exprMat.symbols) <- gene_names_df$symbol
+
+# Create data object
+data.sub <- lapply(treatments, function(tr) {
+  IDs <- patAnno[patAnno$treatment == tr, ]$ID
+  patAnno.sub <- patAnno[patAnno$ID %in% IDs,]
+  # Subset gene expression matrix for each treatment
+  exprMat.sub <- exprMat.symbols[, colnames(exprMat.symbols) %in% IDs]
+  # Rename matrix columns to patient IDs
+  colnames(exprMat.sub) <- patAnno.sub$patID
+  exprMat.final <- exprMat.sub
+})
+names(data.sub) <- treatments
+
+# Subtract DMSO matrix
+IbrDuvNut <- c("Ibrutinib", "Duvelisib", "Nutlin_3a")
+data.subdiff <- lapply(IbrDuvNut, function(tr) {
+  # check whether patient IDs are in the same order
+  print(identical(colnames(data.sub[[tr]]), colnames(data.sub$DMSO)))
+  
+  # subtract DMSO matrix
+  exprMat.diff <- data.sub[[tr]] - data.sub$DMSO
+})
+names(data.subdiff) <- IbrDuvNut
+
+# View dimensions
+lapply(data.subdiff,dim)
+
+# Create MOFA object
+MOFAobject <- create_mofa(data.subdiff)
+
+# Visualize structure of data
+plot_data_overview(MOFAobject)
+```
+
+Function for running MOFA 
+```{r}
+running_mofa <- function(obj, var){
+  
+  ### Setup MOFA training parameters
+  # Define data options
+  DataOptions <- get_default_data_options(obj)
+
+  #Define model options
+  ModelOptions <- get_default_model_options(obj)
+  # number of factors to start with
+  # (in each iteration number of factors is tried to be reduced)
+  ModelOptions$num_factors <- 20
+  #ModelOptions
+
+  # Define training options
+  TrainOptions <- get_default_training_options(obj)
+
+  # Automatically drop factors that explain less than x% of variance
+  TrainOptions$drop_factor_threshold <- var
+  # Train model for longer time by using stricter convergence criteria
+  TrainOptions$convergence_mode <- "slow"
+  
+  ### Run MOFA model
+  obj_prep <- prepare_mofa(
+    obj, 
+    data_options = DataOptions,
+    model_options = ModelOptions,
+    training_options = TrainOptions
+  )
+
+  obj_res <- run_mofa(obj_prep)
+  return(obj_res)
+}
+```
+
+Prepare and run MOFA model
+```{r, eval=FALSE, include=TRUE}
+MOFAobject_res <- running_mofa(obj=MOFAobject, var=0.01)
+
+save(MOFAobject_res, file = "./output/MOFAres_STAR_viewingIbrDuvNutsubtractDMSO_20220423.RData")
+# converged after 106 iterations (ELBO=-251360.91, deltaELBO=88.533 (0.00038612%), Factors=17)
+
+#Warnung in .quality_control(object, verbose = verbose)
+#  Factor(s) 1, 2, 3 are strongly correlated with the total number of expressed features for at least one of your #omics. Such factors appear when there are differences in the total 'levels' between your samples, *sometimes* because #of poor normalisation in the preprocessing steps.
+
+#Warnung in .quality_control(object, verbose = verbose)
+#  The model contains highly correlated factors (see `plot_factor_cor(MOFAobject)`). 
+#We recommend that you train the model with less factors and that you let it train for a longer time.
+```
+
+## Inspect results
+
+Load MOFA model
+```{r}
+load("./output/MOFAres_STAR_viewingIbrDuvNutsubtractDMSO_20220423.RData")
+```
+
+Total variance explained per view
+```{r}
+model <- MOFAobject_res
+head(model@cache$variance_explained$r2_total[[1]])
+```
+
+Variance decomposition
+```{r}
+plot_variance_explained(model, x="view", y="factor")
+```
+
+Factor correlation
+```{r, fig.width=4, fig.height=4}
+plot_factor_cor(model, method="pearson", "number")
+```
+
+
+
+# Gene Set Enrichment Analysis on MOFA factors
+
+
+# Associations of latent factors to clinical behaviors (Cox regression)
+
+
+# Session Info Details
+```{r, echo=FALSE, eval=TRUE}
+sessionInfo()
+```

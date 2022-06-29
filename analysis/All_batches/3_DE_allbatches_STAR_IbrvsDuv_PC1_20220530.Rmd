@@ -1,0 +1,1249 @@
+---
+title: "DE of Duvelisib versus Ibrutinib using PC1 instead of patID, pre-processed with STAR + HTSeq"
+author: "Caroline Lohoff"
+date: "May 16 2022"
+output:
+  BiocStyle::html_document:
+    toc_float: true
+---
+
+# Description
+
+In this differential gene expression analysis we compare the gene expression between samples treated with Ibrutinib and Duvelisib.
+Since Duvelisib has a stronger impact on cell viability and more differentially expressed genes compared to Ibrutinib when using DMSO as a reference, we expect that Duvelisib deregulates more pathways than Ibrutinib. Therefore, we conduct a pairwise t-test and compare Duvelisib vs Ibrutinib, i.e. with Ibrutinib as reference. As an additional covariate, PC1 is used instead of the patient IDs because it is a strong technical factor that correlates with mapping rate and viability, and is thus associated with the patient IDs. 
+
+Design formula: ~ PC1 + condition  (Duv vs Ibr)
+
+# Load libraries and set options
+
+Set global options
+```{r setup, include=FALSE, cache = FALSE}
+knitr::opts_knit$set(root.dir = "~/Documents/R/drugseq_test")
+knitr::opts_chunk$set(warning = FALSE, message = FALSE)
+```
+
+Load libraries
+```{r}
+suppressPackageStartupMessages({
+  library(DESeq2)
+  library(tidyverse)
+  library(RColorBrewer)
+  library(factoextra)
+  library(pheatmap)
+  library(clusterProfiler)
+  library(enrichplot)
+  library(cowplot)
+  library(org.Hs.eg.db)
+  library(annotate)
+  library(BiocParallel)
+})
+register(MulticoreParam(2))
+```
+
+Set global ggplot variables
+```{r}
+theme_set(theme_bw() + theme(axis.text = element_text(size=12), 
+                             axis.title = element_text(size=14),
+                             legend.title = element_text(size=14),
+                             legend.text = element_text(size=12),
+                             plot.title = element_text(size=16,
+                                                       hjust=0.5,face="bold")))
+```
+
+# Load data and add annotations
+```{r}
+# Load dds data set containing 1106 samples and count matrix
+load("./output/ddsDrug_htseq_batchPilot1c234_20220426.RData")
+
+# Load meta data including genotyping info
+load("./data/patmeta_210324.RData")
+
+# Add columns to DESeq object using patient meta data
+col_vec <- c("diagnosis", "gender", "Methylation_Cluster", "trisomy12", "TP53")
+ddsDrug@colData@listData <- lapply(col_vec, function(n) {
+  ddsDrug[[n]] <- patMeta[match(ddsDrug$patID, patMeta$Patient.ID), n]
+}) %>% bind_cols() %>% sjmisc::add_columns(ddsDrug@colData@listData)
+
+names(ddsDrug@colData@listData)[names(ddsDrug@colData@listData) == "Methylation_Cluster"] <- "Methylation"
+ddsDrug$IGHVpat <- patMeta[match(ddsDrug$patID, patMeta$Patient.ID),]$IGHV.status
+ddsDrug$IGHV <- ifelse(is.na(ddsDrug$IGHV), ddsDrug$IGHVpat, ddsDrug$IGHV)
+
+# Add meta data to the samples from the pilot batch
+ddsDrug$diagnosis[ddsDrug$batch == "pilot"] <- "CLL" 
+ddsDrug$trisomy12[ddsDrug$batch == "pilot"] <- 0
+ddsDrug$NOTCH1[ddsDrug$batch == "pilot"] <- 0
+ddsDrug$TP53[ddsDrug$batch == "pilot"] <- 0
+ddsDrug$IGHV[ddsDrug$batch == "pilot" & ddsDrug$patID %in% c("PID1095", "PID1222")] <- "U"
+ddsDrug$IGHV[ddsDrug$batch == "pilot" & ddsDrug$patID %in% c("PID1177", "PID1210")] <- "M"
+ddsDrug$gender[ddsDrug$batch == "pilot" & ddsDrug$patID %in% c("PID1095", "PID1222")] <- "f"
+ddsDrug$gender[ddsDrug$batch == "pilot" & ddsDrug$patID %in% c("PID1177", "PID1210")] <- "m"
+
+# Rename IGHV status from 'U' and 'M' to 0 and 1
+ddsDrug$IGHV[ddsDrug$IGHV == "U"] <- 0
+ddsDrug$IGHV[ddsDrug$IGHV == "M"] <- 1
+ddsDrug$IGHV <- as.factor(ddsDrug$IGHV)
+ddsDrug$IGHVpat <- NULL
+
+# Replace spaces in treatment names
+ddsDrug$treatment <- str_replace_all(ddsDrug$treatment,"[- ]","_")
+
+dim(ddsDrug)
+```
+
+Filter patients
+```{r}
+# Remove patients with a low mapping rate & little counts
+remPat <- c("P0437", "P0738", "P0029")
+ddsAll <- ddsDrug[, !ddsDrug$patID %in% remPat]
+
+# Keep only CLL patients and remove Jurkat samples
+ddsAll <- ddsAll[,ddsAll$diagnosis == "CLL" &
+                   ddsAll$treatment != "Baseline" &
+                   ddsAll$Replicate == 1]
+
+dim(ddsAll)
+```
+
+Filter genes, counts and diagnosis
+```{r}
+# Only use protein coding genes and remove genes with unknown gene symbol
+ddsAll <- ddsAll[rowData(ddsAll)$biotype == "protein_coding" &
+                   !rowData(ddsAll)$symbol %in% c(NA, ""),]
+
+# Remove all mitochondrial, artificial, and Y chromosome
+ddsAll <- ddsAll[rowData(ddsAll)$chromosome %in% c(1:22,"X")]
+table(rowData(ddsAll)$chromosome)
+
+# Keep only genes with a minimum of 10 counts in any sample
+keep_counts <- apply(counts(ddsAll), 1, function(x) any(x >= 10))
+ddsAll <- ddsAll[keep_counts,]
+dim(ddsAll)
+
+# Keep only genes expressed in at least 30% of all samples, 
+# since most genes have a basal expression. 
+# With this function the sparsity of the expression matrix is reduced.
+expr_min <- round(ncol(counts(ddsAll)) * 0.7)
+keep_counts_expr <- apply(counts(ddsAll), 1, function(x) sum(x == 0) < expr_min)
+ddsAll <- ddsAll[keep_counts_expr,]
+
+dim(ddsAll)
+
+# Retrieve patient annotations as data frame
+patAnno <- colData(ddsAll) %>% as_tibble()
+```
+Keeping only genes with a minimum of 10 counts in any sample, reduces the genes by 36006. 
+Keeping only genes expressed in 30% of all samples, reduces the genes by 3548. 
+
+Add mapping rate to annotation columns
+```{r}
+# Load mapping rate data
+htTab <- read_tsv("./output/htseq_process_batchPilot1c234_20220203.tsv")
+htTab <- htTab %>% mutate(percent = percent*100)
+
+# Only select mapping rate & add column with patient IDs
+htTab_mapRate <- htTab[htTab$feature == "total mapped",] %>%
+   mutate(patID = patAnno[match(fileName, patAnno$fileName),]$patID)
+
+# Add mapping rate to patAnno
+patAnno <- patAnno %>%
+  mutate(mapping_rate = htTab_mapRate[match(fileName,htTab_mapRate$fileName),]$percent)
+ddsAll$mapping_rate <- patAnno[match(ddsAll$fileName, patAnno$fileName),]$mapping_rate
+```
+
+# PCA
+
+## Normalized raw counts
+
+Variance stabilization transformation of the raw data
+```{r}
+ddsAll.vst <- varianceStabilizingTransformation(ddsAll)
+```
+
+Invariant filtering of top 5000 most variant genes
+```{r}
+exprMat <- assay(ddsAll.vst)
+meanExpr <- colMeans(exprMat)
+# Using mad instead of rowSds(exprMat)
+sds <- apply(exprMat, 1, function(x) mad(x))
+exprMat <- exprMat[order(sds, decreasing=T)[1:5000],]
+```
+
+Calculate PCA
+```{r}
+pcaRes <- prcomp(t(exprMat), scale=T, center=T)
+varExp <- (pcaRes$sdev^2 / sum(pcaRes$sdev^2))*100
+pcaTab <- data.frame(pcaRes$x[,1:10]) %>%
+  rownames_to_column("ID") %>% left_join(patAnno) %>%
+  mutate(meanExp = meanExpr)
+names(varExp) <- colnames(pcaRes$x)
+```
+
+Add PC1 to ddsAll
+```{r}
+ddsAll$PC1before <- pcaTab[match(ddsAll$ID, pcaTab$ID),]$PC1
+patAnno$PC1before <- pcaTab[match(patAnno$ID, pcaTab$ID),]$PC1
+```
+
+### Variance explained 
+
+Visualize eigenvalues (variance explained by the principal components)
+```{r}
+fviz_screeplot(pcaRes, addlabels = TRUE, ylim = c(0, 19))
+```
+
+```{r}
+ggplot(pcaTab, aes(x=PC1,y=PC2, col=batch)) + geom_point() + 
+  xlab(sprintf("PC1 (%2.1f%%)",varExp[1])) +
+  ylab(sprintf("PC2 (%2.1f%%)",varExp[2])) +
+  ggtitle("PCA colored by batches")
+```
+
+### Correlation between viability and mapping rate
+```{r, fig.width=18, fig.height=5}
+p1 <- ggplot(pcaTab, aes(x=FSC.SSC, y=mapping_rate, col=FSC.SSC)) +
+  geom_point() +
+  geom_smooth(method="glm") +
+  ggtitle("Correlation viability and mapping rate") +
+    annotate(x=20, y=31, 
+         label=paste("R = ", round(cor(pcaTab$FSC.SSC, pcaTab$mapping_rate),2)), 
+         geom="text", size=6)
+
+p2 <- ggplot(pcaTab, aes(x=PC1, y=mapping_rate, col=mapping_rate)) +
+  geom_point() +
+  geom_smooth(method="glm") +
+  ggtitle("Correlation PC1 and mapping rate") +
+    annotate(x=100, y=31, 
+         label=paste("R = ", round(cor(pcaTab$PC1, pcaTab$mapping_rate),2)), 
+         geom="text", size=6)
+
+p3 <- ggplot(pcaTab, aes(x=PC1, y=FSC.SSC, col=FSC.SSC)) +
+  geom_point() +
+  geom_smooth(method="glm") +
+  ggtitle("Correlation PC1 and viability") +
+    annotate(x=100, y=77, 
+         label=paste("R = ", round(cor(pcaTab$PC1, pcaTab$FSC.SSC),2)), 
+         geom="text", size=6)
+
+plot_grid(p1, p2, p3, ncol=3)
+```
+
+### PCA colored by interesting genetic features
+```{r, fig.width=10, fig.height=6}
+p1 <- ggplot(pcaTab, aes(x=PC1, y=PC2, col = IGHV)) + geom_point(size=2) + theme_bw() + 
+  xlab(sprintf("PC1 (%2.1f%%)",varExp[1])) + ylab(sprintf("PC2 (%2.1f%%)",varExp[2])) +
+  ggtitle("PCA colored by IGHV status")
+
+p2 <- ggplot(pcaTab, aes(x=PC1, y=PC2, col = Methylation)) + geom_point(size=2) + theme_bw() + 
+  xlab(sprintf("PC1 (%2.1f%%)",varExp[1])) + ylab(sprintf("PC2 (%2.1f%%)",varExp[2])) +
+  ggtitle("PCA colored by methylation cluster")
+
+p3 <- ggplot(pcaTab, aes(x=PC1, y=PC3, col = trisomy12)) + geom_point(size=2) + theme_bw() + 
+  xlab(sprintf("PC1 (%2.1f%%)",varExp[1])) + ylab(sprintf("PC3 (%2.1f%%)",varExp[3])) +
+  ggtitle("PCA colored by trisomy 12 status")
+
+p4 <- ggplot(pcaTab, aes(x=PC1, y=PC2, col = TP53)) + geom_point(size=2) + theme_bw() + 
+  xlab(sprintf("PC1 (%2.1f%%)",varExp[1])) + ylab(sprintf("PC2 (%2.1f%%)",varExp[2])) +
+  ggtitle("PCA colored by TP53 mutation")
+
+plot_grid(p1, p2, p3, p4, ncol=2)
+```
+
+
+## scTransform normalized counts
+
+Correct raw count matrix with scTransform
+(Resulting counts are integers and can be used as input for DESeq2)
+```{r, results=FALSE}
+countMat <- counts(ddsAll)
+scModel <- sctransform::vst(countMat,
+                            return_corrected_umi = TRUE)
+
+# Extract normalized counts matrix
+countMat.norm <- as.matrix(scModel$umi_corrected)
+
+# Create new ddsAll object with norm. counts matrix and colData from ddsDrug
+ddsAll.adj <- DESeqDataSetFromMatrix(countMat.norm,
+                                     colData = colData(ddsAll), design = ~1)
+rowData(ddsAll.adj) <- rowData(ddsAll[rownames(countMat.norm)],)
+
+# Reset size factors
+ddsAll.adj$sizeFactor <- 1
+```
+
+Variance stabilization transformation of the raw data
+```{r vst}
+ddsAll.adjvst <- varianceStabilizingTransformation(ddsAll.adj)
+```
+
+Invariant filtering of top 5000 most variant genes
+```{r}
+exprMat <- assay(ddsAll.adjvst)
+meanExpr <- colMeans(exprMat)
+# Using mad instead of rowSds(exprMat)
+sds <- apply(exprMat, 1, function(x) mad(x))
+exprMat <- exprMat[order(sds, decreasing=T)[1:5000],]
+```
+
+Calculate PCA
+```{r}
+pcaRes <- prcomp(t(exprMat), scale=T, center=T)
+varExp <- (pcaRes$sdev^2 / sum(pcaRes$sdev^2))*100
+pcaTab <- data.frame(pcaRes$x[,1:10]) %>%
+  rownames_to_column("ID") %>% left_join(patAnno) %>%
+  mutate(meanExp = meanExpr)
+names(varExp) <- colnames(pcaRes$x)
+```
+
+Add PC1 to ddsAll.adj
+```{r}
+ddsAll.adj$PC1sc <- pcaTab[match(ddsAll$ID, pcaTab$ID),]$PC1
+patAnno$PC1sc <- pcaTab[match(patAnno$ID, pcaTab$ID),]$PC1
+```
+
+### Variance explained
+Visualize eigenvalues (variance explained by the principal components)
+```{r}
+fviz_screeplot(pcaRes, addlabels = TRUE, ylim = c(0, 13))
+```
+
+```{r}
+ggplot(pcaTab, aes(x=PC1,y=PC2, col=batch)) + geom_point() + 
+  xlab(sprintf("PC1 (%2.1f%%)",varExp[1])) +
+  ylab(sprintf("PC2 (%2.1f%%)",varExp[2])) +
+  ggtitle("PCA colored by batches")
+```
+
+### Correlation between viability and mapping rate
+```{r, fig.width=18, fig.height=5}
+p1 <- ggplot(pcaTab, aes(x=FSC.SSC, y=mapping_rate, col=FSC.SSC)) +
+  geom_point() +
+  geom_smooth(method="glm") +
+  ggtitle("Correlation viability and mapping rate") +
+    annotate(x=20, y=31, 
+         label=paste("R = ", round(cor(pcaTab$FSC.SSC, pcaTab$mapping_rate),2)), 
+         geom="text", size=6)
+
+p2 <- ggplot(pcaTab, aes(x=PC1, y=mapping_rate, col=mapping_rate)) +
+  geom_point() +
+  geom_smooth(method="glm") +
+  ggtitle("Correlation PC1 and mapping rate") +
+    annotate(x=75, y=31, 
+         label=paste("R = ", round(cor(pcaTab$PC1, pcaTab$mapping_rate),2)), 
+         geom="text", size=6)
+
+p3 <- ggplot(pcaTab, aes(x=PC1, y=FSC.SSC, col=FSC.SSC)) +
+  geom_point() +
+  geom_smooth(method="glm") +
+  ggtitle("Correlation PC1 and viability") +
+    annotate(x=75, y=77, 
+         label=paste("R = ", round(cor(pcaTab$PC1, pcaTab$FSC.SSC),2)), 
+         geom="text", size=6)
+
+plot_grid(p1, p2, p3, ncol=3)
+```
+
+### PCA colored by interesting genetic features
+```{r, fig.width=10, fig.height=6}
+p1 <- ggplot(pcaTab, aes(x=PC1, y=PC2, col = IGHV)) + geom_point(size=2) + theme_bw() + 
+  xlab(sprintf("PC1 (%2.1f%%)",varExp[1])) + ylab(sprintf("PC2 (%2.1f%%)",varExp[2])) +
+  ggtitle("PCA colored by IGHV status")
+
+p2 <- ggplot(pcaTab, aes(x=PC1, y=PC2, col = Methylation)) + geom_point(size=2) + theme_bw() + 
+  xlab(sprintf("PC1 (%2.1f%%)",varExp[1])) + ylab(sprintf("PC2 (%2.1f%%)",varExp[2])) +
+  ggtitle("PCA colored by methylation cluster")
+
+p3 <- ggplot(pcaTab, aes(x=PC1, y=PC3, col = trisomy12)) + geom_point(size=2) + theme_bw() + 
+  xlab(sprintf("PC1 (%2.1f%%)",varExp[1])) + ylab(sprintf("PC3 (%2.1f%%)",varExp[3])) +
+  ggtitle("PCA colored by trisomy 12 status")
+
+p4 <- ggplot(pcaTab, aes(x=PC1, y=PC2, col = TP53)) + geom_point(size=2) + theme_bw() + 
+  xlab(sprintf("PC1 (%2.1f%%)",varExp[1])) + ylab(sprintf("PC2 (%2.1f%%)",varExp[2])) +
+  ggtitle("PCA colored by TP53 mutation")
+
+plot_grid(p1, p2, p3, p4, ncol=2)
+```
+
+
+## Correlation of PC1 before and after adjustment with scTransform
+```{r}
+ggplot(patAnno, aes(x=PC1before, y=PC1sc)) +
+  geom_point() +
+  geom_smooth(method="glm") +
+  ggtitle("Correlation between PC1 before and after scTransform") +
+    annotate(x=75, y=77, 
+         label=paste("R = ", round(cor(patAnno$PC1before, patAnno$PC1sc),2)), 
+         geom="text", size=6)
+```
+High correlation, but values of PC1 are more shrunken after applying scTransform. 
+
+
+# Differential expression using DESeq2
+
+Differential expression analysis of genomic data types uses linear models to determine the size and direction of the changes in gene expression.
+
+## Preparations of input data
+
+Keep only patients with Ibrutinib and Duvelisib samples
+```{r}
+allTreat <- c("Ibrutinib", "Duvelisib")
+
+patIDIbr <- unique(ddsAll.adj$patID[ddsAll.adj$treatment == "Ibrutinib"])
+patIDDuv <- unique(ddsAll.adj$patID[ddsAll.adj$treatment == "Duvelisib"])
+keepPat <- intersect(patIDIbr, patIDDuv)
+ddsTr <- ddsAll.adj[, ddsAll.adj$treatment %in% allTreat &
+                      ddsAll.adj$patID %in% keepPat]
+dim(ddsTr)
+```
+
+Add design to dds objects
+```{r}
+ddsTr$condi <- factor(ddsTr$treatment)
+ddsTr$condi <- factor(ddsTr$condi,
+                       levels = c("Ibrutinib",setdiff(levels(ddsTr$condi),c("Ibrutinib"))))
+#ddsTr$PC1sc <- factor(ddsTr$PC1sc)
+design(ddsTr) <- ~ PC1sc + condi
+```
+
+Extract design matrix
+```{r}
+patAnnosub <- data.frame(colData(ddsTr)) %>%
+  dplyr::select(PC1sc, condi)
+designMat <- model.matrix(~ 0 + PC1sc + condi, patAnnosub)
+```
+
+
+## Run DESeq2
+
+The DESeq function fits the raw counts to the negative binomial model. The final dds object contains all the information needed for performing DE testing between specific sample groups. New information such as shrunken dispersions, model coefficients, Wald test results, and gene-wise dispersions will be added to the dds object.
+```{r, eval=FALSE}
+DEres <- DESeq(ddsTr, parallel=TRUE)
+save(DEres, file = "./output/DEres_allbatches_STAR_patIDcondi_DuvvsIbr_PC1_scTransform_20220530.RData")
+```
+
+## Load results
+
+Get results
+```{r}
+load("./output/DEres_allbatches_STAR_patIDcondi_DuvvsIbr_PC1_scTransform_20220530.RData")
+```
+
+Omit any remaining gene rows, as these are typically genes with very small counts and little power
+```{r}
+DEresClean <- DEres[which(mcols(DEres)$betaConv),]
+```
+Furthermore, one could examine the counts for the rows that are not converging. Often, these genes have problematic distribution of counts, e.g. they contain outliers. If the rows do not represent DE genes, their p-values and adj p-values could be set to NA.
+
+Extract results names
+```{r}
+resultsNames(DEresClean)
+```
+
+Extract data frame before shrinkage of LFCs
+```{r}
+resTabc <- results(DEresClean, 
+                    name = "condi_Duvelisib_vs_Ibrutinib",
+                    tidy = TRUE)
+names(resTabc)[names(resTabc) == "row"] <- "Ensembl"
+names(resTabc)[names(resTabc) == "log2FoldChange"] <- "LFC"
+resTabc <- resTabc %>%
+  mutate(symbol = rowData(ddsDrug)[Ensembl,]$symbol,
+         chromosome = rowData(ddsDrug)[Ensembl,]$chromosome)
+resTabc <- resTabc[,c(1,8,9,2,3,4,5,6,7)]
+# almost one third of the genes has no adjusted p-value
+```
+
+### Log fold change shrinkage
+Shrinkage of effect size (LFC estimates) is useful for visualization and ranking of genes. 
+
+The results for each treatment are extracted with prior shrinkage of LFC values using the [apeglm estimator](https://academic.oup.com/bioinformatics/article/35/12/2084/5159452), which improves on the previous estimator.
+Before applying the lfcShrink function, we omit the rows which did not converge. 
+```{r, eval=FALSE}
+res <- lfcShrink(DEresClean, coef="condi_Duvelisib_vs_Ibrutinib",
+                 type="apeglm", parallel=TRUE)
+save(res, file = "./output/DEresShrink_allbatches_STAR_patIDcondi_DuvvsIbr_PC1_scTransform_20220530.RData")
+```
+
+Load data with shrunken LFCs
+```{r}
+load("./output/DEresShrink_allbatches_STAR_patIDcondi_DuvvsIbr_PC1_scTransform_20220530.RData")
+```
+
+Extract data frame
+```{r}
+resTab <- data.frame(res@listData) %>%
+      rownames_to_column(var = "Ensembl") %>%
+      mutate(symbol = rowData(ddsDrug)[Ensembl,]$symbol) %>%
+      mutate(chromosome = rowData(ddsDrug)[Ensembl,]$chromosome)
+names(resTab)[names(resTab) == "log2FoldChange"] <- "LFC"
+resTab <- resTab[,c(1,7,8,2,3,4,5,6)]
+```
+
+Save data frame as csv file
+```{r}
+write.csv(resTab, file="./output/Resdf_DuvvsIbr_PC1_STAR_scTransform_20220530.csv")
+save(resTab, file = "./output/Resdf_DuvvsIbr_PC1_STAR_scTransform_20220530.RData")
+```
+
+View data frame
+```{r}
+resTab %>%
+  dplyr::select(Ensembl, symbol, chromosome,
+                LFC, pvalue, padj) %>%
+  arrange(padj) %>%
+  mutate_if(is.numeric, formatC, digits=2) %>%
+  DT::datatable()
+```
+
+
+# Visualize DE results
+
+In this section we explore how well our data fit the model.
+
+## Dispersion of results before shrinkage
+```{r}
+plotDispEsts(DEresClean)
+```
+The dispersion estimate looks quite good. 
+
+### Distribution of LFCs
+
+The function plotMA shows the log2 fold changes attributable to a given variable over the mean of normalized counts for all the samples in the data set. Points will be colored red if the adjusted p value is less than 0.1. Points which fall out of the window are plotted as open triangles pointing either up or down.
+```{r}
+plotMA(DEres, ylim=c(-1.5,1.5), alpha=0.25,
+       main="Duvelisib vs Ibrutinib (before shrinkage)")
+abline(h=c(-1,1), col="dodgerblue", lwd=2)
+abline(h=c(-0.5,0.5), col="lightblue", lwd=2)
+```
+
+```{r}
+plotMA(res, ylim=c(-1.5,1.5), alpha=0.25,
+       cex=.8, main="Duvelisib vs Ibrutinib (after shrinkage)")
+abline(h=c(-1,1), col="dodgerblue", lwd=2)
+abline(h=c(-0.5,0.5), col="lightblue", lwd=2)
+```
+After shrinkage, most of the log-fold change values are around zero. Not many genes are differentially expressed in Duvelisib in comparison to Ibrutinib.
+
+## P-value histogram
+
+```{r, fig.width=10, fig.height=4}
+p1 <- ggplot(resTab, aes(x=pvalue)) +
+  geom_histogram(fill="lightblue", color="black", binwidth=0.025) +
+  geom_vline(xintercept=0.05,color="red",linetype="longdash") +
+  scale_x_continuous(breaks = seq(0,1,by=0.1)) +
+  ylab("# of genes") +
+  theme(plot.title = element_text(face="bold",hjust=0.5))
+
+p2 <- ggplot(resTab, aes(x=padj)) +
+  geom_histogram(fill="lightblue", color="black", binwidth=0.025) +
+  geom_vline(xintercept=0.05,color="red",linetype="longdash") +
+  scale_x_continuous(breaks = seq(0,1,by=0.1)) +
+  ylab("# of genes") +
+  theme(plot.title = element_text(face="bold",hjust=0.5))
+
+plot_grid(p1, p2, ncol=2)
+```
+The p-value histogram indicates that only a few genes have a small p-value. The larger the p-value, the more genes fall into the categories.
+
+## Number of significant DE genes 
+
+When looking at the p-value histograms, one would like to know how many genes pass a certain p-value cutoff. In the p-value histograms the cutoff is indicated at 0.05 (5% FDR). The barplots below answer the question, how many genes have a smaller adjusted p-value then 0.05, 0.1 and 0.25? 
+
+### Preparation
+
+Function for creating a df with significant up- or downregulated genes
+```{r}
+sig_genes_df <- function(fdr, lfc){
+  
+  # Create new df with number of sig. genes for each treatment
+  genes_df <- setNames(data.frame(matrix(ncol = 2, nrow = 0)),
+                         c("direction", "sig_genes"))
+  
+  # Extract upregulated genes
+  genes_up <- resTab %>%
+    filter(LFC >= lfc & padj < fdr) %>%
+    summarise(n=length(Ensembl)) %>% pull(n)
+  # Add new row to df
+  new_row <- c("up", genes_up)
+  genes_df[nrow(genes_df) + 1, ] <- new_row
+  
+  # Extract downregulated genes
+  genes_down <- resTab %>%
+    filter(LFC <= -lfc & padj < fdr) %>%
+    summarise(n=length(Ensembl)) %>% pull(n)
+  # Add new row to df
+  new_row <- c("down", genes_down)
+  genes_df[nrow(genes_df) + 1, ] <- new_row
+  
+  # Operations on columns of new df
+  genes_df$sig_genes <- as.numeric(genes_df$sig_genes)
+  genes_df$direction <- factor(genes_df$direction,
+                               levels = c("up", "down"))
+  return(genes_df)
+}
+```
+
+Function for plotting number of significant genes
+```{r}
+sigDEgenes <- function(df, title){
+  plot <- ggplot(df, aes(x=direction, y=sig_genes)) +
+    geom_bar(stat = "identity", color="black", fill="#0C3C9F") +
+    ylab("# significant DE genes") +
+    theme(axis.title.x = element_blank()) +
+    ggtitle(title) +
+    geom_text(aes(label=sig_genes),vjust=1.2,size=5, color="white")
+  return(plot)
+}
+```
+
+Create plots
+```{r,fig.height=9, fig.width=10}
+# 5% FDR
+df <- sig_genes_df(fdr=0.05, lfc=0)
+df_5F_0L <- sigDEgenes(df,"5% FDR with LFC = 0")
+
+# 10% FDR
+df <- sig_genes_df(fdr=0.1, lfc=0)
+df_10F_0L <- sigDEgenes(df,"10% FDR with LFC = 0")
+
+# 25% FDR
+df <- sig_genes_df(fdr=0.25, lfc=0)
+df_25F_0L <- sigDEgenes(df,"25% FDR with LFC = 0")
+
+# 5% FDR
+df <- sig_genes_df(fdr=0.05, lfc=0.05)
+df_5F_05L <- sigDEgenes(df,"5% FDR with LFC = 0.05")
+
+# 10% FDR
+df <- sig_genes_df(fdr=0.1, lfc=0.05)
+df_10F_05L <- sigDEgenes(df,"10% FDR with LFC = 0.05")
+
+# 25% FDR
+df <- sig_genes_df(fdr=0.25, lfc=0.05)
+df_25F_05L <- sigDEgenes(df,"25% FDR with LFC = 0.05")
+
+# 5% FDR
+df <- sig_genes_df(fdr=0.05, lfc=0.2)
+df_5F_2L <- sigDEgenes(df,"5% FDR with LFC = 0.2")
+
+# 10% FDR
+df <- sig_genes_df(fdr=0.1, lfc=0.2)
+df_10F_2L <- sigDEgenes(df,"10% FDR with LFC = 0.2")
+
+# 25% FDR
+df <- sig_genes_df(fdr=0.25, lfc=0.2)
+df_25F_2L <- sigDEgenes(df,"25% FDR with LFC = 0.2")
+
+# 5% FDR
+df <- sig_genes_df(fdr=0.05, lfc=0.5)
+df_5F_5L <- sigDEgenes(df,"5% FDR with LFC = 0.5")
+
+# 10% FDR
+df <- sig_genes_df(fdr=0.1, lfc=0.5)
+df_10F_5L <- sigDEgenes(df,"10% FDR with LFC = 0.5")
+
+# 25% FDR
+df <- sig_genes_df(fdr=0.25, lfc=0.5)
+df_25F_5L <- sigDEgenes(df,"25% FDR with LFC = 0.5")
+
+plot_grid(df_5F_0L, df_10F_0L, df_25F_0L, df_5F_05L,
+          df_10F_05L, df_25F_05L, df_5F_2L, df_10F_2L,
+          df_25F_2L, df_5F_5L, df_10F_5L, df_25F_5L, ncol=3)
+```
+
+## Volcano plot
+
+Remove genes with non-calculated adjusted p-values
+```{r}
+resTabna <- resTab[!is.na(resTab$padj),]
+resTabnac <- resTabc[!is.na(resTabc$padj),]
+```
+
+Show volcano plot
+```{r, fig.height=7, fig.width=12}
+create_volcano <- function(df, title){
+  plot <- ggplot(df, aes(x=LFC, y=-log10(padj))) +
+    geom_vline(xintercept = 0, color="black", linetype="solid", size=0.25) +
+    geom_vline(xintercept = 0.5, color="darkgrey", linetype="dashed") +
+    geom_vline(xintercept =-0.5, color="darkgrey", linetype="dashed") +
+    geom_hline(yintercept = -log10(0.05), color="darkgrey", linetype="dashed") +
+    annotate(x=-2.1, y=1.5, label=paste("p-adjusted = ", 0.05), geom="text", size=3, color="darkgrey") +
+    geom_hline(yintercept = -log10(0.25), color="darkgrey", linetype="dashed") +
+    annotate(x=-2.1, y=0.8, label=paste("p-adjusted = ", 0.25), geom="text", size=3, color="darkgrey") +
+    geom_point(data=df[df$LFC >= 0 & df$padj <= 0.25,],
+              color="firebrick3", size=0.9) +
+    geom_point(data=df[df$LFC <= 0 & df$padj <= 0.25,],
+              color="navy", size=0.9) +
+    geom_point(data=df[df$padj >= 0.25,], color="darkgrey", size=0.9) +
+    ggrepel::geom_label_repel(data=df[df$LFC > 0 & df$padj <= 0.1,],
+                              aes(label=symbol), color="firebrick3", size=2,
+                              max.overlaps=15) +
+    ggrepel::geom_label_repel(data=df[df$LFC < 0 & df$padj <= 0.05,],
+                              aes(label=symbol), color="navy", size=2,
+                              max.overlaps=15) +
+    ggtitle(title) +
+    theme(plot.title = element_text(hjust=0.5, face="bold"))
+  return(plot)
+}
+
+v1 <- create_volcano(resTabnac, "Before LFC shrinkage")
+v2 <- create_volcano(resTabna, "After LFC shrinkage")
+plot_grid(v1, v2, ncol=2)
+```
+
+# Pathway Enrichment Analysis
+
+For the pathway enrichment analysis the genes considered as differentially expressed between Duvelisib and Ibrutinib with an adjusted p-value below 0.25 (25% FDR) and a log-fold change larger than 0.05 are used as input. These criteria were chosen based on the plots above. Being more strict leads to a list of DE genes which might be to short for finding gene sets. 
+```{r}
+padjusted <- 0.25
+lfc <- 0.05
+
+# Filter data frame
+gene_list_df <- resTab %>%
+  dplyr::filter(padj <= padjusted,
+         LFC > lfc | LFC < -lfc) %>%
+  dplyr::select(Ensembl, symbol, padj)
+gene_list_df$treatment <- "Duvelisib"
+
+# Number of genes used for pathway enrichment
+n_genes <- pull(gene_list_df, Ensembl)
+length(n_genes)
+```
+
+## clusterProfiler
+clusterProfiler is a universal enrichment tool for interpreting omics data and supports several ontology and pathway annotations.
+[ClusterProfiler 4.0](https://doi.org/10.1016/j.xinn.2021.100141) was expanded for conducting biological theme comparison. 
+The provided function "compareCluster" calculates enriched functional profiles of each gene cluster and aggregates the results into a single object. Therefore, we can analyze the effects of all treatments at once. The disadvantage of "compareCluster" is that it can only perform over-representation analyses and not gene set enrichment analyses.
+
+Perpare gene lists as data frames
+```{r prepare-cP}
+# Convert Ensembl IDs to Entrez IDs
+EntrezID = mapIds(org.Hs.eg.db,
+                  keys=gene_list_df$Ensembl,
+                  column="ENTREZID",
+                  keytype="ENSEMBL",
+                  multiVals="first")
+
+# Add EntredID column to df
+cluster_df <- add_column(gene_list_df, EntrezID, .before = "symbol")
+cluster_df <- cluster_df[!is.na(cluster_df$EntrezID),]
+```
+
+### ORA with “compareCluster” function and GO pathways
+
+In this analysis we use pathways from gene ontology.
+```{r}
+clusterResGO <- compareCluster(EntrezID~treatment, data=cluster_df, fun="enrichGO",
+                               OrgDb=org.Hs.eg.db, pvalueCutoff=0.25, pAdjustMethod="BH")
+```
+
+Each column in the dotplot represents an enrichment result of a treatment. For every treatment the five most significant pathways are depicted. To make the comparison among different clusters more informative, also not significant pathways are displayed if they are under the top five of any other treatment. The color gradient based on p-values may indicate which categories are more likely to have biological meanings. The size of the dots refers to the number of genes considered as significant within a pathway.
+```{r, fig.height=5, fig.width=6}
+dotplot(clusterResGO, showCategory=10, size="Count")
+```
+
+### ORA with “compareCluster” function and Reactome pathways
+
+In this analysis we use pathways from Reactome, an open-source, manually curated and peer-reviewed pathway database.
+```{r}
+library(ReactomePA)
+clusterResReactome <- compareCluster(EntrezID~treatment, data=cluster_df,
+                                     fun="enrichPathway", pvalueCutoff=0.25, pAdjustMethod="BH")
+```
+
+Dotplot
+```{r, fig.height=7, fig.width=6}
+dotplot(clusterResReactome, showCategory=10, size="Count")
+```
+
+
+### GSEA with "gseKEGG" function
+If we want to conduct a gene set enrichment analysis (GSEA) instead of an over-representation analysis, we have to use the "gseKEGG" function.
+
+Prepare gene list
+```{r}
+# Extract sorted gene list
+cluster_dforder <- cluster_df[order(cluster_df$padj, decreasing=TRUE),]
+geneList <- cluster_dforder$padj
+names(geneList) <- cluster_dforder$EntrezID
+```
+
+#### KEGG pathways
+
+Run gseKEGG function
+```{r}
+gseKEGG_res <- gseKEGG(geneList=geneList, organism="hsa",
+                       pvalueCutoff=0.9, pAdjustMethod="BH",
+                       scoreType="pos", keyType="kegg")
+```
+
+Dotplot
+```{r}
+dotplot(gseKEGG_res, showCategory=10, size="Count")
+```
+
+## camera
+
+This method was proposed by Wu and Smyth in 2012. [camera](https://www.rdocumentation.org/packages/limma/versions/3.28.14/topics/camera) performs a competitive test in the sense defined by [Goeman and Buhlmann](https://doi.org/10.1093/bioinformatics/btm051). It tests whether the genes in the set are highly ranked in terms of differential expression relative to genes not in the set and thereby accounts for inter-gene correlation. As input camera only needs a count matrix and a design matrix. No prior differential expression (DE) is required, as camera performs a DE internally. Again, we can perform a gene set enrichment analysis for every drug treatment individually.
+
+### Preparations
+First, we have to prepare the gene lists and create the design matrix.
+```{r prepare-camera}
+gmt_KEGG <- read.gmt("data/c2.cp.kegg.v7.4.symbols.gmt.txt")
+gmt_Hallmark <- read.gmt("data/h.all.v7.4.symbols.gmt.txt")
+
+#Function for converting gene name data frame into list
+geneList <- function(source) {
+  pathwayNames <- levels(source$term)
+  newList<- vector("list")
+
+  for (pathway in pathwayNames) {
+    genes <- source$gene[source$term == pathway]
+    newList[[length(newList) + 1]] <- genes 
+  }
+  names(newList) <- pathwayNames
+  return(newList)
+}
+
+geneList_KEGG <- geneList(gmt_KEGG)
+geneList_Hallmark <- geneList(gmt_Hallmark)
+```
+
+Function for converting Ensembl IDs to gene symbols
+```{r}
+convertIDs <- function(counts_df){
+
+  # Convert Ensembl IDs to Entrez IDs
+  entrezID = mapIds(org.Hs.eg.db,
+                    keys=row.names(counts_df),
+                    column="ENTREZID",
+                    keytype="ENSEMBL",
+                    multiVals="first")
+
+  # Convert Entrez IDs to gene symbols
+  gene_symbols <- getSYMBOL(na.omit(as.vector(entrezID)),
+                            data="org.Hs.eg.db")
+
+  # Create new df with gene symbols as row names
+  counts_df_symbols <- add_column(counts_df, entrezID) %>%
+    drop_na(entrezID) %>% add_column(gene_symbols) %>%
+    dplyr::select(-entrezID) %>% drop_na(gene_symbols) %>%
+    distinct(gene_symbols, .keep_all = TRUE) %>%
+    remove_rownames %>% column_to_rownames(var="gene_symbols")
+  
+  return(counts_df_symbols)
+}
+```
+
+```{r}
+# Extract normalized counts
+ddsTr.vst <- vst(ddsTr)
+countMatTr.vst <- assay(ddsTr.vst)
+counts_dfTr.vst <- as.data.frame(assay(ddsTr.vst))
+
+# Create counts_df with gene symbols
+counts_dfTr.symb <- convertIDs(counts_dfTr.vst)
+```
+
+### Run camera
+
+```{r}
+# Run camera function with KEGG pathways
+cameraRes_KEGG <- limma::camera(counts_dfTr.symb, geneList_KEGG,
+                           designMat, inter.gene.cor=0.01)
+cameraRes_KEGG <- rownames_to_column(cameraRes_KEGG,var="Pathway")
+
+# Run camera function with Hallmark pathways
+cameraRes_Hall <- limma::camera(counts_dfTr.symb, geneList_Hallmark,
+                          designMat, inter.gene.cor=0.01)
+cameraRes_Hall <- rownames_to_column(cameraRes_Hall,var="Pathway")
+```
+
+### Show results
+
+Plot most important pathways for Duvelisib in comparison to Ibrutinib
+```{r, fig.height=6, fig.width=15}
+# Add information about total number of genes in pathways to calculate gene ratio
+#cameraRes_kegg <- mapply(cbind, cameraRes_kegg, "TGenes"=lengths(geneList_kegg))
+
+c1 <- cameraRes_KEGG[head(order(cameraRes_KEGG$FDR), 10), ] %>%
+  ggplot(aes(x=Direction, y=reorder(Pathway, -FDR),
+             group=Direction, col=FDR)) +
+  geom_point(size=5) +
+  ggtitle("KEGG pathways") +
+  theme(axis.title=element_blank(),
+        axis.text=element_text(face="bold")) +
+  scale_colour_gradientn(colours=c("#FF0000", "#E90F97", "#0858FB"))
+
+c2 <- cameraRes_Hall[head(order(cameraRes_Hall$FDR), 10), ] %>%
+  ggplot(aes(x=Direction, y=reorder(Pathway, -FDR),
+             group=Direction, col=FDR)) +
+  geom_point(size=5) +
+  ggtitle("Hallmark pathways") +
+  theme(axis.title=element_blank(),
+        axis.text=element_text(face="bold")) +
+  scale_colour_gradientn(colours=c("#FF0000", "#E90F97", "#0858FB"))
+
+plot_grid(c1, c2, ncol=2)
+```
+
+# Boxplots of most interesting genes
+
+From the top 10 pathways, we extract the genes considered as differentially expressed between Duvelisib and Ibrutinib. 
+To exclude genes for which more than 50% of the samples have an expression of 0 counts, we filter the median counts. Only genes with a median count larger than 0 in the samples treated with Duvelisib pass this criterion. 
+Boxplots are used to vizualize wether a gene is downregulated in all Duvelisib samples compared to Ibrutinib. 
+
+## Create mapping data frame for Ensembl IDs to symbols
+```{r}
+ddsAll.adj <- ddsAll.adjvst
+
+nrow(ddsAll.adj)
+df_geneIDs <- as.data.frame(rownames(assay(ddsAll.adj)))
+colnames(df_geneIDs) <- "Ensembl"
+df_geneIDs <- df_geneIDs %>%
+  mutate(symbol = rowData(ddsDrug)[Ensembl,]$symbol)
+
+# check for any duplicated gene symbols
+duplicate_symbols <- which(duplicated(df_geneIDs$symbol))
+df_geneIDs[rownames(df_geneIDs) == duplicate_symbols,]$symbol
+
+# gene ZNF385C is the only gene which appears two times in symbol column
+# The duplicated row will be removed 
+df_geneIDs <- df_geneIDs[-c(duplicate_symbols), ]
+#ddsAll.adj <- ddsAll.adj[rowData(ddsAll.adj)$symbol != "ZNF385C",]
+ddsAll.adj <- ddsAll.adj[!duplicated(rowData(ddsAll.adj)$symbol),]
+
+nrow(ddsAll.adj)
+```
+
+As we are also interested in the IGHV status, we remove all patients with undefined IGHV status
+```{r}
+ncol(ddsAll.adj)
+ddsAll.adj <- ddsAll.adj[,!is.na(ddsAll.adj$IGHV)]
+ncol(ddsAll.adj)
+```
+
+
+## Extract counts matrices for DMSO, Ibrutinib, Duvelisib
+Keep only genes with median counts > 0
+```{r}
+# Retrieve patients with samples for DMSO, Ibrutinib and Duvelisib
+patIDDMSO <- unique(ddsAll.adj$patID[ddsAll.adj$treatment == "DMSO"])
+patIDIbr <- unique(ddsAll.adj$patID[ddsAll.adj$treatment == "Ibrutinib"])
+patIDDuv <- unique(ddsAll.adj$patID[ddsAll.adj$treatment == "Duvelisib"])
+patIDall <- intersect(patIDDMSO, intersect(patIDIbr, patIDDuv))
+
+# Extract dds objects containing only DMSO, Ibrutinib or Duvelisib samples
+ddsDMSO <- ddsAll.adj[, ddsAll.adj$treatment == "DMSO" &
+                        ddsAll.adj$patID %in% patIDall]
+ddsIbr <- ddsAll.adj[, ddsAll.adj$treatment == "Ibrutinib" &
+                       ddsAll.adj$patID %in% patIDall]
+ddsDuv <- ddsAll.adj[, ddsAll.adj$treatment == "Duvelisib" &
+                       ddsAll.adj$patID %in% patIDall]
+
+# U-CLL
+ddsDMSO_U <- ddsDMSO[,ddsDMSO$IGHV == 0]
+counts_dfDMSO_U <- as.data.frame(assay(ddsDMSO_U))
+colnames(counts_dfDMSO_U) <- ddsDMSO_U$patID
+rownames(counts_dfDMSO_U) <- df_geneIDs$symbol
+counts_dfDMSO_U$row_median <- matrixStats::rowMedians(as.matrix(counts_dfDMSO_U))
+counts_dfDMSO_U <- counts_dfDMSO_U[counts_dfDMSO_U$row_median > 0,]
+
+ddsIbr_U <- ddsIbr[,ddsIbr$IGHV == 0]
+counts_dfIbr_U <- as.data.frame(assay(ddsIbr_U))
+colnames(counts_dfIbr_U) <- ddsIbr_U$patID
+rownames(counts_dfIbr_U) <- df_geneIDs$symbol
+counts_dfIbr_U$row_median <- matrixStats::rowMedians(as.matrix(counts_dfIbr_U))
+counts_dfIbr_U <- counts_dfIbr_U[counts_dfIbr_U$row_median > 0,]
+
+ddsDuv_U <- ddsDuv[,ddsDuv$IGHV == 0]
+counts_dfDuv_U <- as.data.frame(assay(ddsDuv_U))
+colnames(counts_dfDuv_U) <- ddsDuv_U$patID
+rownames(counts_dfDuv_U) <- df_geneIDs$symbol
+counts_dfDuv_U$row_median <- matrixStats::rowMedians(as.matrix(counts_dfDuv_U))
+counts_dfDuv_U <- counts_dfDuv_U[counts_dfDuv_U$row_median > 0,]
+
+# M-CLL
+ddsDMSO_M <- ddsDMSO[,ddsDMSO$IGHV == 1]
+counts_dfDMSO_M <- as.data.frame(assay(ddsDMSO_M))
+colnames(counts_dfDMSO_M) <- ddsDMSO_M$patID
+rownames(counts_dfDMSO_M) <- df_geneIDs$symbol
+counts_dfDMSO_M$row_median <- matrixStats::rowMedians(as.matrix(counts_dfDMSO_M))
+counts_dfDMSO_M <- counts_dfDMSO_M[counts_dfDMSO_M$row_median > 0,]
+
+ddsIbr_M <- ddsIbr[,ddsIbr$IGHV == 1]
+counts_dfIbr_M <- as.data.frame(assay(ddsIbr_M))
+colnames(counts_dfIbr_M) <- ddsIbr_M$patID
+rownames(counts_dfIbr_M) <- df_geneIDs$symbol
+counts_dfIbr_M$row_median <- matrixStats::rowMedians(as.matrix(counts_dfIbr_M))
+counts_dfIbr_M <- counts_dfIbr_M[counts_dfIbr_M$row_median > 0,]
+
+ddsDuv_M <- ddsDuv[,ddsDuv$IGHV == 1]
+counts_dfDuv_M <- as.data.frame(assay(ddsDuv_M))
+colnames(counts_dfDuv_M) <- ddsDuv_M$patID
+rownames(counts_dfDuv_M) <- df_geneIDs$symbol
+counts_dfDuv_M$row_median <- matrixStats::rowMedians(as.matrix(counts_dfDuv_M))
+counts_dfDuv_M <- counts_dfDuv_M[counts_dfDuv_M$row_median > 0,]
+```
+
+
+## Extract DE genes from pathways of interest
+Reactome pathways
+```{r}
+pathway_df_Reactome <- as.data.frame(clusterResReactome@compareClusterResult)
+
+# Extract DE genes from top 10 pathways as gene symbol
+gene_list_pathways <- lapply(seq_len(10), function(row) {
+  
+  # Extract Entrez IDs of all DE genes in one pathway
+  genes_all <- pathway_df_Reactome$geneID[row]
+
+  # Split strings
+  genes <- unlist(strsplit(genes_all, "\\/"))
+  
+  # Map EntrezIDs to gene symbols (use input df for clusterProfiler)
+  genes_symb <- cluster_df[cluster_df$EntrezID %in% genes,]$symbol
+})
+
+# Extract names of top 10 pathways
+gene_names_pathways <- lapply(seq_len(10), function(row) {
+  name <- pathway_df_Reactome$Description[row]
+})
+pathway_names <- unlist(gene_names_pathways)
+
+# Add pathway names to gene lists
+names(gene_list_pathways) <- pathway_names
+
+
+# Example
+#genes_all <- pathway_df_Reactome[pathway_df_Reactome$Description == "Interferon Signaling",]$geneID
+#genes_Duv <- genes_all[1]
+#genes_Ibr <- genes_all[2]
+
+# Split string and map EntrezIDs to gene symbols
+#genes_Duv_vec <- unlist(strsplit(genes_Duv, "\\/"))
+#genes_Duv_symb <- cluster_df_u[cluster_df_u$EntrezID_u %in% genes_Duv_vec &
+#  cluster_df_u$treatment == "Duvelisib_IGHVu",]$symbol
+#genes_Ibr_vec <- unlist(strsplit(genes_Ibr, "\\/"))
+#genes_Ibr_symb <- cluster_df_u[cluster_df_u$EntrezID_u %in% genes_Ibr_vec &
+#  cluster_df_u$treatment == "Ibrutinib_IGHVu",]$symbol
+
+# Combine DE genes from Ibr and Duv
+#genes <- intersect(genes_Duv_symb, genes_Ibr_symb)
+```
+
+
+## Create boxplots
+
+Function to create new data frame for each gene which is then used for boxplot
+```{r}
+create_boxplotU <- function(gene){
+  
+  # U-CLL
+  exprMat.DMSO <- counts_dfDMSO_U[rownames(counts_dfDMSO_U) == gene,]
+  exprMat.Ibr <- counts_dfIbr_U[rownames(counts_dfIbr_U) == gene,]
+  exprMat.Duv <- counts_dfDuv_U[rownames(counts_dfDuv_U) == gene,]
+  patID1 <- colnames(counts_dfDMSO_U)
+  patID2 <- colnames(counts_dfIbr_U)
+  patID3 <- colnames(counts_dfDuv_U)
+  trDMSO <- rep("DMSO",times=length(exprMat.DMSO))
+  trIbr <- rep("Ibrutinib",times=length(exprMat.Ibr))
+  trDuv <- rep("Duvelisib",times=length(exprMat.Duv))
+
+  plotTab_U <- tibble(expression = c(exprMat.DMSO, exprMat.Ibr, exprMat.Duv),
+                      treatment = c(trDMSO, trIbr, trDuv),
+                      patID = c(patID1, patID2, patID3))
+  plotTab_U$expression <- as.numeric(plotTab_U$expression)
+  return(plotTab_U)
+}
+
+create_boxplotM <- function(gene){
+
+  # M-CLL
+  exprMat.DMSO <- counts_dfDMSO_M[rownames(counts_dfDMSO_M) == gene,]
+  exprMat.Ibr <- counts_dfIbr_M[rownames(counts_dfIbr_M) == gene,]
+  exprMat.Duv <- counts_dfDuv_M[rownames(counts_dfDuv_M) == gene,]
+  patID1 <- colnames(counts_dfDMSO_M)
+  patID2 <- colnames(counts_dfIbr_M)
+  patID3 <- colnames(counts_dfDuv_M)
+  trDMSO <- rep("DMSO",times=length(exprMat.DMSO))
+  trIbr <- rep("Ibrutinib",times=length(exprMat.Ibr))
+  trDuv <- rep("Duvelisib",times=length(exprMat.Duv))
+
+  plotTab_M <- tibble(expression = c(exprMat.DMSO, exprMat.Ibr, exprMat.Duv),
+                      treatment = c(trDMSO, trIbr, trDuv),
+                      patID = c(patID1, patID2, patID3))
+  plotTab_M$expression <- as.numeric(plotTab_M$expression)
+  return(plotTab_M)
+}
+```
+
+Function for boxplots
+```{r}
+colors_drugs <- c(DMSO_U="#FCB500", Duvelisib_U="#00D6D6", Ibrutinib_U="#DE02DE",
+                  DMSO_M="#BD8300", Duvelisib_M="#0C8989", Ibrutinib_M="#6E006E")
+
+drugs_order <- c("DMSO_U", "Duvelisib_U", "Ibrutinib_U",
+                   "DMSO_M", "Duvelisib_M", "Ibrutinib_M")
+
+plot_boxplot <- function(gene, plotTabU, plotTabM){
+  
+  tabU <- plotTabU[plotTabU$patID != "row_median",]
+  tabM <- plotTabM[plotTabM$patID != "row_median",]
+
+  # Add U or M to distinguish the data frames
+  tabU$treatment <- paste(tabU$treatment, "_U", sep="")
+  tabM$treatment <- paste(tabM$treatment, "_M", sep="")
+  tabM$patID <- paste(tabM$patID, "_M", sep="")
+
+  # Combine both data frames
+  tabAll <- rbind(tabU, tabM)
+
+  # Reorder treatments
+  tabAll <- within(tabAll, treatment <- 
+                     factor(treatment,levels=drugs_order))
+
+  plot <- ggplot(tabAll, aes(x=treatment, y=expression, fill=treatment)) +
+    geom_boxplot() +
+    geom_line(aes(group=patID), position=position_dodge(0.2),
+              linetype="dotted", col="grey50") +
+    geom_point(aes(fill=treatment, group=patID), size=2,
+               shape=21, position=position_dodge(0.2)) +
+    ylab("norm. expression") +
+    theme(legend.position = "none", axis.title.x=element_blank()) +
+    ggtitle(paste(gene, "expression differences", sep=" ")) +
+    scale_fill_manual(values=colors_drugs)
+
+  return(plot)
+}
+```
+
+Test with one gene
+```{r}
+plotTab_U <- create_boxplotU("JAK2")
+plotTab_M <- create_boxplotM("JAK2")
+plot_boxplot("JAK2", plotTab_U, plotTab_M)
+```
+
+In the boxplots we can visualize the differences between U-CLL and M-CLL, but also between DMSO, Ibrutinib and Duvelisib. 
+```{r, eval=FALSE}
+
+# Somehow saving during a loop does not work 
+# (the PDF files are created correctly, e.g. 386kb, but then at the end of the loop deleted to a file with 4kb)
+
+for(n in seq_len(10)){
+  
+  # Create one plot including six boxplots per gene
+  plot_list <- lapply(gene_list_pathways[[n]], function(gene) {
+    if(gene %in% rownames(counts_dfDMSO_U)){
+      plotTab_U <- create_boxplotU(gene)
+      plotTab_M <- create_boxplotM(gene)
+      plot <- plot_boxplot(gene, plotTab_U, plotTab_M)
+    }
+  })
+
+  # Generate characteristics for pdf file
+  pathway <- names(gene_list_pathways)[n]
+  pathway_save <- str_replace_all(pathway,"[-/ ]","_")
+  pathway_save <- str_replace(pathway_save,"&","and")
+  height <- 3.8 * ceiling(lengths(gene_list_pathways)[n] / 2)
+
+  # Save all plots for one pathway in one PDF
+  pdf(file=sprintf("./output/boxplots_%s.pdf", pathway_save),
+      title=pathway, width=13, height=height)
+  plot_grid(plotlist=plot_list, ncol=2)
+  dev.off()
+}
+```
+
+# Heatmap
+
+For this heatmap the most distinct genes between Ibrutinib and Duvelisib are used. These are the genes considered as differentially expressed between Duvelisib and Ibrutinib with an adjusted p-value below 0.25 (25% FDR) and a log-fold change larger than 0.05 are used as input.
+
+```{r}
+ddsTr.adj <- ddsAll.adjvst[, ddsAll.adjvst$treatment %in% allTreat &
+                            ddsAll.adjvst$patID %in% keepPat]
+patAnnosub <- as.data.frame(colData(ddsTr.adj))
+```
+
+Preparations for heatmap annotations
+```{r}
+# Define annotations
+annoCol <- patAnnosub %>%
+  dplyr::select(patID, trisomy12, IGHV, TP53, FSC.SSC, treatment)
+annoCol$trisomy12 <- as.character(annoCol$trisomy12)
+annoCol$TP53 <- as.character(annoCol$TP53)
+annoCol$IGHV <- as.character(annoCol$IGHV)
+annoCol$trisomy12[annoCol$trisomy12 == 0] <- "wt"
+annoCol$trisomy12[annoCol$trisomy12 == 1] <- "m"
+annoCol$TP53[annoCol$TP53 == 0] <- "wt"
+annoCol$TP53[annoCol$TP53 == 1] <- "m"
+annoCol$IGHV[annoCol$IGHV == 0] <- "U"
+annoCol$IGHV[annoCol$IGHV == 1] <- "M"
+
+# Define annotation colors
+color_anno = list(
+  treatment = c(Duvelisib="#4A72A6", Ibrutinib="#C70000"),
+  #batch = c(pilot="#F8F417", batch1="#B5E222", batch2="#76EE3D", batch3="#07D256", batch4="#0A9C43"),
+  IGHV = c(U="#ECB3EE", M="#A201B5"),
+  TP53 = c(wt="#D5B97B", m="#B07900"),
+  trisomy12 = c(wt="#7BF6F5", m="#08B8B7"))
+
+# Define fill colors
+color_fill <- colorRampPalette( rev(brewer.pal(9,"RdBu")) )(255)
+```
+
+## Before patient adjustment
+
+Extract and subset normalized expression matrix
+```{r}
+exprMat <- assay(ddsTr.adj)
+exprMatsub <- exprMat[rownames(exprMat) %in% n_genes,]
+
+# Use gene symbols instead of Ensembl IDs
+gene_conv <- as.data.frame(rownames(exprMatsub))
+colnames(gene_conv) <- "Ensembl"
+gene_conv$symbol <- cluster_df[match(gene_conv$Ensembl, cluster_df$Ensembl),]$symbol
+
+rownames(exprMatsub) <- gene_conv$symbol
+```
+
+Show heatmap colored with normalized counts
+```{r, fig.width=11, fig.height=8}
+exprMatsub <- jyluMisc::mscale(exprMatsub, censor=2)
+
+pheatmap(exprMatsub, color = color_fill, annotation_col = annoCol,
+         annotation_colors = color_anno, clustering_method = "ward.D2", fontsize=12,
+         labels_col = paste0(patAnnosub[colnames(exprMatsub),]$patID,"_",
+                             patAnnosub[colnames(exprMatsub),]$treatment),
+         show_rownames=T, fontsize_row=4, show_colnames=T, fontsize_col=3,
+         main = "Heatmap of top DE genes Duv vs Ibr (without patient correction)")
+```
+
+## After patient adjustment
+
+Extract and subset normalized expression matrix
+```{r}
+# Remove patient effect
+exprMat <- limma::removeBatchEffect(assay(ddsTr.adj), batch=factor(ddsTr.adj$patID))
+exprMatsub <- exprMat[rownames(exprMat) %in% n_genes,]
+rownames(exprMatsub) <- gene_conv$symbol
+```
+
+Show heatmap colored with normalized counts
+```{r, fig.width=11, fig.height=8}
+exprMatsub <- jyluMisc::mscale(exprMatsub, censor=2)
+
+pheatmap(exprMatsub, color = color_fill, annotation_col = annoCol,
+         annotation_colors = color_anno, clustering_method = "ward.D2", fontsize=12,
+         labels_col = paste0(patAnnosub[colnames(exprMatsub),]$patID,"_",
+                             patAnnosub[colnames(exprMatsub),]$treatment),
+         show_rownames=T, fontsize_row=4, show_colnames=T, fontsize_col=3,
+         main = "Heatmap of top DE genes Duv vs Ibr (after patient correction)")
+```
+After adjusting the patient effect, the columns cluster automatically by treatment (Duvelisib and Ibrutinib).
+The outlier columns belong  to samples from the patients P0066, P0679, P0645, and P0030. 
+
+# Session Info Details
+```{r, echo=FALSE, eval=TRUE}
+sessionInfo()
+```

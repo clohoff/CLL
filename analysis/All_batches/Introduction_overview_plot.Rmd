@@ -1,0 +1,236 @@
+---
+title: "Plot for patient overview (mutations)"
+author: "Caroline Lohoff"
+date: "June 6 2022"
+output:
+  BiocStyle::html_document:
+    toc_float: true
+---
+
+# Description
+The aim of this script is to generate a plot which presents an overview of the patients from which samples were extretced and used for the CLL data set.
+This plots contains information about the mutations and clinical background of the patients.
+
+# Load libraries and data sets
+
+Set global options
+```{r setup, include=FALSE, cache = FALSE}
+knitr::opts_knit$set(root.dir = "~/Documents/R/drugseq_test")
+knitr::opts_chunk$set(warning = FALSE, message = FALSE)
+```
+
+Load libraries
+```{r load-libs}
+suppressPackageStartupMessages({
+  library(tidyverse)
+  library(DESeq2)
+  library(pheatmap)
+  library(RColorBrewer)
+})
+```
+
+Set global ggplot variables
+```{r set-ggplot}
+theme_set(theme_bw() + theme(axis.text = element_text(size=12), 
+                             axis.title = element_text(size=14),
+                             legend.title = element_text(size=14),
+                             legend.text = element_text(size=12),
+                             plot.title = element_text(size=16,
+                                                       hjust=0.5,face="bold")))
+```
+
+
+# Load data and add annotations
+
+Load datasets
+```{r}
+# Load meta data including genotyping info
+load("./data/patmeta_210324.RData")
+patMeta$pretreated <- patMeta$treatment
+
+# Load survival data
+load("./data/survival_190516.RData")
+names(survT)[names(survT) == "treatment"] <- "treatment_bin"
+
+# Load dds data set containing 1106 samples and count matrix
+load("./output/ddsDrug_htseq_batchPilot1c234_20220426.RData")
+
+# Add columns to DESeq object from survival data
+sur_vec <- c("sampleDate", "LKA", "OS", "died", "diagDate", "TFT", "TTT",
+             "treatment_bin", "firstTreatDate", "lastKnownUntreated", "treatedAfter")
+ddsDrug@colData@listData <- lapply(sur_vec, function(n) {
+  ddsDrug[[n]] <- survT[match(ddsDrug$sampleID, survT$sampleID), n]
+}) %>% bind_cols() %>% sjmisc::add_columns(ddsDrug@colData@listData)
+
+# Add columns to DESeq object from patient meta data
+col_vec <- c("diagnosis", "gender", "pretreated", "Methylation_Cluster", "trisomy12", "NOTCH1", "TP53",
+             "ATM", "FBXW7", "MED12", "BRAF", "SF3B1", "del11q", "del17p", "del13q", "del8p", "gain2p",
+             "gain8q", "del6q", "gain3q", "del9p", "del15q", "del6p", "MYD88", "KRAS", "EGR2", "XPO1")
+ddsDrug@colData@listData <- lapply(col_vec, function(n) {
+  ddsDrug[[n]] <- patMeta[match(ddsDrug$patID, patMeta$Patient.ID), n]
+}) %>% bind_cols() %>% sjmisc::add_columns(ddsDrug@colData@listData)
+
+names(ddsDrug@colData@listData)[names(ddsDrug@colData@listData) == "Methylation_Cluster"] <- "Methylation"
+ddsDrug$IGHVpat <- patMeta[match(ddsDrug$patID, patMeta$Patient.ID),]$IGHV.status
+ddsDrug$IGHV <- ifelse(is.na(ddsDrug$IGHV), ddsDrug$IGHVpat, ddsDrug$IGHV)
+ddsDrug$IGHVpat <- NULL
+ddsDrug$IGHV[ddsDrug$batch == "pilot" & ddsDrug$patID %in% c("PID1095", "PID1222")] <- "U"
+ddsDrug$IGHV[ddsDrug$batch == "pilot" & ddsDrug$patID %in% c("PID1177", "PID1210")] <- "M"
+ddsDrug$IGHV[ddsDrug$IGHV == "U"] <- 0
+ddsDrug$IGHV[ddsDrug$IGHV == "M"] <- 1
+
+# Add meta data to the samples from the pilot batch
+ddsDrug$diagnosis[ddsDrug$batch == "pilot"] <- "CLL" 
+ddsDrug$trisomy12[ddsDrug$batch == "pilot"] <- 0
+ddsDrug$gender[ddsDrug$batch == "pilot" & ddsDrug$patID %in% c("PID1095", "PID1222")] <- "f"
+ddsDrug$gender[ddsDrug$batch == "pilot" & ddsDrug$patID %in% c("PID1177", "PID1210")] <- "m"
+
+# Add age of patients on day of sample extraction
+ddsDrug$age <- ageTab[match(ddsDrug$sampleID, ageTab$sampleID),]$age
+
+# Remove replicates
+ddsDrug <- ddsDrug[ ,ddsDrug$Replicate == 1]
+
+# Retrieve patient annotations from dds object as data frame
+patAnno <- colData(ddsDrug) %>% as_tibble()
+
+dim(ddsDrug)
+```
+
+# Barplots 
+
+## Number of samples per treatment
+
+```{r, fig.width=8, fig.height=5}
+color_vec <- colorRampPalette(brewer.pal(1,"Pastel2"))(12)
+
+patAnno %>%
+  ggplot(aes(x=treatment, fill=treatment)) +
+  geom_bar() +
+  geom_text(stat = "count", aes(label=..count..),
+            vjust=1.3, size=4, color="#323232") +
+  theme(axis.text.x = element_text(angle = 45, vjust=0.9, hjust=0.9)) +
+  ylab("Number of samples") +
+  theme(axis.title.x = element_blank(),
+        legend.position="none") +
+  scale_fill_manual(values=color_vec)
+```
+
+## Pathology classification of samples
+
+```{r, fig.width=4, fig.height=5}
+# Remove baseline samples (Jurkat cell line)
+ddsDrug <- ddsDrug[ ,ddsDrug$treatment != "Baseline"]
+patAnno <- colData(ddsDrug) %>% as_tibble()
+dim(ddsDrug)
+
+# Keep every patient only one time
+patAnno.sub <- patAnno[!duplicated(patAnno$patID), ]
+length(patAnno.sub$patID)
+
+color_vec <- colorRampPalette(brewer.pal(10,"Set3"))(5)
+
+patAnno.sub %>%
+  ggplot(aes(x=diagnosis, fill=diagnosis)) +
+    geom_bar() +
+  geom_text(stat = "count", aes(label=..count..),
+            vjust=-0.2,size=4,color="#323232") +
+    theme(axis.text.x = element_text(angle = 45, vjust=0.9, hjust=0.9)) +
+    ylab("Number of patients") +
+    theme(axis.title.x = element_blank(),
+        legend.position="none") +
+    scale_fill_manual(values=color_vec)
+```
+
+
+# Genetic landscape of CLL cohort
+
+Filter data set by diagnosis
+```{r}
+ddsDrug <- ddsDrug[ ,ddsDrug$diagnosis %in% "CLL"]
+patAnno <- colData(ddsDrug) %>% as_tibble()
+dim(ddsDrug)
+length(unique(patAnno$patID))
+```
+
+Extract expression matrix for DMSO
+```{r}
+exprMat <- counts(ddsDrug)
+
+patAnno_DMSO <- patAnno[patAnno$treatment == "DMSO", ]
+patAnno_DMSOnames <- patAnno_DMSO %>%
+  column_to_rownames(var="ID")
+exprMat_DMSO <- exprMat[,colnames(exprMat) %in% patAnno_DMSO$ID]
+length(colnames(exprMat_DMSO))
+```
+
+```{r}
+#Prepare data frame
+annoCol <- patAnno_DMSO %>%
+  select(ID, pretreated, age, gender, batch, IGHV, TP53, ATM,
+         SF3B1, NOTCH1, MYD88, BRAF, KRAS, EGR2, MED12, FBXW7, XPO1,
+         trisomy12, del17p, del13q, del11q, del8p, gain2p,
+         gain8q, del6q, gain3q, del9p, del15q, del6p) %>%
+  column_to_rownames(var="ID")
+
+# Convert pretreated column to character
+annoCol$pretreated[is.na(annoCol$pretreated)] <- 2
+annoCol$pretreated <- as.character(annoCol$pretreated)
+annoCol$pretreated[annoCol$pretreated == "0"] <- "No" 
+annoCol$pretreated[annoCol$pretreated == "1"] <- "Yes" 
+annoCol$pretreated[annoCol$pretreated == "2"] <- "na"
+
+# Sort data frame by IGHV mutation status
+annoCol <- annoCol[order(annoCol$IGHV, annoCol$TP53,
+                         annoCol$del13q, decreasing = TRUE),]
+
+# Subset data frame for header
+annoColHeader <- annoCol %>%
+  select(pretreated, age, gender, batch)
+
+# Subset data frame for matrix
+annoColMat <- annoCol %>%
+  select(-batch, -gender, -pretreated, -age)
+
+# Convert mutation columns from factor to numeric
+annoColMat[is.na(annoColMat)] <- 2.0
+
+ind <- sapply(annoColMat, is.factor)
+annoColMat[ind] <- lapply(annoColMat[ind],
+                          function(x) as.numeric(as.character(x)))
+annoColMat$IGHV <- as.numeric(annoColMat$IGHV)
+
+# Transpose and create matrix
+mat <- t(annoColMat)
+
+# Settings
+breaks <- c(0,0.5,1)
+colors <- c("white","black", "gray")
+rowLabs <- rownames(mat)
+```
+
+```{r}
+color_anno = list(
+  batch = c(pilot="#F8F417", batch1="#B5E222", batch2="#76EE3D", batch3="#07D256", batch4="#0A9C43"),
+  gender = c(f="#ECB3EE", m="#A201B5"),
+  pretreated = c(Yes="#EFD08C", No="#8D6100", na="#A3884D"))
+```
+
+Plot heatmap
+```{r, fig.width=10, fig.height=8}
+plotGeneHeatmap <- pheatmap(mat, cluster_cols = FALSE, cluster_rows = FALSE, 
+                            annotation_col = annoColHeader, annotation_colors=color_anno,
+                            border_color = "black", treeheight_col=0,
+         breaks = breaks, color = colors, show_colnames = T, fontsize=13,
+         labels_col = patAnno_DMSOnames[colnames(mat),]$patID,
+         labels_row = parse(text = rowLabs), fontsize_col=5,
+         fontsize_row=10, legend = FALSE, silent = TRUE)$gtable
+cowplot::plot_grid(plotGeneHeatmap)
+```
+
+As additional information survival data such as overall survival, died or time to treatment could be displayed in the heatmap.
+
+# Session Info Details
+```{r, echo=FALSE, eval=TRUE}
+sessionInfo()
+```

@@ -1,0 +1,1940 @@
+---
+title: "Viability analysis"
+author: "Caroline Lohoff"
+date: "April 28 2022"
+output:
+  BiocStyle::html_document:
+    toc_float: true
+---
+
+# Description
+Viability is the major source of variation in the drug-perturbed RNAseq data set. The viability of cells was measured by flow cytometry. In flow cytometry, the forward scatter (FSC) measures the light scattered by cells along the path of the laser, whereas side scatter detects scatter at a 90° angle relative to the laser. 
+
+The objective of the analysis is to find genes that are associated with viability, or more specifically with apoptosis.  
+Spontaneous apoptosis is often a problem in CLL. If we understand the genes activated during apoptosis in DMSO treated (control) cells, we can distinguish better the effects of the individual drugs on gene expression and pathway changes. 
+
+This analysis focuses on PCA, contrastive PCA and Pearson correlation of gene expression with viability.
+
+# Load data and packages
+
+Set global options
+```{r setup, include=FALSE, cache = FALSE}
+knitr::opts_knit$set(root.dir = "~/Documents/R/drugseq_test")
+knitr::opts_chunk$set(warning = FALSE, message = FALSE)
+```
+
+Load packages
+```{r}
+suppressPackageStartupMessages({
+  library(DESeq2)
+  library(tidyverse)
+  library(sjmisc)
+  library(RColorBrewer)
+  library(factoextra)
+  library(cowplot)
+  library(scPCA)
+  library(pheatmap)
+})
+```
+
+Set global ggplot variables
+```{r}
+theme_set(theme_bw() + theme(axis.text = element_text(size=12), 
+                             axis.title = element_text(size=14),
+                             legend.title = element_text(size=14),
+                             legend.text = element_text(size=12),
+                             plot.title = element_text(size=15,
+                                                       hjust=0.5,face="bold")))
+
+# Define color palette for batches
+cp <- c("#2CB902", "#FD7306", "#FF1EBE", "#0137A4", "#C8C701")
+```
+
+Load data and add annotations
+```{r}
+# Load dds data set containing 1106 samples and count matrix
+load("./output/ddsDrug_htseq_batchPilot1c234_20220207.RData")
+
+# Load meta data including genotyping info
+load("./data/patmeta_210324.RData")
+
+# Add columns to DESeq object using patient meta data
+col_vec <- c("diagnosis", "gender", "Methylation_Cluster", "trisomy12", "NOTCH1", "TP53",
+             "ATM", "FBXW7", "MED12", "BRAF", "SF3B1", "del11q", "del17p", "del13q")
+ddsDrug@colData@listData <- lapply(col_vec, function(n) {
+  ddsDrug[[n]] <- patMeta[match(ddsDrug$patID, patMeta$Patient.ID), n]
+}) %>% bind_cols() %>% sjmisc::add_columns(ddsDrug@colData@listData)
+
+names(ddsDrug@colData@listData)[names(ddsDrug@colData@listData) == "Methylation_Cluster"] <- "Methylation"
+ddsDrug$IGHVpat <- patMeta[match(ddsDrug$patID, patMeta$Patient.ID),]$IGHV.status
+ddsDrug$IGHV <- ifelse(is.na(ddsDrug$IGHV), ddsDrug$IGHVpat, ddsDrug$IGHV)
+ddsDrug$IGHVpat <- NULL
+
+# Add meta data to the samples from the pilot batch
+ddsDrug$diagnosis[ddsDrug$batch == "pilot"] <- "CLL" 
+ddsDrug$trisomy12[ddsDrug$batch == "pilot"] <- 0
+ddsDrug$TP53[ddsDrug$batch == "pilot"] <- 0
+ddsDrug$NOTCH1[ddsDrug$batch == "pilot"] <- 0
+ddsDrug$del13q[ddsDrug$batch == "pilot"] <- 1
+ddsDrug$IGHV[ddsDrug$batch == "pilot" & ddsDrug$patID %in% c("PID1095", "PID1222")] <- "U"
+ddsDrug$IGHV[ddsDrug$batch == "pilot" & ddsDrug$patID %in% c("PID1177", "PID1210")] <- "M"
+ddsDrug$gender[ddsDrug$batch == "pilot" & ddsDrug$patID %in% c("PID1095", "PID1222")] <- "f"
+ddsDrug$gender[ddsDrug$batch == "pilot" & ddsDrug$patID %in% c("PID1177", "PID1210")] <- "m"
+```
+
+
+## Transform data
+
+Filter genes
+```{r filter-genes}
+# Only use protein coding genes and include only CLL samples in analysis
+ddsAll <- ddsDrug[rowData(ddsDrug)$biotype == "protein_coding" & !rowData(ddsDrug)$symbol %in% c(NA, ""),
+                  ddsDrug$diagnosis == "CLL" & ddsDrug$treatment != "Baseline" & ddsDrug$Replicate == 1]
+
+# Remove all mitochondrial and artificial chromosomes
+ddsAll <- ddsAll[rowData(ddsAll)$chromosome %in% c(1:22,"X","Y")]
+
+# Remove genes on Y chromosome which could introduce some bias
+ddsAll <- ddsAll[rowData(ddsAll)$chromosome != "Y"]
+# ddsAll <- ddsAll[!rowData(ddsAll)$chromosome %in% c("X","Y")]
+table(rowData(ddsAll)$chromosome)
+
+# Keep only genes with a minimum of 10 counts in any sample
+keep_counts <- apply(counts(ddsAll), 1, function(x) any(x >= 10))
+ddsAll <- ddsAll[keep_counts,]
+dim(ddsAll)
+
+# Keep only genes expressed in at least 5% of all samples
+n <- round(ncol(counts(ddsAll)) * 0.95)
+keep_counts_expr <- apply(counts(ddsAll), 1, function(x) sum(x == 0) < n)
+ddsAll_expr <- ddsAll[keep_counts_expr,]
+dim(ddsAll_expr)
+```
+
+New columns are added to the ddsAll object in which either the viability of the DMSO samples after unfreezing or after 48 hours of incubation is added to all samples from one patient.
+```{r}
+# Patients without DMSO sample
+allPat <- unique(ddsAll$patID)
+allPatDMSO <- unique(ddsAll[,ddsAll$treatment == "DMSO"]$patID)
+allPatnoDMSO <- setdiff(allPat, allPatDMSO)
+
+# Viability after unfreezing
+ddsAll$FSC.SSC.d0DMSO <- ddsAll$FSC.SSC.d0
+for(id in allPatDMSO){
+  viability <- ddsAll$FSC.SSC.d0[ddsAll$patID == id & ddsAll$treatment == "DMSO"]
+  ddsAll$FSC.SSC.d0DMSO[ddsAll$patID == id] <- viability
+}
+
+# Viability after 48h
+ddsAll$FSC.SSC.DMSO <- ddsAll$FSC.SSC
+for(id in allPatDMSO){
+  viability <- ddsAll$FSC.SSC[ddsAll$patID == id & ddsAll$treatment == "DMSO"]
+  ddsAll$FSC.SSC.DMSO[ddsAll$patID == id] <- viability
+}
+```
+
+Extract count matrix and patient annotations df
+```{r}
+# Extract count matrix
+counts_df <- data.frame(assay(ddsAll))
+
+# Retrieve patient annotations from dds object as data frame
+patAnno_all <- colData(ddsAll) %>% as_tibble() %>%
+  mutate(treatment = str_replace_all(treatment,"[- ]","_"))
+patAnno <- patAnno_all %>%
+  dplyr::select(-c(fileName, Replicate, time, Barcode,
+                   Input.concentration, RIN, IDplate, Library.concentration,
+                   Libary.molarity, Average.fragment.size))
+```
+
+Variance stabilization transformation of the raw data
+```{r vst}
+RNAnorm_all <- varianceStabilizingTransformation(ddsAll)
+```
+
+Extract a vector with the names of all drug treatments (and DMSO)
+```{r}
+allTreatDMSO <- patAnno %>%
+  distinct(treatment) %>% pull(treatment)
+allTreat <- allTreatDMSO[!allTreatDMSO == "DMSO"]
+```
+
+
+# Principal component analysis
+
+The exploratory data analysis is performed on data normalized and transformed using the variance stabilizing transformation (vst) provided by the DESeq2 package.
+Principle component analysis is a substantial part of quality control in order to explore the variation in the data.
+
+## Preparations
+Invariant filtering of top 500, 1000, and 5000 most variable genes.
+(The genes with the largest variance in gene expression are the most interesting genes.)
+```{r}
+exprMat <- assay(RNAnorm_all)
+sds <- rowSds(exprMat)
+
+exprMat_500 <- exprMat[order(sds, decreasing=T)[1:500],]
+exprMat_1000 <- exprMat[order(sds, decreasing=T)[1:1000],]
+exprMat_5000 <- exprMat[order(sds, decreasing=T)[1:5000],]
+```
+
+Calculate the PCA
+```{r}
+# Top 500 genes
+pcaRes500 <- prcomp(t(exprMat_500), scale=TRUE, center=TRUE)
+varExp500 <- (pcaRes500$sdev^2 / sum(pcaRes500$sdev^2))*100
+pcaTab500 <- data.frame(pcaRes500$x[,1:10]) %>%
+  rownames_to_column("ID") %>% left_join(patAnno)
+names(varExp500) <- colnames(pcaRes500$x)
+
+# Top 1000 genes
+pcaRes1000 <- prcomp(t(exprMat_1000), scale=TRUE, center=TRUE)  
+varExp1000 <- (pcaRes1000$sdev^2 / sum(pcaRes1000$sdev^2))*100
+pcaTab1000 <- data.frame(pcaRes1000$x[,1:10]) %>%
+  rownames_to_column("ID") %>% left_join(patAnno)
+names(varExp1000) <- colnames(pcaRes1000$x)
+
+# Top 5000 genes
+pcaRes5000 <- prcomp(t(exprMat_5000), scale=TRUE, center=TRUE)  
+varExp5000 <- (pcaRes5000$sdev^2 / sum(pcaRes5000$sdev^2))*100
+pcaTab5000 <- data.frame(pcaRes5000$x[,1:10]) %>%
+  rownames_to_column("ID") %>% left_join(patAnno)
+names(varExp5000) <- colnames(pcaRes5000$x)
+```
+
+## Results - normal PCA
+
+### Focus on loading matrix
+factoextra is an R package for extracting and visualizing the output of exploratory multivariate data analyses. 
+
+Visualize eigenvalues/variances
+```{r}
+fviz_screeplot(pcaRes5000, addlabels=TRUE, ylim = c(0, 22))
+```
+500 most variable genes
+```{r}
+fviz_screeplot(pcaRes500, addlabels=TRUE, ylim = c(0, 20))
+```
+
+Extract and visualize directions of variables (genes). 
+```{r}
+plot_gene_dir <- fviz_pca_var(pcaRes500, col.var="x", repel=TRUE,
+                              gradient.cols = c("#00AFBB", "#E7B800", "#FC4E07"))
+plot_gene_dir
+```
+x describes the direction with respect to PC1. A positive value indicates an error pointing towards the positive direction of PC1. The length of the arrow represents the significance of that gene. 
+From this plot we can extract the genes contributing most to PC1 and PC2. 
+```{r}
+pcaRes500_df <- data.frame(plot_gene_dir$data) %>%
+  mutate(symbol = rowData(ddsDrug)[name,]$symbol)
+
+# PC1 is associated most with viability
+genes_PC1 <- filter(pcaRes500_df, x > 0.75) %>% pull(symbol)
+cat("Genes contributing most to PC1:", genes_PC1, "\n")
+
+# PC2 is associated with IGHV status
+genes_PC2_neg <- filter(pcaRes500_df, y < -0.5) %>% pull(symbol)
+cat("Genes contributing most to PC2 in negative direction:",
+    genes_PC2_neg, "\n")
+
+genes_PC2_pos <- filter(pcaRes500_df, y > 0.5) %>% pull(symbol)
+cat("Genes contributing most to PC2 in positive direction:",
+    genes_PC2_pos, "\n")
+```
+
+Biplot of individuals (samples) and variables (genes)
+```{r}
+fviz_mca_biplot(pcaRes500, repel = TRUE)
+```
+The red dot in the middle of the plot represents the arrows of genes from the plot above (directions of variables). In comparison to the position of the samples the gene arrows are rather short. The wide distribution of samples indicates that the samples itself contain information that can't be purely explained by the gene expression. Such information are among other the viability and genotype, such as the IGHV status.
+
+We can visualize the loading matrix of the PCA to see the direction and influence of the genes on the sample landscape.
+```{r}
+fviz_pca(pcaRes500, repel=TRUE)
+```
+
+Group the treatments and show distribution of samples belonging to each treatment
+```{r, fig.width=8, fig.height=7}
+color_vec <- colorRampPalette(brewer.pal(9,"Set1"))(11)
+color_vecTr <- c(DMSO = color_vec[2], Ibrutinib = color_vec[7], Duvelisib = color_vec[3],
+                 Trametinib = color_vec[11], Everolimus = color_vec[4],
+                 MK2206 = color_vec[8], C26 = color_vec[1], Ibr_x_C26 = color_vec[6],
+                 Nutlin_3a = color_vec[9], IBET762 = color_vec[5], Selinexor = color_vec[10])
+
+fviz_pca_ind(pcaRes500,
+             label = "none", # hide individual labels
+             habillage = pcaTab500$treatment, # color by groups
+             palette = color_vecTr,
+             addEllipses = TRUE # Concentration ellipses
+             )
+```
+From this plot we get the impression that Ibrutinib and IBET 762 are most distinct from the other treatments. 
+
+***Question:*** How can I show the direction of factors such as FSC.SSC or IGHV instead of showing the genes?
+
+
+### PCA colored by batch
+```{r}
+ggplot(pcaTab5000, aes(x=PC1,y=PC2, col = batch)) + geom_point() + theme_bw() + scale_color_manual(values=cp) +
+  xlab(sprintf("PC1 (%2.1f%%)",varExp5000[1])) + ylab(sprintf("PC2 (%2.1f%%)",varExp5000[2])) +
+  ggtitle("PCA colored by batches (only CLL)")
+```
+After removing the baseline samples and all other diagnosis than CLL, there is no separation between the batches. Thus, there is no need to adjust for batch effects.
+
+### PCA colored by patientID
+```{r, fig.width=10, fig.height=5}
+ggplot(pcaTab5000, aes(x=PC1,y=PC2, col = patID)) + geom_point(size=2) + theme_bw() + 
+  xlab(sprintf("PC1 (%2.1f%%)",varExp5000[1])) + ylab(sprintf("PC2 (%2.1f%%)",varExp5000[2])) +
+  ggtitle("PCA colored by patients (only CLL)")
+```
+There is a high inter-patient heterogeneity in the data set, as samples from the same patients cluster together. This is especially visible for the samples of patients P0437 and P0029. The samples of both patients have a very low viability in terms of FSC.SSC (P0029: 7.1% - 16.7%, P0437: 9.3% - 17.8%).
+
+### PCA colored by viability
+
+Viability after unfreezing the samples (day 0)
+```{r, fig.width=20, fig.height=5}
+p1 <- ggplot(pcaTab500, aes(x=PC1, y=PC2, col=FSC.SSC.d0)) + geom_point(size=2) + theme_bw() + 
+  xlab(sprintf("PC1 (%2.1f%%)",varExp500[1])) + ylab(sprintf("PC2 (%2.1f%%)",varExp500[2])) +
+  ggtitle("PCA colored by viability after unfreezing (top 500 genes)")
+
+p2 <- ggplot(pcaTab1000, aes(x=PC1, y=PC2, col=FSC.SSC.d0)) + geom_point(size=2) + theme_bw() + 
+  xlab(sprintf("PC1 (%2.1f%%)",varExp1000[1])) + ylab(sprintf("PC2 (%2.1f%%)",varExp1000[2])) +
+  ggtitle("PCA colored by viability after unfreezing (top 1000 genes)")
+
+p3 <- ggplot(pcaTab5000, aes(x=PC1, y=PC2, col=FSC.SSC.d0)) + geom_point(size=2) + theme_bw() + 
+  xlab(sprintf("PC1 (%2.1f%%)",varExp5000[1])) + ylab(sprintf("PC2 (%2.1f%%)",varExp5000[2])) +
+  ggtitle("PCA colored by viability after unfreezing (top 5000 genes)")
+
+plot_grid(p1, p2, p3, ncol=3)
+```
+
+Viability after 48h of incubation
+```{r, fig.width=21, fig.height=5}
+p1 <- ggplot(pcaTab500, aes(x=PC1, y=PC2, col=FSC.SSC)) + geom_point(size=2) + theme_bw() + 
+  xlab(sprintf("PC1 (%2.1f%%)",varExp500[1])) + ylab(sprintf("PC2 (%2.1f%%)",varExp500[2])) +
+  ggtitle("PCA colored by viability after 48h incubation (top 500 genes)")
+
+p2 <- ggplot(pcaTab1000, aes(x=PC1, y=PC2, col=FSC.SSC)) + geom_point(size=2) + theme_bw() + 
+  xlab(sprintf("PC1 (%2.1f%%)",varExp1000[1])) + ylab(sprintf("PC2 (%2.1f%%)",varExp1000[2])) +
+  ggtitle("PCA colored by viability after 48h incubation (top 1000 genes)")
+
+p3 <- ggplot(pcaTab5000, aes(x=PC1, y=PC2, col=FSC.SSC)) + geom_point(size=2) + theme_bw() + 
+  xlab(sprintf("PC1 (%2.1f%%)",varExp5000[1])) + ylab(sprintf("PC2 (%2.1f%%)",varExp5000[2])) +
+  ggtitle("PCA colored by viability after 48h incubation (top 5000 genes)")
+
+plot_grid(p1, p2, p3, ncol=3)
+```
+When we compare the viability at the different time points (directly after unfreezing the samples and after incubation at 37°C for 48 hours), we can clearly see a decrease in overall viability from 50% - 95% to 10% - 88%. Thus, spontaneous apoptosis is a major problem in CLL samples that leads to strong noise in the data set. Principal component 1 is the viability.
+
+Normalized viability after 48h of incubation
+```{r, fig.width=22, fig.height=5}
+p1 <- ggplot(pcaTab500, aes(x=PC1, y=PC2, col=FSC.SSC.norm)) + geom_point(size=2) + theme_bw() + 
+  xlab(sprintf("PC1 (%2.1f%%)",varExp500[1])) + ylab(sprintf("PC2 (%2.1f%%)",varExp500[2])) +
+  ggtitle("PCA colored by norm. viability after 48h incubation (top 500 genes)")
+
+p2 <- ggplot(pcaTab1000, aes(x=PC1, y=PC2, col=FSC.SSC.norm)) + geom_point(size=2) + theme_bw() + 
+  xlab(sprintf("PC1 (%2.1f%%)",varExp1000[1])) + ylab(sprintf("PC2 (%2.1f%%)",varExp1000[2])) +
+  ggtitle("PCA colored by norm. viability after 48h incubation (top 1000 genes)")
+
+p3 <- ggplot(pcaTab5000, aes(x=PC1, y=PC2, col=FSC.SSC.norm)) + geom_point(size=2) + theme_bw() + 
+  xlab(sprintf("PC1 (%2.1f%%)",varExp5000[1])) + ylab(sprintf("PC2 (%2.1f%%)",varExp5000[2])) +
+  ggtitle("PCA colored by norm. viability after 48h incubation (top 5000 genes)")
+
+plot_grid(p1, p2, p3, ncol=3)
+```
+The viability of the drug-perturbed samples after 48 hours of incubation was normalized using the DMSO samples after incubation of 48 hours:
+
+Viability_norm = viability(treatment after 48h) / viability(DMSO after 48h)
+
+When we display the PCA colored by normalized viability, the trend is less strong. However, some samples have a viability ratio of below 0.6 or above 1.5. These samples have a clearly distinct viability from the respective DMSO samples. A normalized viability of 0.5 means that the DMSO sample contained twice as many living cells as the drug-perturbed sample after 48 hours of incubation.
+
+#### Samples responsible for PC1
+
+Patients contributing to PC1
+```{r, fig.width=14, fig.height=6}
+ggplot(pcaTab5000, aes(x=PC1, y=PC2, col=patID)) + geom_point(size=2) + theme_bw() + 
+  xlab(sprintf("PC1 (%2.1f%%)",varExp5000[1])) + ylab(sprintf("PC2 (%2.1f%%)",varExp5000[2])) +
+  ggtitle("PCA colored by patients (top 5000 genes)") +
+  ggrepel::geom_label_repel(data=pcaTab5000[pcaTab5000$PC1 >= 100,],
+                            aes(label=patID), size=3)
+```
+The patients with the IDs P0029, P0437, P0583, P0880, P0645, and P0708 contribute mainly to the separation of the samples by PC1, which is associated with viability. 
+```{r}
+pcaTab5000 %>%
+  select(patID, PC1, FSC.SSC.d0DMSO, FSC.SSC.DMSO, IGHV, TP53, trisomy12) %>%
+  filter(PC1 > 100) %>% distinct(patID, .keep_all=TRUE) %>%
+  arrange(FSC.SSC.d0DMSO) %>% DT::datatable()
+```
+
+```{r}
+pcaTab5000 %>%
+  select(patID, PC1, FSC.SSC.d0DMSO, FSC.SSC.DMSO, IGHV, TP53, trisomy12) %>%
+  filter(PC1 > 90) %>% distinct(patID, .keep_all=TRUE) %>%
+  arrange(FSC.SSC.d0DMSO) %>% DT::datatable()
+```
+
+DMSO viability of these patients
+```{r, fig.width=18, fig.height=5}
+p1 <- ggplot(pcaTab5000, aes(x=PC1, y=PC2, col=FSC.SSC.d0DMSO)) +
+  geom_point(size=2) + theme_bw() + 
+  xlab(sprintf("PC1 (%2.1f%%)",varExp5000[1])) + ylab(sprintf("PC2 (%2.1f%%)",varExp5000[2])) +
+  ggtitle("PCA colored by DMSO viability day 0 (top 5000 genes)") +
+  ggrepel::geom_label_repel(data=pcaTab5000[pcaTab5000$PC1 >= 100,],
+                            aes(label=FSC.SSC.d0DMSO), size=3)
+
+p2 <- ggplot(pcaTab5000, aes(x=PC1, y=PC2, col=FSC.SSC.DMSO)) +
+  geom_point(size=2) + theme_bw() + 
+  xlab(sprintf("PC1 (%2.1f%%)",varExp5000[1])) + ylab(sprintf("PC2 (%2.1f%%)",varExp5000[2])) +
+  ggtitle("PCA colored by DMSO viability day 2 (top 5000 genes)") +
+  ggrepel::geom_label_repel(data=pcaTab5000[pcaTab5000$PC1 >= 100,],
+                            aes(label=FSC.SSC.DMSO), size=3)
+
+plot_grid(p1, p2, ncol=2)
+```
+
+There was a problem with the storage of some samples (from expID 100)
+```{r, fig.width=10, fig.height=5}
+pcaTab5000$expID <- as.numeric(pcaTab5000$expID)
+ggplot(pcaTab5000, aes(x=PC1, y=PC2, col=expID)) + geom_point(size=2) + theme_bw() + 
+  xlab(sprintf("PC1 (%2.1f%%)",varExp5000[1])) + ylab(sprintf("PC2 (%2.1f%%)",varExp5000[2])) +
+  ggtitle("PCA colored by expID (top 5000 genes)") +
+  ggrepel::geom_label_repel(data=pcaTab5000[pcaTab5000$expID >= 100,],
+                            aes(label=expID), size=3)
+```
+Most of the samples with an expID above 100 are far away from the center of the plot.
+
+
+### PCA colored by viability (individual treatments)
+
+Viability after unfreezing the cells (day 0)
+```{r, fig.width=18, fig.height=14}
+pca_plot <- function(tr){
+  plot <- pcaTab5000 %>%
+    dplyr::filter(treatment == tr) %>%
+    ggplot(aes(x=PC1, y=PC2, col=FSC.SSC.d0)) + geom_point(size=2) + theme_bw() + 
+    xlab(sprintf("PC1 (%2.1f%%)",varExp5000[1])) +
+    ylab(sprintf("PC2 (%2.1f%%)",varExp5000[2])) +
+    ggtitle(sprintf("PCA colored by day 0 viability of %s", tr))
+  return(plot)
+}
+
+plot_list <- lapply(allTreatDMSO, function(tr) {
+  pca_plot(tr)
+})
+
+plot_grid(plotlist=plot_list, ncol=3)
+```
+
+Viability after 48h of incubation
+```{r, fig.width=18, fig.height=14}
+pca_plot <- function(tr){
+  plot <- pcaTab5000 %>%
+    dplyr::filter(treatment == tr) %>%
+    ggplot(aes(x=PC1, y=PC2, col=FSC.SSC)) + geom_point(size=2) + theme_bw() + 
+    xlab(sprintf("PC1 (%2.1f%%)",varExp5000[1])) +
+    ylab(sprintf("PC2 (%2.1f%%)",varExp5000[2])) +
+    ggtitle(sprintf("PCA colored by viability (FSC.SSC) of %s", tr))
+  return(plot)
+}
+
+plot_list <- lapply(allTreatDMSO, function(tr) {
+  pca_plot(tr)
+})
+
+plot_grid(plotlist=plot_list, ncol=3)
+```
+Patients with a viability below 70% after unfreezing the cells 
+```{r}
+pcaTab5000 %>%
+  select(patID, batch, expID, expBatch, FSC.SSC.d0DMSO, FSC.SSC.DMSO) %>%
+  distinct(patID, .keep_all=TRUE) %>% filter(FSC.SSC.d0DMSO < 70) %>%
+  arrange(FSC.SSC.d0DMSO) %>% DT::datatable()
+```
+
+Mark these patients in the plot
+```{r, fig.width=14, fig.height=6}
+ggplot(pcaTab5000, aes(x=PC1, y=PC2, col=patID)) + geom_point(size=2) + theme_bw() + 
+  xlab(sprintf("PC1 (%2.1f%%)",varExp5000[1])) + ylab(sprintf("PC2 (%2.1f%%)",varExp5000[2])) +
+  ggtitle("PCA colored by expID (top 5000 genes)") +
+  ggrepel::geom_label_repel(data=pcaTab5000[pcaTab5000$patID %in% c("P0645", "P0437", "P0067", "P0035",
+                                                                    "P0604", "P0494", "P0051"),],
+                            aes(label=patID), size=3)
+```
+These patients are spread over PC1. Nevertheless, these patients will be removed from further analysis, since some apoptotic signalling pathways may already be turned on. When analyzing the effect of the treatments, the low viability might affect the conclusions we draw from the data Two of these patients (P0437 and P0645) belong to those six that contribute most to PC1 (see PCA plot above). Otherwise, these patients could be most susceptible for a treatment since the apoptotic pathways are already active in most of the cells in one sample. 
+
+Show PCA plot after removing the patients with a DMSO viability on day 1 below 70%
+```{r}
+# Remove patients from dds object
+remPat <- c("P0645", "P0437", "P0067", "P0035",
+            "P0604", "P0494", "P0051")
+RNAnorm_allsub <- RNAnorm_all[,!RNAnorm_all$patID %in% remPat]
+
+# Extract expression matrix and filter 5000 most variant genes
+exprMatsub <- assay(RNAnorm_allsub)
+sdssub <- rowSds(exprMatsub)
+exprMat_5000sub <- exprMatsub[order(sdssub,
+                                    decreasing=T)[1:5000],]
+
+# Calculate PCA
+pcaRes5000sub <- prcomp(t(exprMat_5000sub), scale=TRUE, center=TRUE)  
+varExp5000sub <- (pcaRes5000sub$sdev^2 / sum(pcaRes5000sub$sdev^2))*100
+pcaTab5000sub <- data.frame(pcaRes5000sub$x[,1:10]) %>%
+  rownames_to_column("ID") %>% left_join(patAnno)
+names(varExp5000sub) <- colnames(pcaRes5000sub$x)
+```
+
+```{r}
+ggplot(pcaTab5000sub, aes(x=PC1, y=PC2, col=FSC.SSC.DMSO)) +
+  geom_point(size=2) + theme_bw() + 
+  xlab(sprintf("PC1 (%2.1f%%)",varExp5000sub[1])) +
+  ylab(sprintf("PC2 (%2.1f%%)",varExp5000sub[2])) +
+  ggtitle("PCA colored by viability after removing samples") +
+  ggrepel::geom_label_repel(data=pcaTab5000sub[pcaTab5000sub$PC1 > 120,],
+                            aes(label=patID), size=3, min.segment.length=0,
+                            max.overlap=1, box.padding=0.5)
+```
+
+```{r, fig.width=12, fig.height=5}
+before <- factoextra::fviz_screeplot(pcaRes5000,
+                           addlabels=TRUE, ylim = c(0, 22))
+after <- factoextra::fviz_screeplot(pcaRes5000sub,
+                           addlabels=TRUE, ylim = c(0, 22))
+plot_grid(before, after, ncol=2)
+```
+After removing the low viability samples, less variance is explained by PC1. 
+
+### PCA colored by IGHV status
+```{r, fig.width=20, fig.height=5}
+p1 <- ggplot(pcaTab500, aes(x=PC1, y=PC2, col=IGHV)) + geom_point(size=2) + theme_bw() + 
+  xlab(sprintf("PC1 (%2.1f%%)",varExp500[1])) + ylab(sprintf("PC2 (%2.1f%%)",varExp500[2])) +
+  ggtitle("PCA colored by IGHV status (top 500 genes)")
+
+p2 <- ggplot(pcaTab1000, aes(x=PC1, y=PC2, col=IGHV)) + geom_point(size=2) + theme_bw() + 
+  xlab(sprintf("PC1 (%2.1f%%)",varExp1000[1])) + ylab(sprintf("PC2 (%2.1f%%)",varExp1000[2])) +
+  ggtitle("PCA colored by IGHV status (top 1000 genes)")
+
+p3 <- ggplot(pcaTab5000, aes(x=PC1, y=PC2, col=IGHV)) + geom_point(size=2) + theme_bw() + 
+  xlab(sprintf("PC1 (%2.1f%%)",varExp5000[1])) + ylab(sprintf("PC2 (%2.1f%%)",varExp5000[2])) +
+  ggtitle("PCA colored by IGHV status (to 5000 genes)")
+
+plot_grid(p1, p2, p3, ncol=3)
+```
+
+PC2 is clearly the IGHV status.
+
+### PCA colored by TP53 mutational status
+```{r, fig.width=20, fig.height=5}
+p1 <- ggplot(pcaTab500, aes(x=PC1, y=PC2, col=TP53)) + geom_point(size=2) + theme_bw() + 
+  xlab(sprintf("PC1 (%2.1f%%)",varExp500[1])) + ylab(sprintf("PC2 (%2.1f%%)",varExp500[2])) +
+  ggtitle("PCA colored by TP53 status (top 500 genes)")
+
+p2 <- ggplot(pcaTab1000, aes(x=PC1, y=PC2, col=TP53)) + geom_point(size=2) + theme_bw() + 
+  xlab(sprintf("PC1 (%2.1f%%)",varExp1000[1])) + ylab(sprintf("PC2 (%2.1f%%)",varExp1000[2])) +
+  ggtitle("PCA colored by TP53 status (top 1000 genes)")
+
+p3 <- ggplot(pcaTab5000, aes(x=PC1, y=PC2, col=TP53)) + geom_point(size=2) + theme_bw() + 
+  xlab(sprintf("PC1 (%2.1f%%)",varExp5000[1])) + ylab(sprintf("PC2 (%2.1f%%)",varExp5000[2])) +
+  ggtitle("PCA colored by TP53 status (to 5000 genes)")
+
+plot_grid(p1, p2, p3, ncol=3)
+```
+PC2 is also to some extend the TP53 mutational status.
+
+### PCA colored by trisomy 12 status
+```{r, fig.width=12, fig.height=5}
+p1 <- ggplot(pcaTab5000, aes(x=PC1, y=PC3, col=trisomy12)) + geom_point(size=2) + theme_bw() + 
+  xlab(sprintf("PC1 (%2.1f%%)",varExp5000[1])) + ylab(sprintf("PC3 (%2.1f%%)",varExp5000[3])) +
+  ggtitle("PCA colored by trisomy 12 status (top 5000 genes)")
+
+p2 <- ggplot(pcaTab5000, aes(x=PC2, y=PC3, col=trisomy12)) + geom_point(size=2) + theme_bw() + 
+  xlab(sprintf("PC2 (%2.1f%%)",varExp5000[2])) + ylab(sprintf("PC3 (%2.1f%%)",varExp5000[3])) +
+  ggtitle("PCA colored by trisomy 12 status (top 5000 genes)")
+plot_grid(p1, p2, ncol=2)
+```
+PC3 describes the trisomy 12 status. 
+
+### Correlation of PC1 and PC2 with viability
+```{r, fig.width=10, fig.height=3}
+p1 <- ggplot(pcaTab5000, aes(x=PC1, y=FSC.SSC)) +
+  scattermore::geom_scattermore(pointsize = 1.5) +
+  ggtitle("Correlation of PC1 and viability") +
+  geom_smooth(method="glm") +
+  annotate(x=140, y=75,
+           label=paste("R = ", round(cor(pcaTab5000$PC1,
+                                         pcaTab5000$FSC.SSC),2)), 
+         geom="text", size=5)
+p2 <- ggplot(pcaTab5000, aes(x=PC2, y=FSC.SSC)) +
+  scattermore::geom_scattermore(pointsize = 1.5) +
+  ggtitle("Correlation of PC2 and viability") +
+  geom_smooth(method="glm") +
+  annotate(x=30, y=75,
+           label=paste("R = ", round(cor(pcaTab5000$PC2,
+                                         pcaTab5000$FSC.SSC),2)), 
+         geom="text", size=5)
+
+plot_grid(p1, p2, ncol=2)
+```
+PC1 and to some extend PC2 describe the viability, which was determined by flow cytometry.
+
+## Results - Sparse Contrastive PCA (scPCA)
+
+Contrastive PCA is a dimension reduction method which estimates low-dimensional changes in variation between conditions. In particular, the aim is to identify variation that is unique to the foreground data (treatment) but does not exist in the background data (DMSO). Similar to PCA it is assumed that the variation in each condition can be explained by a small number of latent dimensions.
+
+The sparse version of cPCA allows for greater interpretability of the estimated components, especially in high-dimensional settings [Boileau et al. 2020](https://doi.org/10.1093/bioinformatics/btaa176). scPCA uses element-wise l1 regularization to encourage zeros in the loadings matrix. On top of that, an estimation procedure is used that alternates between estimating the PCs and the sparse loadings matrix.
+Given target and background gene expression matrices, scPCA will perform a sparse contrastive principal component analysis (scPCA) of the target data for a given number of eigenvectors, a vector of real-valued contrast parameters, and a vector of sparsity inducing penalty terms. The leading sparse contrastive components are able to capture the variation of interest.
+In terms of interpretability, the first and second loading vectors should possess only a few non-zero loadings.
+
+After filtering the genes, sparsity does not apply to the RNAseq data set. Thefeore, it is best to only perform a contrastive PCA. This is the case, if the penalties argument is set to 0.
+
+Here, we use the [Bioconductor implementation scPCA](https://bioconductor.org/packages/release/bioc/html/scPCA.html) from Boileau et al. 2020.
+As long as the n_centers parameter is larger than one, the automated hyperparameter tuning heuristic is used. Otherwise, the semi-automated approach selects the appropriate hyperparameter automatically (Abid 2018).
+
+***Question***: Use all 17000 genes or only the 5000 most variable genes as for PCA?
+
+### cPCA with 3 eigenvectors
+```{r, eval=FALSE, include=TRUE}
+# Split the gene expression matrix into treatments (target) and DMSO (background)
+DMSO_IDs <- patAnno[patAnno$treatment == "DMSO", ]$ID
+exprMat_500_DMSO <- exprMat_500[, colnames(exprMat_500) %in% DMSO_IDs]
+exprMat_500_treat <- exprMat_500[, !colnames(exprMat_500) %in% DMSO_IDs]
+
+cpca_3ev <- scPCA(target = t(exprMat_500_treat),    # treatments
+                   background = t(exprMat_500_DMSO), # DMSO
+                   n_eigen = 3,                      # number of eigenvectors (number of PCs)
+                   n_centers = 10,                   # number of centers in the clustering algorithm
+                   penalties = 0,                    # vector of the L1 penalty terms on the loadings
+                   center = TRUE,
+                   scale = TRUE,
+                   clust_method = "kmeans",         # or "hclust" or "pam" (partitioning around medoids)
+                   alg = "var_proj"                 # or "iterative" or "rand_var_proj"
+                   )
+
+# Extract information as vectors from patAnno
+viability <- patAnno[patAnno$treatment != "DMSO", ]$FSC.SSC
+IGHV <- patAnno[patAnno$treatment != "DMSO", ]$IGHV
+TP53 <- patAnno[patAnno$treatment != "DMSO", ]$TP53
+patID <- patAnno[patAnno$treatment != "DMSO", ]$patID
+labels <- patAnno[patAnno$treatment != "DMSO", ]$treatment
+
+# Create a data frame to be plotted
+cpca_3ev_df <- cpca_3ev$x %>% as_tibble() %>%
+  mutate(treatment = labels) %>%
+  mutate(viability = viability) %>% mutate(IGHV = IGHV) %>%
+  mutate(TP53 = TP53) %>% mutate(patID = patID)
+colnames(cpca_3ev_df) <- c("cPC1", "cPC2", "cPC3", "treatment",
+                           "viability", "IGHV", "TP53", "patID")
+# Save result
+save(cpca_3ev_df, file = "./output/cpca_allTreat_df.RData")
+```
+
+Plot cPCA for all treatments vs DMSO
+```{r, fig.width=12, fig.height=14}
+load("./output/cpca_allTreat_df.RData")
+
+ptr1 <- ggplot(cpca_3ev_df, aes(x = cPC1, y = cPC2, color = treatment)) +
+  geom_point(alpha = 0.7) + ggtitle("cPCA colored by treatment") +
+  theme_minimal()
+ptr2 <- ggplot(cpca_3ev_df, aes(x = cPC1, y = cPC3, color = treatment)) +
+  geom_point(alpha = 0.7) + ggtitle("cPCA colored by treatment") +
+  theme_minimal()
+ptr3 <- ggplot(cpca_3ev_df, aes(x = cPC2, y = cPC3, color = treatment)) +
+  geom_point(alpha = 0.7) + ggtitle("cPCA colored by treatment") +
+  theme_minimal()
+p1 <- ggplot(cpca_3ev_df, aes(x = cPC1, y = cPC2, color = viability)) +
+  geom_point(alpha = 0.7) + ggtitle("cPCA colored by viability") +
+  theme_minimal()
+p2 <- ggplot(cpca_3ev_df, aes(x = cPC1, y = cPC2, color = IGHV)) +
+  geom_point(alpha = 0.7) + ggtitle("cPCA colored by IGHV") +
+  theme_minimal()
+p3 <- ggplot(cpca_3ev_df, aes(x = cPC1, y = cPC2, color = TP53)) +
+  geom_point(alpha = 0.7) + ggtitle("cPCA colored by TP53") +
+  theme_minimal()
+plot_grid(ptr1, ptr2, ptr3, p1, p2, p3, ncol=2)
+```
+Viability is PC1, IGHV and TP53 mutational status are PC2. There are no differences between the treatments. 
+
+```{r, fig.width=10, fig.height=6}
+ggplot(cpca_3ev_df, aes(x = cPC1, y = cPC2, color = patID)) +
+  geom_point(alpha = 0.7) + ggtitle("cPCA colored by patients") +
+  theme_minimal()
+```
+Samples from the same patients cluster together. Overall, the results are quite similar to a normal PCA.
+
+Change number of centers used for the k-means clustering algorithm
+```{r, eval=FALSE, include=TRUE}
+# Split the gene expression matrix into treatments (target) and DMSO (background)
+DMSO_IDs <- patAnno[patAnno$treatment == "DMSO", ]$ID
+exprMat_500_DMSO <- exprMat_500[, colnames(exprMat_500) %in% DMSO_IDs]
+exprMat_500_treat <- exprMat_500[, !colnames(exprMat_500) %in% DMSO_IDs]
+
+cpca_3ev_5centers <- scPCA(target = t(exprMat_500_treat),     # treatments
+                   background = t(exprMat_500_DMSO), # DMSO
+                   n_eigen = 3,                      # number of eigenvectors (number of PCs)
+                   n_centers = 5,                    # number of centers in the clustering algorithm
+                   penalties = 0,                    # vector of the L1 penalty terms on the loadings
+                   center = TRUE,
+                   scale = TRUE,
+                   clust_method = "kmeans",         # or "hclust" or "pam" (partitioning around medoids)
+                   alg = "var_proj"                 # or "iterative" or "rand_var_proj"
+                   )
+
+# Extract information as vectors from patAnno
+viability <- patAnno[patAnno$treatment != "DMSO", ]$FSC.SSC
+IGHV <- patAnno[patAnno$treatment != "DMSO", ]$IGHV
+TP53 <- patAnno[patAnno$treatment != "DMSO", ]$TP53
+patID <- patAnno[patAnno$treatment != "DMSO", ]$patID
+labels <- patAnno[patAnno$treatment != "DMSO", ]$treatment
+
+# Create a data frame to be plotted
+cpca_3ev_5centers_df <- cpca_3ev_5centers$x %>%
+  as_tibble() %>%
+  mutate(treatment = labels) %>%
+  mutate(viability = viability) %>% mutate(IGHV = IGHV) %>%
+  mutate(TP53 = TP53) %>% mutate(patID = patID)
+colnames(cpca_3ev_5centers_df) <- c("cPC1", "cPC2", "cPC3", "treatment",
+                                    "viability", "IGHV", "TP53", "patID")
+# Save result
+save(cpca_3ev_5centers_df, file = "./output/cpca_allTreat_5center_df.RData")
+```
+
+Plot cPCA for all treatments vs DMSO
+```{r, fig.width=14, fig.height=16, include=FALSE}
+load("./output/cpca_allTreat_5center_df.RData")
+
+ptr1 <- ggplot(cpca_3ev_5centers_df, aes(x = cPC1, y = cPC2, color = treatment)) +
+  geom_point(alpha = 0.7) + ggtitle("cPCA colored by treatment") +
+  theme_minimal()
+ptr2 <- ggplot(cpca_3ev_5centers_df, aes(x = cPC1, y = cPC3, color = treatment)) +
+  geom_point(alpha = 0.7) + ggtitle("cPCA colored by treatment") +
+  theme_minimal()
+ptr3 <- ggplot(cpca_3ev_5centers_df, aes(x = cPC2, y = cPC3, color = treatment)) +
+  geom_point(alpha = 0.7) + ggtitle("cPCA colored by treatment") +
+  theme_minimal()
+p1 <- ggplot(cpca_3ev_5centers_df, aes(x = cPC1, y = cPC2, color = viability)) +
+  geom_point(alpha = 0.7) + ggtitle("cPCA colored by viability") +
+  theme_minimal()
+p2 <- ggplot(cpca_3ev_5centers_df, aes(x = cPC1, y = cPC2, color = IGHV)) +
+  geom_point(alpha = 0.7) + ggtitle("cPCA colored by IGHV") +
+  theme_minimal()
+p3 <- ggplot(cpca_3ev_5centers_df, aes(x = cPC1, y = cPC2, color = TP53)) +
+  geom_point(alpha = 0.7) + ggtitle("cPCA colored by TP53") +
+  theme_minimal()
+
+plot_grid(ptr1, ptr2, ptr3, p1, p2, p3, ncol=2)
+```
+The number of centers in the clustering algorithm does not change much in the result of the contrastive PCA.
+
+
+### scPCA with DMSO versus Ibrutinib
+```{r, eval=FALSE, include=TRUE}
+# Split the gene expression matrix into the different drugs
+exprMat_list <- lapply(allTreatDMSO, function(tr) {
+  IDs <- patAnno[patAnno$treatment == tr, ]$ID
+  exprMat <- exprMat_500[, colnames(exprMat_500) %in% IDs]
+})
+names(exprMat_list) <- allTreatDMSO
+
+# Run scPCA for each treatment vs DMSO
+scpca_sim <- scPCA(target = t(exprMat_list$Ibrutinib),
+                   background = t(exprMat_list$DMSO),
+                   n_eigen = 2, 
+                   n_centers = 2,
+                   center = TRUE,
+                   scale = TRUE,
+                   alg = "iterative",  # or "var_proj"
+                   parallel = TRUE
+                   )
+
+# Extract information as vectors from patAnno
+viability <- patAnno[patAnno$treatment == "Ibrutinib", ]$FSC.SSC
+IGHV <- patAnno[patAnno$treatment == "Ibrutinib", ]$IGHV
+TP53 <- patAnno[patAnno$treatment == "Ibrutinib", ]$TP53
+patID <- patAnno[patAnno$treatment == "Ibrutinib", ]$patID
+
+# Create a data frame to be plotted
+scpca_df <- scpca_sim$x %>% as_tibble() %>%
+  mutate(viability = viability) %>%
+  mutate(IGHV = IGHV) %>%
+  mutate(TP53 = TP53) %>%
+  mutate(patID = patID)
+colnames(scpca_df) <- c("scPC1", "scPC2", "viability",
+                        "IGHV", "TP53", "patID")
+scpca_df_Ibrutinib <- scpca_df
+
+# Save result
+save(scpca_df_Ibrutinib, file = "./output/scpca_df_Ibrutinib.RData")
+```
+
+Plot scPCA for Ibrutinib vs DMSO
+```{r, fig.width=16, fig.height=6}
+load("./output/scpca_df_Ibrutinib.RData")
+
+p1 <- ggplot(scpca_df_Ibrutinib, aes(x = scPC1, y = scPC2, color = viability)) +
+  geom_point(alpha = 0.7) + ggtitle("scPCA of Ibrutinib vs DMSO colored by viability") +
+  theme_minimal()
+p2 <- ggplot(scpca_df_Ibrutinib, aes(x = scPC1, y = scPC2, color = IGHV)) +
+  geom_point(alpha = 0.7) + ggtitle("scPCA of Ibrutinib vs DMSO colored by IGHV") +
+  theme_minimal()
+p3 <- ggplot(scpca_df_Ibrutinib, aes(x = scPC1, y = scPC2, color = TP53)) +
+  geom_point(alpha = 0.7) + ggtitle("scPCA of Ibrutinib vs DMSO colored by TP53") +
+  theme_minimal()
+plot_grid(p1, p2, p3, ncol=3)
+```
+The Ibrutinib samples do not cluster according to viability, IGHV status or TP53 mutational status.
+
+### scPCA with all treatments
+
+#### 10 eigenvectors
+```{r, eval=FALSE, include=TRUE}
+# Split the gene expression matrix into treatments (target) and DMSO (background)
+DMSO_IDs <- patAnno[patAnno$treatment == "DMSO", ]$ID
+exprMat_500_DMSO <- exprMat_500[, colnames(exprMat_500) %in% DMSO_IDs]
+exprMat_500_treat <- exprMat_500[, !colnames(exprMat_500) %in% DMSO_IDs]
+
+# Defining a contrast vector and a penalties vector
+contrasts <- exp(seq(log(0.1), log(1000), length.out = 40))
+penalties <- seq(0.05, 1, length.out = 20)
+
+# Run scPCA for using 40 logarithmically separated contrastive parameter values and possible 20 L1 penalty terms
+scpca_sim <- scPCA(target = t(exprMat_500_treat),
+                   background = t(exprMat_500_DMSO),
+                   n_eigen = 10,  # the number of eigenvectors (number of PCs)
+                   n_centers = 10, # number of centers to use in the clustering algorithm
+                   contrasts = contrasts, # vector of the contrastive parameters (by default, 40)
+                                          # (logarithmically spaced values between 0.1 and 1000)
+                   penalties = penalties, # vector of the L1 penalty terms on the loadings
+                                          # (default, 20 equidistant values between 0.05 and 1)
+                   center = TRUE,
+                   scale = TRUE,
+                   clust_method = "kmeans",  # or "pam" (partitioning around medoids) or "hclust" (hierarchical clustering)
+                   alg = "var_proj"  # or "iterative" or "rand_var_proj"
+                   )
+
+# Extract drug names of samples in treatment matrix
+labels <- patAnno[patAnno$treatment != "DMSO", ]$treatment
+
+# Create a data frame to be plotted
+scpca_df <- scpca_sim$x %>% as_tibble() %>%
+  mutate(treatment = labels)
+colnames(scpca_df) <- c("scPC1", "scPC2", "scPC3", "scPC4", "scPC5", "scPC6",
+                        "scPC7", "scPC8", "scPC9", "scPC10", "treatment")
+scpca_df_10eigenvectors <- scpca_df
+
+# Save result
+save(scpca_df_10eigenvectors, file = "./output/scpca_df_10eigenvectors.RData")
+```
+
+Show the results for the scPCA with 10 eigenvectors
+```{r, fig.width=12, fig.height=12}
+load("./output/scpca_df_10eigenvectors.RData")
+scpca_df <- scpca_df_10eigenvectors
+
+p12 <- ggplot(scpca_df, aes(x = scPC1, y = scPC2, color = treatment)) +
+  geom_point(alpha = 0.5) + ggtitle("scPCA of treatments vs DMSO") +
+  theme_minimal()
+p13 <- ggplot(scpca_df, aes(x = scPC1, y = scPC3, color = treatment)) +
+  geom_point(alpha = 0.5) + ggtitle("scPCA of treatments vs DMSO") +
+  theme_minimal()
+p14 <- ggplot(scpca_df, aes(x = scPC1, y = scPC4, color = treatment)) +
+  geom_point(alpha = 0.5) + ggtitle("scPCA of treatments vs DMSO") +
+  theme_minimal()
+p15 <- ggplot(scpca_df, aes(x = scPC1, y = scPC5, color = treatment)) +
+  geom_point(alpha = 0.5) + ggtitle("scPCA of treatments vs DMSO") +
+  theme_minimal()
+p16 <- ggplot(scpca_df, aes(x = scPC1, y = scPC6, color = treatment)) +
+  geom_point(alpha = 0.5) + ggtitle("scPCA of treatments vs DMSO") +
+  theme_minimal()
+p17 <- ggplot(scpca_df, aes(x = scPC1, y = scPC7, color = treatment)) +
+  geom_point(alpha = 0.5) + ggtitle("scPCA of treatments vs DMSO") +
+  theme_minimal()
+p18 <- ggplot(scpca_df, aes(x = scPC1, y = scPC8, color = treatment)) +
+  geom_point(alpha = 0.5) + ggtitle("scPCA of treatments vs DMSO") +
+  theme_minimal()
+p19 <- ggplot(scpca_df, aes(x = scPC1, y = scPC9, color = treatment)) +
+  geom_point(alpha = 0.5) + ggtitle("scPCA of treatments vs DMSO") +
+  theme_minimal()
+p110 <- ggplot(scpca_df, aes(x = scPC1, y = scPC10, color = treatment)) +
+  geom_point(alpha = 0.5) + ggtitle("scPCA of treatments vs DMSO") +
+  theme_minimal()
+
+plot_grid(p12, p13, p14, p15, p16, p17, p18, p19, p110, ncol=3)
+```
+scPC2 and scPC7 separate Selinexor from the other treatments, whereas scPC8 is separating Nutlin from the other treatments. An explanation could be that the Selinexor and Nutlin expression matrices both contain the genes with the highest effect sizes. This leads to longer loading vectors which pull the Selinexor and Nutlin samples further apart from the DMSO samples. In comparison, Duvelisib and Ibrutinib have more genes with a high variance, but this variance is not as high as the one for Selinexor.
+
+Based on this scPCA result, it can be guessed that Selinexor has a different mode of action than the other drugs (nuclear export instead of kinase inhibitors). When overlapping the significant differentially expressed genes, Selinexor should have only little overlap with the other drugs.
+This assumption is true, when we look at the UpSetR plot in the markdown file 3_DE_allbatches_STAR_HTSeq_20220221.html. 
+
+#### 4 eigenvectors
+```{r, eval=FALSE, include=TRUE}
+# Split the gene expression matrix into treatments (target) and DMSO (background)
+DMSO_IDs <- patAnno[patAnno$treatment == "DMSO", ]$ID
+exprMat_500_DMSO <- exprMat_500[, colnames(exprMat_500) %in% DMSO_IDs]
+exprMat_500_treat <- exprMat_500[, !colnames(exprMat_500) %in% DMSO_IDs]
+
+scpca_4ev <- scPCA(target = t(exprMat_500_treat),
+                   background = t(exprMat_500_DMSO),
+                   n_eigen = 4, 
+                   n_centers = 10, 
+                   center = TRUE,
+                   scale = TRUE,
+                   clust_method = "kmeans",
+                   alg = "var_proj")
+
+# Extract information as vectors from patAnno
+labels <- patAnno[patAnno$treatment != "DMSO", ]$treatment
+viability <- patAnno[patAnno$treatment != "DMSO", ]$FSC.SSC
+IGHV <- patAnno[patAnno$treatment != "DMSO", ]$IGHV
+TP53 <- patAnno[patAnno$treatment != "DMSO", ]$TP53
+patID <- patAnno[patAnno$treatment != "DMSO", ]$patID
+
+# Create a data frame to be plotted
+scpca_4ev_df <- scpca_4ev$x %>% as_tibble() %>%
+  mutate(treatment = labels) %>%
+  mutate(viability = viability) %>% mutate(IGHV = IGHV) %>%
+  mutate(TP53 = TP53) %>% mutate(patID = patID)
+colnames(scpca_4ev_df) <- c("scPC1", "scPC2", "scPC3", "scPC4",
+                            "treatment", "viability", "IGHV", "TP53", "patID")
+# Save result
+save(scpca_4ev_df, file = "./output/scpca_4ev_allTreat_df.RData")
+```
+
+Show the results for the scPCA with 4 eigenvectors
+```{r, fig.width=24, fig.height=18}
+load("./output/scpca_4ev_allTreat_df.RData")
+
+p12tr <- ggplot(scpca_4ev_df, aes(x = scPC1, y = scPC2, color = treatment)) +
+  geom_point(alpha = 0.5) + ggtitle("scPCA of treatments vs DMSO (colored by treatments)") +
+  theme_minimal()
+p13tr <- ggplot(scpca_4ev_df, aes(x = scPC1, y = scPC3, color = treatment)) +
+  geom_point(alpha = 0.5) + ggtitle("scPCA of treatments vs DMSO (colored by treatments") +
+  theme_minimal()
+p14tr <- ggplot(scpca_4ev_df, aes(x = scPC1, y = scPC4, color = treatment)) +
+  geom_point(alpha = 0.5) + ggtitle("scPCA of treatments vs DMSO (colored by treatments") +
+  theme_minimal()
+p12via <- ggplot(scpca_4ev_df, aes(x = scPC1, y = scPC2, color = viability)) +
+  geom_point(alpha = 0.5) + ggtitle("scPCA of treatments vs DMSO (colored by viability)") +
+  theme_minimal()
+p13via <- ggplot(scpca_4ev_df, aes(x = scPC1, y = scPC3, color = viability)) +
+  geom_point(alpha = 0.5) + ggtitle("scPCA of treatments vs DMSO (colored by viability)") +
+  theme_minimal()
+p14via <- ggplot(scpca_4ev_df, aes(x = scPC1, y = scPC4, color = viability)) +
+  geom_point(alpha = 0.5) + ggtitle("scPCA of treatments vs DMSO (colored by viability)") +
+  theme_minimal()
+p12pat <- ggplot(scpca_4ev_df, aes(x = scPC1, y = scPC2, color = patID)) +
+  geom_point(alpha = 0.5) + ggtitle("scPCA of treatments vs DMSO (colored by patID)") +
+  theme_minimal()
+p13pat <- ggplot(scpca_4ev_df, aes(x = scPC1, y = scPC3, color = patID)) +
+  geom_point(alpha = 0.5) + ggtitle("scPCA of treatments vs DMSO (colored by patID)") +
+  theme_minimal()
+p14pat <- ggplot(scpca_4ev_df, aes(x = scPC1, y = scPC4, color = patID)) +
+  geom_point(alpha = 0.5) + ggtitle("scPCA of treatments vs DMSO (colored by patID)") +
+  theme_minimal()
+p12IGHV <- ggplot(scpca_4ev_df, aes(x = scPC1, y = scPC2, color = IGHV)) +
+  geom_point(alpha = 0.5) + ggtitle("scPCA of treatments vs DMSO (colored by IGHV)") +
+  theme_minimal()
+p13IGHV <- ggplot(scpca_4ev_df, aes(x = scPC1, y = scPC3, color = IGHV)) +
+  geom_point(alpha = 0.5) + ggtitle("scPCA of treatments vs DMSO (colored by IGHV)") +
+  theme_minimal()
+p12TP53 <- ggplot(scpca_4ev_df, aes(x = scPC1, y = scPC2, color = TP53)) +
+  geom_point(alpha = 0.5) + ggtitle("scPCA of treatments vs DMSO (colored by TP53)") +
+  theme_minimal()
+
+plot_grid(p12tr, p13tr, p14tr, p12via, p13via, p14via, p12pat, p13pat, p14pat, p12IGHV, p13IGHV, p12TP53, ncol=3)
+```
+
+
+# Correlation of viability with gene expression
+In this section, we want to extract genes that are associated with viability. 
+
+The pearson correlation estimates the association between paired samples (gene expression of gene A in all DMSO samples vs viability in all DMSO samples) and computes a test of the value being zero. The measure of association is in the range [-1, 1] with Null indicating no association. The test statistic is based on Pearson's product moment correlation coefficient cor(x, y) and follows a t distribution with length(x)-2 degrees of freedom, if the samples follow independent normal distributions. If there are at least 4 complete pairs of observations, an asymptotic confidence interval is given based on Fisher's Z transform. 
+
+One drawback of this method is that the data needs to follow a normal distribution. If this is not the case, the Spearman correlation is a good alternative. It nearly relies on the same assumptions as the Pearson correlation, but it does not rely on normality and hence it is a non-parametric test. Spearman’s correlation coefficient is a measure of the strength of a monotonic relationship between paired data. Its interpretation is similar to that of Pearsons. Spearman’s correlation works by calculating Pearson’s correlation on the ranked (from low to high) values, as shown in [statstutor](http://www.statstutor.ac.uk/resources/uploaded/spearmans.pdf).
+
+Preparations (we use the vst normalized gene expression matrix of all genes (without patient normalization))
+```{r}
+# Transpose the matrix
+exprMat.t <- data.frame(t(exprMat))
+exprMat.t <- rownames_to_column(exprMat.t, var="Ensembl")
+
+# Convert the matrix to a data frame and add informative columns
+PCA_genes_df <- pcaTab5000 %>%
+  dplyr::select(c(ID, PC1, FSC.SSC, FSC.SSC.norm, treatment)) %>%
+  mutate(treatment = str_replace_all(treatment,"[- ]","_"))
+PCA_genes_df <- left_join(PCA_genes_df, exprMat.t, by = c("ID" = "Ensembl"))
+
+# Check if there are any columns with only the same values, i.e. a standard deviation of Null
+which(apply(PCA_genes_df, 2, function(a) length(unique(a))==1))
+
+# Subset df to only contain DMSO samples
+PCA_genes_df_DMSO <- PCA_genes_df[PCA_genes_df$treatment == "DMSO",]
+```
+
+
+## Normal distribution
+
+We first need to check, whether the data follows a normal distribution.
+A normal distribution is referred to a graph which has a bell shape curve with the values of the variable in the horizontal axis and the count of the values in the vertical axis. The center of the curve represents the mean of the data set. In the graph, fifty percent of values lie to the left of the mean and the other fifty percent lie to the right side.
+```{r}
+# Define a function for plotting a normal distribution for a selected column 
+normal_plot <- function(col, width, xtitle){
+
+  mean <- mean(PCA_genes_df_DMSO[[col]])
+  sd <- sd(PCA_genes_df_DMSO[[col]])
+
+  # The dnorm function gives the height of the probability distribution
+  # at each point for a given mean and standard deviation
+  norm_dist <- dnorm(PCA_genes_df_DMSO[[col]], mean=mean, sd=sd)
+  p1 <- plot(PCA_genes_df_DMSO[[col]], norm_dist, xlab=xtitle) +
+    title(sprintf("Normal distribution of %s", col)) +
+    abline(v=mean, col="blue")
+
+  # The Cumulative Distribution function gives the probability of a normally
+  # distributed random number to be less than the value of a given number.
+  p_dist <- pnorm(PCA_genes_df_DMSO[[col]], mean=mean, sd=sd)
+  p2 <- plot(PCA_genes_df_DMSO[[col]], p_dist, xlab=xtitle) +
+    title(sprintf("Cumulative distribution of %s", col))
+  
+  # Histogram
+  p3 <- ggplot(data=PCA_genes_df_DMSO, aes(x=.data[[col]])) + 
+    geom_histogram(binwidth = width) + xlab(xtitle)
+  
+  # Boxplot
+  p4 <- ggplot(data=PCA_genes_df_DMSO, aes(.data[[col]])) + 
+    geom_boxplot() +
+    xlab(xtitle)
+    #stat_summary(fun.y=mean, geom="hline", linetype=2)
+
+  return(plot_grid(p1, p2, p3, p4, ncol=2))
+}
+```
+
+### Principal Component 1
+```{r, fig.width=10, fig.height=5}
+normal_plot(col="PC1", width=8, xtitle="PC1")
+
+# Calculate skewness and standard deviation
+moments::skewness(PCA_genes_df_DMSO$PC1)
+sd(PCA_genes_df_DMSO$PC1)
+```
+The data can be considered as normally distributed if the skewness coefficient is less than two times the standard deviation. This is the case for PC1, although many samples can be considered as outliers. 
+
+### Viability
+```{r, fig.width=10, fig.height=5}
+normal_plot(col="FSC.SSC", width=3, xtitle="Viability")
+
+# Calculate skewness and standard deviation
+moments::skewness(PCA_genes_df_DMSO$FSC.SSC)
+sd(PCA_genes_df_DMSO$FSC.SSC)
+```
+The viability data can be considered as normally distributed with a little bit more data on the left side.
+
+### TP53
+```{r, fig.width=10, fig.height=5}
+normal_plot(col="ENSG00000141510", width=0.05,
+            xtitle="TP53 gene expression")
+```
+
+The median of the boxplot is fairly close to the centre of the box and the whiskers are of approximate equal length. Thus, the data is normally distributed. This is expected, as the gene expression counts were transformed using variance stabilisation transformation which converts the raw counts into normalized counts that are Gaussian distributed. Thus, Pearson correlation can be applied to the normalized gene expression data.
+
+## Monotonic relationship
+Are the two variables correlated? 
+Is the relationship between gene expression of TP53 and viability monotonic? 
+To test this, we plot the normalized gene expression data vs viability and the ranked data in another plot. 
+```{r, fig.height=5, fig.width=10}
+# Normalized data
+p1 <- ggplot(data=PCA_genes_df_DMSO, aes(x=FSC.SSC, y=ENSG00000141510)) + 
+  geom_point() + ylab("Norm. gene expression of TP53")
+
+# Ranked data
+p2 <- ggplot(data=PCA_genes_df_DMSO,
+             aes(x=rank(FSC.SSC), y=rank(ENSG00000141510))) + 
+  geom_point() + ylab("Norm. gene expression of TP53")
+
+plot_grid(p1, p2, ncol=2)
+```
+The relationship is rather linear than monotonic. 
+If the relationship would be monotonic, the right plot would show a linear relationship. 
+Therefore, Pearson correlation is the test statistic of choice.
+
+## Correlation test
+The cor.test function in R can be used to test for association between paired samples.
+
+### Example for TP53
+
+We test the correlation of TP53 gene expression of all samples with viability (FSC.SSC). 
+```{r}
+genes_viability <- cor.test(PCA_genes_df$FSC.SSC,
+                            PCA_genes_df$ENSG00000141510,
+         alternative = "two.sided",
+         method = "pearson", conf.level = 0.95)
+genes_viability
+```
+
+Visualize the correlation of TP53 and viability
+```{r, fig.height=5, fig.width=15}
+p1 <- ggplot(PCA_genes_df, aes(x=FSC.SSC, y=ENSG00000141510)) +
+  scattermore::geom_scattermore(pointsize = 1.5) +
+  ggtitle("Pearson correlation of viability and TP53 expression") +
+  geom_smooth(method="glm") +
+  annotate(x=70, y=8.5,
+           label=paste("R = ", round(cor(PCA_genes_df$FSC.SSC,
+                                         PCA_genes_df$ENSG00000141510),2)), 
+         geom="text", size=5)
+
+p2 <- ggplot(PCA_genes_df, aes(x=FSC.SSC, y=ENSG00000141510)) +
+  scattermore::geom_scattermore(pointsize = 1.5) +
+  ggtitle("Spearman correlation of viability and TP53 expression") +
+  geom_smooth(method="glm") +
+  annotate(x=70, y=8.5,
+           label=paste("R = ", round(cor(PCA_genes_df$FSC.SSC,
+                                         PCA_genes_df$ENSG00000141510,
+                                         method="spearman"),2)), 
+         geom="text", size=5)
+plot_grid(p1, p2, ncol=2)
+```
+
+Visualize the correlation of JUN and viability
+```{r, fig.height=5, fig.width=15}
+p1 <- ggplot(PCA_genes_df, aes(x=FSC.SSC, y=ENSG00000177606)) +
+  scattermore::geom_scattermore(pointsize = 1.5) +
+  ggtitle("Pearson correlation of viability and JUN expression") +
+  geom_smooth(method="glm") +
+  annotate(x=70, y=11.25,
+           label=paste("R = ", round(cor(PCA_genes_df$FSC.SSC,
+                                         PCA_genes_df$ENSG00000177606),2)), 
+         geom="text", size=5)
+
+p2 <- ggplot(PCA_genes_df, aes(x=FSC.SSC, y=ENSG00000177606)) +
+  scattermore::geom_scattermore(pointsize = 1.5) +
+  ggtitle("Spearman correlation of viability and JUN expression") +
+  geom_smooth(method="glm") +
+  annotate(x=70, y=11.25,
+           label=paste("R = ", round(cor(PCA_genes_df$FSC.SSC,
+                                         PCA_genes_df$ENSG00000177606,
+                                         method="spearman"),2)), 
+         geom="text", size=5)
+plot_grid(p1, p2, ncol=2)
+```
+
+```{r, fig.height=5, fig.width=10}
+# Raw data
+p1 <- ggplot(data=PCA_genes_df_DMSO, aes(x=FSC.SSC, y=ENSG00000177606)) + 
+  geom_point() + ylab("Norm. gene expression of JUN")
+
+# Ranked data
+p2 <- ggplot(data=PCA_genes_df_DMSO,
+             aes(x=rank(FSC.SSC), y=rank(ENSG00000177606))) + 
+  geom_point() + ylab("Norm. gene expression of JUN")
+
+plot_grid(p1, p2, ncol=2)
+```
+
+***Conclusion: Although the viability is not perfectly normally distributed, the relationship between gene expression and viability is rather linear than monotonic. Hence, the Pearson correlation is more suitable than Spearman correlation.***
+
+### Correlation between viability and gene expression of genes for each treatment
+
+Preparations:
+Function to conduct a correlation test for all genes and to summarize the results in one data frame
+```{r}
+cor_viab_genes <- function(genes_df, column){
+  
+  # Create empty data frame
+  df <- data.frame(t(data.frame(c(NA, NA, NA, NA, "example"))))
+  colnames(df)<- c("Pearson_cor","Pvalue","95%_confidence1","95%_confidence2", "gene")
+
+  # Conduct correlation test for every gene and add results as one row to df
+  for(gene in 6:ncol(genes_df)){
+    cor_res <- cor.test(genes_df[[column]], genes_df[[gene]],
+          alternative = "two.sided", method = "pearson", conf.level = 0.95)
+    new_row <- c(cor_res$estimate, cor_res$p.value, cor_res$conf.int[1],
+                 cor_res$conf.int[2], colnames(genes_df[gene][1]))
+    df <- rbind(df, new_row)
+  }
+
+  # Rename row names and add gene symbols
+  df <- df[-1,]  #delete first row of df
+  df <- df %>% mutate(symbol = rowData(ddsDrug)[gene,]$symbol, .before="Pearson_cor")
+  df <- remove_rownames(df) %>% column_to_rownames("gene")
+
+  # Columns should be numeric and contain only 3 decimals
+  num <- c("Pearson_cor","Pvalue","95%_confidence1","95%_confidence2")
+  df[num] <- sapply(df[num], as.numeric)
+  df <- df %>% mutate_if(is.numeric, formatC, digits=3)
+  return(df)
+}
+
+num <- c("Pearson_cor","Pvalue","95%_confidence1","95%_confidence2")
+```
+
+First we need to filter the data frame so that it only contains the rows with samples for one treatment.
+Then, we can perform the Pearson correlation test with the normalized viability (corrected for DMSO) and create a results data frame.
+```{r, eval=FALSE, include=TRUE}
+cor_viability_list <- lapply(allTreat, function(tr) {
+  print(tr)
+  # Filter data frame rows
+  genes_df_filter <- PCA_genes_df[PCA_genes_df$treatment == tr, ]
+  print(dim(genes_df_filter))
+    
+  # Conduct correlation test
+  cor_df <- cor_viab_genes(genes_df=genes_df_filter, column="FSC.SSC.norm")
+  
+  # Add column for treatment
+  cor_df$treatment <- tr
+  result_df <- cor_df
+}) 
+names(cor_viability_list) <- allTreat
+save(cor_viability_list, file = "./output/correlation_FSCSSC_genes_indTreat.RData")
+```
+
+Add genes associated with viability in DMSO samples. Here we use viability, not normalized viability.
+```{r}
+load("./output/correlation_FSCSSC_genes_indTreat.RData")
+
+genes_df_DMSO <- PCA_genes_df[PCA_genes_df$treatment == "DMSO", ]
+cor_df <- cor_viab_genes(genes_df=genes_df_DMSO, column="FSC.SSC")
+cor_df$treatment <- "DMSO"
+DMSO_list <- list(cor_df)
+names(DMSO_list) <- "DMSO"
+
+cor_viability_listall <- append(cor_viability_list, DMSO_list)
+```
+
+For each treatment data frame we calculate the adjusted p-values. 
+Then, we combine all data frames and view all results in one data table. 
+```{r}
+cor_viability_listmod <- lapply(cor_viability_listall, function(tr) {
+  df <- rownames_to_column(tr, var="Ensembl")
+  df[num] <- sapply(df[num], as.numeric)
+  df$padjBH <- p.adjust(df$Pvalue, method="BH")
+  df_mod <- df
+})
+
+cor_viability_df <- cor_viability_listmod %>%
+  bind_rows() %>% drop_na(Pearson_cor)
+cor_viability_df <- cor_viability_df[, c(1, 2, 3, 8, 4, 5, 6, 7)]
+```
+
+Filter by adjusted p-value
+```{r}
+cor_viability_df %>% filter(padjBH <= 0.02) %>% arrange(padjBH) %>%
+  mutate_if(is.numeric, formatC, digits=3) %>% DT::datatable()
+```
+
+#### Correlation of DMSO samples with viability or apoptosis
+The DMSO results are much more relevant than the results for the individual treatments, as the strongly expressed genes are truly upregulated due to apoptosis and not due to any treatment. 
+
+View the genes correlated with apoptosis
+```{r}
+cor_viability_df %>% filter(treatment == "DMSO") %>%
+  filter(Pearson_cor <= -0.5) %>%
+  filter(padjBH <= 0.02) %>% arrange(padjBH) %>%
+  mutate_if(is.numeric, formatC, digits=3) %>% DT::datatable()
+```
+Many genes in this list are transcription factors.
+
+View the genes correlated with viability
+```{r}
+cor_viability_df %>% filter(treatment == "DMSO") %>%
+  filter(Pearson_cor >= 0.4) %>%
+  filter(padjBH <= 0.02) %>% arrange(padjBH) %>%
+  mutate_if(is.numeric, formatC, digits=3) %>% DT::datatable()
+```
+
+
+#### Visualization of top associated genes with apoptosis
+
+Function for correlation plot showing viability vs gene expression
+```{r}
+cor_plot <- function(ensembl, name, xcor, ycor){
+  plot <- ggplot(genes_df_DMSO,
+                 aes(x=FSC.SSC, y=.data[[ensembl]])) +
+    scattermore::geom_scattermore(pointsize = 1.5) +
+    ggtitle(sprintf("Correlation of viability and %s expression", name)) +
+    geom_smooth(method="glm") +
+    labs(x="Viability (FSC.SSC)", y=sprintf("norm. %s expression", name)) +
+    annotate(x=xcor, y=ycor,
+             label=paste("R = ", round(cor(PCA_genes_df$FSC.SSC,
+                                         PCA_genes_df[[ensembl]]),2)), 
+             geom="text", size=5)
+  return(plot)
+}
+```
+
+The top 9 genes associated with apoptosis are JUN, PPP1R15A (protein phosphatase 1 regulatory subunit 15A), FOSB (proto-oncogene, AP-1 transcription factor subunit), PABPC4, DNAJB1 (DnaJ heat shock protein family (Hsp40) member B1), FOS, SRRM2 (serine/arginine repetitive matrix 2), RGS2 (regulator of G-protein signaling), and NUP62 (Nucleoporin 62).
+
+The negative correlation between expression of these genes and viability (FSC.SSC) indicates that these genes are more active in cells close to cell death, and less active in healthy, viable cells.
+
+JUN is a proto-oncogene and associated with diseases such as Sarcoma and Primary Cutaneous T-Cell Lymphoma. It is related to the NF-kappaB pathway, apoptosis pathways, and involved in activated KRAS-mediated transcriptional activation of USP28 in colorectal cancer cells (PubMed:24623306).
+The FOS gene family encodes leucine zipper proteins that can dimerize with proteins of the JUN family (e.g., c-Jun, JunD), thereby forming the transcription factor complex AP-1. Thus, the FOS proteins have been implicated as regulators of cell proliferation, differentiation, and transformation (see [Entrez Gene](https://www.ncbi.nlm.nih.gov/gene?Db=gene&Cmd=ShowDetailView&TermToSearch=2354)).
+
+```{r, fig.width=20, fig.height=10}
+cor_JUN <- cor_plot(ens="ENSG00000177606", name="JUN", xcor=81, ycor=9.25)
+cor_PPP1R15A <- cor_plot(ens="ENSG00000087074", name="PPP1R15A", xcor=81, ycor=9.25)
+cor_FOSB <- cor_plot(ens="ENSG00000125740", name="FOSB", xcor=81, ycor=7.65)
+cor_PABPC4 <- cor_plot(ens="ENSG00000090621", name="PABPC4", xcor=81, ycor=10.25)
+cor_DNAJB1 <- cor_plot(ens="ENSG00000132002", name="DNAJB1", xcor=81, ycor=9.25)
+cor_FOS <- cor_plot(ens="ENSG00000170345", name="FOS", xcor=81, ycor=7.75)
+cor_SRRM2 <- cor_plot(ens="ENSG00000167978", name="SRRM2", xcor=81, ycor=11.75)
+cor_RGS2 <- cor_plot(ens="ENSG00000116741", name="RGS2", xcor=81, ycor=10.25)
+cor_NUP62 <- cor_plot(ens="ENSG00000213024", name="NUP62", xcor=81, ycor=9.25)
+
+plot_grid(cor_JUN, cor_PPP1R15A, cor_FOSB, cor_PABPC4, cor_DNAJB1,
+          cor_FOS, cor_SRRM2, cor_RGS2, cor_NUP62, ncol=3)
+```
+
+
+#### Visualization of top associated genes with viable cells
+
+The four genes with the largest positive Pearson correlation coefficient are TLR7, CD79B, STX7, and ZNF24.
+
+The positive correlation of expression of those genes and viability (FSC.SSC) indicates that these genes are more often expressed in healthy, viable cells. Thus, they are not associated with cell death.
+```{r, fig.width=11, fig.height=6}
+cor_TLR7 <- cor_plot(ens="ENSG00000196664", name="TLR7", xcor=19, ycor=7.75)
+cor_CD79B <- cor_plot(ens="ENSG00000007312", name="CD79B", xcor=19, ycor=9.75)
+cor_STX7 <- cor_plot(ens="ENSG00000079950", name="STX7", xcor=19, ycor=10.25)
+cor_ZNF24 <- cor_plot(ens="ENSG00000172466", name="ZNF24", xcor=19, ycor=9.1)
+
+plot_grid(cor_TLR7, cor_CD79B, cor_STX7, cor_ZNF24, ncol=2)
+```
+
+The CD79B gene encodes the B-cell antigen receptor complex-associated protein (beta chain). The B lymphocyte antigen receptor is a multimeric complex that includes the antigen-specific component, surface immunoglobulin (Ig). Surface Ig non-covalently associates with two other proteins, Ig-alpha and Ig-beta, which are necessary for expression and function of the B-cell antigen receptor. Among its related pathways are Hematopoietic Stem Cells and Lineage-specific Markers and Immune response Fc epsilon RI pathway (see [GeneCards](https://www.genecards.org/cgi-bin/carddisp.pl?gene=CD79B&keywords=CD79B)). 
+
+
+#### Overlap of genes associated with viability
+
+Filter the data frames and retrieve two gene lists per treatment (one with positive correlation, one with negative correlation).
+```{r}
+cor_viability_list_pos <- lapply(cor_viability_listmod, function(df) {
+  top_df <- dplyr::filter(df, padjBH <= 0.05)
+  pos_df <- dplyr::filter(top_df, Pearson_cor >= 0.37) %>% arrange(desc(Pearson_cor))
+  pos_vec <- pos_df$Ensembl
+})
+
+cor_viability_list_neg <- lapply(cor_viability_listmod, function(df) {
+  top_df <- dplyr::filter(df, padjBH <= 0.05)
+  neg_df <- dplyr::filter(top_df, Pearson_cor <= -0.37) %>% arrange(desc(Pearson_cor))
+  neg_vec <- neg_df$Ensembl
+})
+```
+When we compare the lists for positive and negative correlation, there are much more genes associated with apoptosis than with viability, since ten times more genes are in the lists for negative correlation.
+
+The genes associated with viability per treatment can be depicted in an UpsetR plot to show the overlapping genes between the treatments and the unique genes.
+
+Positive association (high gene expression in viable cells)
+```{r, fig.height=10, fig.width=15}
+UpSetR::upset(UpSetR::fromList(cor_viability_list_pos), nsets = 30)
+```
+
+Negative association (high gene expression in apoptotic cells)
+```{r, fig.height=10, fig.width=15}
+UpSetR::upset(UpSetR::fromList(cor_viability_list_neg), nsets = 30)
+```
+We would expect a rather high overlap between DMSO and the drugs, as the background apoptosis should be present in all samples regardless of the treatment. This is true for DMSO and Nutlin 3a. However, we used normalized viability for obtaining the genes associated with viability.
+
+Another possibility for getting genes associated with viability is to perform a differential gene expression with DESeq.
+Therefore, the patients need to be grouped based on viability, e.g. 20-30%, 30-40%, prior to performing the analysis. This grouping is used as the covariate for the analysis.
+
+
+## PCA
+
+### Only with apoptotic genes
+We conduct a PCA only with genes that are associated with apoptosis. 
+It is expected to see the viability very clearly in PC1.
+```{r}
+# Filter gene expression matrix
+exprMat_apoptosis <- exprMat[rownames(exprMat) %in% cor_viability_list_neg$DMSO, ]
+
+pcaRes <- prcomp(t(exprMat_apoptosis), scale=TRUE, center=TRUE)
+varExp <- (pcaRes$sdev^2 / sum(pcaRes$sdev^2))*100
+pcaTab_apoptosis <- data.frame(pcaRes$x[,1:10]) %>%
+  rownames_to_column("ID") %>% left_join(patAnno)
+names(varExp) <- colnames(pcaRes$x)
+```
+
+```{r, fig.height=4, fig.width=10}
+p1 <- ggplot(pcaTab_apoptosis, aes(x=PC1, y=PC2, col=FSC.SSC)) + geom_point(size=2) + theme_bw() + 
+  xlab(sprintf("PC1 (%2.1f%%)",varExp[1])) + ylab(sprintf("PC2 (%2.1f%%)",varExp[2])) +
+  ggtitle("PCA colored by viability")
+p2 <- ggplot(pcaTab_apoptosis, aes(x=PC1, y=PC2, col=IGHV)) + geom_point(size=2) + theme_bw() + 
+  xlab(sprintf("PC1 (%2.1f%%)",varExp[1])) + ylab(sprintf("PC2 (%2.1f%%)",varExp[2])) +
+  ggtitle("PCA colored by IGHV")
+plot_grid(p1, p2, ncol=2)
+```
+
+### Without apoptotic genes
+We conduct a PCA without the genes presumably associated with apoptosis. 
+```{r}
+# Filter gene expression matrix
+exprMat_without <- exprMat_5000[!rownames(exprMat_5000) %in% cor_viability_list_neg$DMSO, ]
+
+pcaRes <- prcomp(t(exprMat_without), scale=TRUE, center=TRUE)
+varExp <- (pcaRes$sdev^2 / sum(pcaRes$sdev^2))*100
+pcaTab_without <- data.frame(pcaRes$x[,1:10]) %>%
+  rownames_to_column("ID") %>% left_join(patAnno)
+names(varExp) <- colnames(pcaRes$x)
+```
+
+```{r, fig.height=4, fig.width=10}
+p1 <- ggplot(pcaTab_without, aes(x=PC1, y=PC2, col=FSC.SSC)) + geom_point(size=2) + theme_bw() + 
+  xlab(sprintf("PC1 (%2.1f%%)",varExp[1])) + ylab(sprintf("PC2 (%2.1f%%)",varExp[2])) +
+  ggtitle("PCA colored by viability")
+p2 <- ggplot(pcaTab_without, aes(x=PC1, y=PC2, col=IGHV)) + geom_point(size=2) + theme_bw() + 
+  xlab(sprintf("PC1 (%2.1f%%)",varExp[1])) + ylab(sprintf("PC2 (%2.1f%%)",varExp[2])) +
+  ggtitle("PCA colored by IGHV")
+plot_grid(p1, p2, ncol=2)
+```
+PC1 describes only 20% of the variation in comparison to 38%. However, PC1 is still the viability.
+
+
+## Bar plot
+This plot compares genes associated with viability in samples for one treatment with genes that respond to this respective drug treatment. 
+
+First, we load the results from the differential expression analysis for all treatments, combined in one data frame.
+The design formula for the DE analysis was ~ patID + treatment.
+```{r}
+load("./output/Combined_CLL_DEres_HTSeq_batchPilot1c234_allRes_20220213.RData")
+
+allRes_sig <- filter(allRes, padj < 0.05)
+DE_list <- lapply(allTreat, function(tr) {
+  filter(allRes_sig, treatment == tr)$Ensembl
+  })
+names(DE_list) <- allTreat
+```
+
+Split the data frame into up- and downregulated genes and set the LFC cut-off to 1.5 (log2(1.5) = 0.58)
+```{r}
+allRes_up <- filter(allRes, log2FoldChange > 0.58)
+allRes_down <- filter(allRes, log2FoldChange < -0.58)
+```
+
+Prepare gene lists with all significant differentially expressed genes per treatment
+```{r}
+# Upregulated genes
+allRes_up_sig <- filter(allRes_up, padj < 0.05)
+DE_list_up <- lapply(allTreat, function(tr) {
+  filter(allRes_up_sig, treatment == tr)$Ensembl
+  })
+names(DE_list_up) <- allTreat
+
+# Downregulated genes
+allRes_down_sig <- filter(allRes_down, padj < 0.05)
+DE_list_down <- lapply(allTreat, function(tr) {
+  filter(allRes_down_sig, treatment == tr)$Ensembl
+  })
+names(DE_list_down) <- allTreat
+```
+
+Now, we combine the information of differentially expressed genes with the info about genes associated with apoptosis. 
+We prepare a data frame which contains the number of genes only identified as differentially expressed, only associated with viability, or identified in both gene lists.
+```{r}
+overlap_function <- function(gene_lists){
+  overlap_df <- data.frame(number_of_genes="1", treatment="na", occurence="na")
+
+  for(tr in allTreat){
+    new_rows <- data.frame(c(length(setdiff(cor_viability_list_neg[["DMSO"]],
+                                          gene_lists[[tr]])), tr, "Unique_viability"),
+                           c(length(intersect(cor_viability_list_neg[["DMSO"]],
+                                              gene_lists[[tr]])), tr, "Overlap"),
+                           c(length(setdiff(gene_lists[[tr]],
+                                            cor_viability_list_neg[["DMSO"]])), tr, "Unique_DE"))
+    new_rows_df <- as.data.frame(t(new_rows))
+    new_rows_df <- remove_rownames(new_rows_df)
+    colnames(new_rows_df) <- c("number_of_genes", "treatment", "occurence")
+  
+    overlap_df <- rbind(overlap_df, new_rows_df)
+  }
+
+  # Remove first row from data frame
+  overlap_df <- overlap_df[-1,]
+
+  # Make column numeric
+  overlap_df$number_of_genes <- as.numeric(overlap_df$number_of_genes)
+  return(overlap_df)
+}
+
+overlap_DEup_viability <- overlap_function(DE_list_up) %>%
+  mutate(percentage = as.character(number_of_genes))
+overlap_DEdown_viability <- overlap_function(DE_list_down) %>%
+  mutate(percentage = as.character(number_of_genes))
+```
+
+Calculate percentage of overlap DE genes with apoptotic genes to show on top of overlap column
+```{r}
+overlap_percentage <- function(gene_lists){
+  percentage_vec <- c()
+
+  for(tr in allTreat){
+    overlap_percentage <- round(length(intersect(cor_viability_list_neg[["DMSO"]],
+                                           gene_lists[[tr]])) / length(gene_lists[[tr]]) * 100, 1)
+    percentage_vec <- append(percentage_vec, paste(as.character(overlap_percentage),"%", sep=""))
+  }
+  return(percentage_vec)
+}
+
+overlap_percentage_up <- overlap_percentage(DE_list_up)
+overlap_percentage_down <- overlap_percentage(DE_list_down)
+
+# Add percentage info to data frame
+overlap_DEup_viability$percentage[overlap_DEup_viability$occurence == "Overlap"] <- overlap_percentage_up
+overlap_DEdown_viability$percentage[overlap_DEdown_viability$occurence == "Overlap"] <- overlap_percentage_down
+```
+
+
+Define function for showing barplot
+```{r}
+barplot_overlap <- function(df, dir){
+  plot <- ggplot(df, aes(x=factor(treatment, levels=allTreat), number_of_genes,
+                                 group = factor(occurence, levels=c("Unique_viability",
+                                                                    "Overlap", "Unique_DE")),
+                                 fill = occurence)) +
+  geom_col(position = "dodge", colour = "black") +
+  ggtitle(sprintf("Overlap of viability-associated genes with %sregulated genes", dir)) +
+  labs(x="treatments", y="number of genes") +
+  geom_text(aes(label=percentage),vjust=-0.5,size=4,fontface="bold",
+            position=position_dodge(width=1)) +
+  scale_fill_manual(values=c(Overlap="#999999", Unique_DE="#E69F00",
+                             Unique_viability="#56B4E9"))
+  return(plot)
+}
+```
+
+Show bar plot for upregulated genes
+```{r, fig.height=10, fig.width=20}
+barplot_overlap_up <- barplot_overlap(overlap_DEup_viability, "up")
+barplot_overlap_up
+```
+From this plot we can suggest that the overlap correlates with the toxicity of the drugs.
+For Everolimus the overlap between genes associated with viability and genes considered as differentially expressed is largest on a percentage basis. 
+The percentage on top of the grey bars is the proportion of genes considered as DE, but which are perhaps upregulated due to apoptosis and not due to the treatment. 
+
+Show bar plot for downregulated genes
+```{r, fig.height=10, fig.width=20}
+barplot_overlap_down <- barplot_overlap(overlap_DEdown_viability, "down")
+barplot_overlap_down
+```
+Less downregulated genes are overlap with genes associated with apoptosis than upregulated genes. This indicates that apoptosis is an active process in which genes are actively upregulated. 
+
+## Heatmaps without apoptotic genes
+
+The genes associated with apoptosis are removed from the significant DE genes. With this subset of genes a heatmap is plotted.
+
+### Upregulated genes
+
+Show most significant genes of every treatment in a heatmap
+```{r}
+DE_genes_up <- unique(allRes_up_sig$Ensembl)
+DE_genes_up_diff <- setdiff(DE_genes_up, cor_viability_list_neg[["DMSO"]])
+
+# Extract and subset normalized expression matrix
+#exprMat <- limma::removeBatchEffect(assay(ddsAllnorm), batch=factor(ddsAllnorm$patID))
+exprMatsub <- exprMat[rownames(exprMat) %in% DE_genes_up_diff,]
+
+# Define annotations
+annoCol <- as.data.frame(RNAnorm_all@colData) %>%
+  dplyr::select(patID, FSC.SSC, treatment, IGHV, TP53, trisomy12, batch) %>%
+  mutate(treatment = str_replace_all(treatment,"[- ]","_"))
+
+annoCol$TP53 <- as.character(annoCol$TP53)
+annoCol$TP53[annoCol$TP53 == "0"] <- "wt"
+annoCol$TP53[annoCol$TP53 == "1"] <- "m"
+annoCol$trisomy12 <- as.character(annoCol$trisomy12)
+annoCol$trisomy12[annoCol$trisomy12 == "0"] <- "wt"
+annoCol$trisomy12[annoCol$trisomy12 == "1"] <- "m"
+
+# Define colors
+color_fill <- colorRampPalette( rev(brewer.pal(9,"RdBu")) )(255)
+color_anno = list(
+  batch = c(pilot="#F8F417", batch1="#B5E222", batch2="#76EE3D", batch3="#07D256", batch4="#0A9C43"),
+  trisomy12 = c(wt = "#DB86C6", m = "#9E137B"),
+  TP53 = c(wt = "#F0C538", m = "#AC8400"),
+  IGHV = c(U="#A4FFF4", M="#17C6B1"),
+  treatment = c(DMSO="#FFFFFF", C26="#E41A1C", Duvelisib="#4A72A6", Everolimus="#7E6E85",
+                IBET762="#D16948", Ibr_x_C26="#FFB716", Ibrutinib="#E1C62F", MK2206="#B75F49",
+                Nutlin_3a = "#EC83BA", Selinexor="#999999", Trametinib="#48A462"))
+```
+
+
+```{r, fig.width=16, fig.height=13}
+exprMatsub <- jyluMisc::mscale(exprMatsub, censor=2)
+
+pheatmap(exprMatsub, color = color_fill, annotation_col = annoCol,
+         annotation_colors = color_anno, clustering_method = "ward.D2", fontsize=13,
+         labels_col = paste0(patAnno[colnames(exprMatsub),]$patID,"_",
+                             patAnno[colnames(exprMatsub),]$treatment),
+         show_rownames=T, fontsize_row=3, show_colnames=T, fontsize_col=2,
+         main = "Heatmap of most significant upregulated genes per treatment")
+```
+
+
+### Downregulated genes
+
+Show most significant genes of every treatment in a heatmap
+```{r, fig.width=16, fig.height=13}
+DE_genes_down <- unique(allRes_down_sig$Ensembl)
+DE_genes_down_diff <- setdiff(DE_genes_down, cor_viability_list_neg[["DMSO"]])
+exprMatsub <- exprMat[rownames(exprMat) %in% DE_genes_down_diff,]
+exprMatsub <- jyluMisc::mscale(exprMatsub, censor=2)
+
+pheatmap(exprMatsub, color = color_fill, annotation_col = annoCol,
+         annotation_colors = color_anno, clustering_method = "ward.D2", fontsize=13,
+         labels_col = paste0(patAnno[colnames(exprMatsub),]$patID,"_",
+                             patAnno[colnames(exprMatsub),]$treatment),
+         show_rownames=T, fontsize_row=3, show_colnames=T, fontsize_col=2,
+         main = "Heatmap of most significant downregulated genes per treatment")
+```
+
+## Heatmaps without genes associated with viability or apoptosis
+
+### Upregulated genes
+
+Show most significant genes of every treatment in a heatmap
+```{r, fig.width=16, fig.height=13}
+DE_genes_up <- unique(allRes_up_sig$Ensembl)
+genes_viability_apoptosis <- append(cor_viability_list_neg[["DMSO"]],
+                                    cor_viability_list_pos[["DMSO"]])
+
+DE_genes_up_diff <- setdiff(DE_genes_up, genes_viability_apoptosis)
+exprMatsub <- exprMat[rownames(exprMat) %in% DE_genes_up_diff,]
+exprMatsub <- jyluMisc::mscale(exprMatsub, censor=2)
+
+pheatmap(exprMatsub, color = color_fill, annotation_col = annoCol,
+         annotation_colors = color_anno, clustering_method = "ward.D2", fontsize=13,
+         labels_col = paste0(patAnno[colnames(exprMatsub),]$patID,"_",
+                             patAnno[colnames(exprMatsub),]$treatment),
+         show_rownames=T, fontsize_row=3, show_colnames=T, fontsize_col=2,
+         main = "Heatmap of most significant downregulated genes per treatment")
+```
+
+
+### Downregulated genes
+
+Show most significant genes of every treatment in a heatmap
+```{r, fig.width=16, fig.height=13}
+DE_genes_down <- unique(allRes_down_sig$Ensembl)
+
+DE_genes_down_diff <- setdiff(DE_genes_down, genes_viability_apoptosis)
+exprMatsub <- exprMat[rownames(exprMat) %in% DE_genes_down_diff,]
+exprMatsub <- jyluMisc::mscale(exprMatsub, censor=2)
+
+pheatmap(exprMatsub, color = color_fill, annotation_col = annoCol,
+         annotation_colors = color_anno, clustering_method = "ward.D2", fontsize=13,
+         labels_col = paste0(patAnno[colnames(exprMatsub),]$patID,"_",
+                             patAnno[colnames(exprMatsub),]$treatment),
+         show_rownames=T, fontsize_row=3, show_colnames=T, fontsize_col=2,
+         main = "Heatmap of most significant downregulated genes per treatment")
+```
+
+
+# Pathway enrichment analysis
+The enrichment analysis is conducted with the genes associated with apoptosis in the DMSO samples. 
+The aim is to find out whether there are pathways highly associated with apoptosis. 
+
+Define the relevant genes to be used in the pathway analysis
+```{r}
+cor_viability_DMSO <- cor_viability_df %>%
+  filter(treatment == "DMSO") %>%
+  filter(padjBH <= 0.02)
+dim(cor_viability_DMSO)
+```
+
+## clusterProfiler
+clusterProfiler is a universal enrichment tool for interpreting omics data and supports several ontology and pathway annotations. The data frame containing the genes associated with viability for all treatments is used as input.
+
+```{r prepare-cP}
+library(clusterProfiler)
+library(org.Hs.eg.db)
+
+# Convert Ensembl IDs to Entrez IDs
+EntrezID = mapIds(org.Hs.eg.db,
+                  keys=cor_viability_DMSO$Ensembl,
+                  column="ENTREZID",
+                  keytype="ENSEMBL",
+                  multiVals="first")
+
+# Create new df as input for ClusterProfiler
+cluster_df <- add_column(cor_viability_DMSO, EntrezID, .before = "symbol") %>%
+  dplyr::select(-`95%_confidence1`, -`95%_confidence2`, -Pvalue, -padjBH)
+
+# Filter the Pearson correlation coefficients
+cluster_df_neg <- cluster_df[cluster_df$Pearson_cor < -0.4,]
+dim(cluster_df_neg)
+cluster_df_pos <- cluster_df[cluster_df$Pearson_cor > 0.3,]
+dim(cluster_df_pos)
+```
+Filtering the Pearson correlation coefficients reduces the number of rows significantly.
+
+### ORA with "compareCluster" function and KEGG pathways
+[ClusterProfiler 4.0](https://doi.org/10.1016/j.xinn.2021.100141) was expanded for conducting biological theme comparison. 
+The provided function "compareCluster" calculates enriched functional profiles of each gene cluster and aggregates the results into a single object. Therefore, we can analyze the effects of all treatments at once. The disadvantage of "compareCluster" is that it can only perform over-representation analyses and not gene set enrichment analyses.
+
+```{r run-cP-KEGG}
+clusterResKEGGneg <- compareCluster(EntrezID~treatment, data=cluster_df_neg, fun="enrichKEGG",
+                                 organism="hsa", pvalueCutoff=0.2, pAdjustMethod = "BH")
+clusterResKEGGpos <- compareCluster(EntrezID~treatment, data=cluster_df_pos, fun="enrichKEGG",
+                                 organism="hsa", pvalueCutoff=0.2, pAdjustMethod = "BH")
+```
+
+**Dotplot**  
+The color gradient based on p-values may indicate which categories are more likely to have biological meanings. The size of the dots refers to the number of genes considered as significant within a pathway.
+
+Genes associated with apoptosis (negative correlation)
+```{r plot-cP-KEGGneg, fig.width=6, fig.height=6}
+dotplot(clusterResKEGGneg, showCategory=8, size="Count", includeAll=TRUE)
+```
+
+Genes associated with viability (positive correlation)
+```{r plot-cP-KEGGpos, fig.width=6, fig.height=6}
+dotplot(clusterResKEGGpos, showCategory=8, size="Count", includeAll=TRUE)
+```
+
+### ORA with "compareCluster" function and GO pathways
+In this analysis we use pathways from gene ontology.
+
+```{r run-cP-GO}
+clusterResGOneg <- compareCluster(EntrezID~treatment, data=cluster_df_neg, fun="enrichGO",
+                                  OrgDb=org.Hs.eg.db, pvalueCutoff=0.2, pAdjustMethod = "BH")
+clusterResGOpos <- compareCluster(EntrezID~treatment, data=cluster_df_pos, fun="enrichGO",
+                                  OrgDb=org.Hs.eg.db, pvalueCutoff=0.2, pAdjustMethod = "BH")
+```
+
+**Dotplot**  
+The color gradient based on p-values may indicate which categories are more likely to have biological meanings. The size of the dots refers to the number of genes considered as significant within a pathway.
+
+Genes associated with apoptosis (negative correlation)
+```{r plot-cP-GOneg, fig.width=6, fig.height=6}
+dotplot(clusterResGOneg, showCategory=8, size="Count")
+```
+
+Genes associated with viability (positive correlation)
+```{r plot-cP-GOpos, fig.width=6, fig.height=6}
+dotplot(clusterResGOpos, showCategory=8, size="Count")
+```
+
+### ORA with "compareCluster" function and Reactome pathways
+In this analysis we use pathways from Reactome, an open-source, manually curated and peer-reviewed pathway database.
+```{r run-cP-Reactome}
+library(ReactomePA)
+clusterResReactomeneg <- compareCluster(EntrezID~treatment, data=cluster_df_neg,fun="enrichPathway",
+                                        pvalueCutoff=0.2, pAdjustMethod = "BH")
+clusterResReactomepos <- compareCluster(EntrezID~treatment, data=cluster_df_pos, fun="enrichPathway",
+                                        pvalueCutoff=0.2, pAdjustMethod = "BH")
+```
+
+**Dotplot**  
+
+Genes associated with apoptosis (negative correlation)
+```{r plot-cP-Reactomeneg, fig.width=6, fig.height=6}
+dotplot(clusterResReactomeneg, showCategory=8, size="Count")
+```
+
+Genes associated with viability (positive correlation)
+```{r plot-cP-Reactomepos, fig.width=6, fig.height=7}
+dotplot(clusterResReactomepos, showCategory=8, size="Count")
+```
+
+
+### GSEA with "gseKEGG" function
+If we want to conduct a gene set enrichment analysis (GSEA) instead of an over-representation analysis, we have to use the "gseKEGG" function, which can only deal with one drug treatment at once. 
+
+Prepare the input list for clusterProfiler
+```{r prepare-cP-GSEA}
+# Negative correlations
+geneList_Pearson_neg <- cluster_df_neg$Pearson_cor
+geneList_Pearson_neg <- na.omit(sort(geneList_Pearson_neg, decreasing = TRUE))
+names(geneList_Pearson_neg) <- cluster_df_neg$EntrezID
+
+# Positive correlations
+geneList_Pearson_pos <- cluster_df_pos$Pearson_cor
+geneList_Pearson_pos <- na.omit(sort(geneList_Pearson_pos, decreasing = TRUE))
+names(geneList_Pearson_pos) <- cluster_df_pos$EntrezID
+```
+
+Run ClusterProfiler
+```{r run-cP-GSEA}
+gseGO_results_neg <- gseKEGG(geneList=geneList_Pearson_neg, organism = "hsa",
+                             pvalueCutoff = 0.2, pAdjustMethod = "BH")
+gseGO_results_pos <- gseKEGG(geneList=geneList_Pearson_pos, organism = "hsa",
+                             pvalueCutoff = 0.2, pAdjustMethod = "BH")
+```
+
+#### Dotplot
+Plot most important pathways as dotplot.
+
+Negative correlations
+```{r dotplot-cP-GSEAneg, fig.width=8, fig.height=6}
+dotplot(gseGO_results_neg, showCategory=8, split=".sign") +
+  facet_grid(.~.sign) +
+  theme(axis.text.y=element_text(face="bold"))
+```
+
+Positive correlations
+```{r dotplot-cP-GSEApos, fig.width=10, fig.height=8}
+dotplot(gseGO_results_pos, showCategory=8, split=".sign") +
+  facet_grid(.~.sign) +
+  theme(axis.text.y=element_text(face="bold"))
+```
+
+#### Enrichment map
+Enrichment map organizes enriched terms into a network with edges connecting overlapping gene sets. In this way, mutually overlapping gene sets are tend to cluster together, making it easy to identify functional modules.
+
+Negative correlations
+```{r enrich-cP-GSEAneg, fig.width=6, fig.height=6}
+library(enrichplot)
+
+map <- pairwise_termsim(gseGO_results_neg)
+emapplot(map, showCategory = 10)
+```
+
+Positive correlations
+```{r enrich-cP-GSEApos, fig.width=10, fig.height=6}
+map <- pairwise_termsim(gseGO_results_pos)
+emapplot(map, showCategory = 10)
+```
+
+#### Cnetplot
+The cnetplot depicts the linkages of genes and biological concepts (e.g. GO terms or KEGG pathways) as a network. This might be helpful to identify genes which are involved in enriched pathways or may belong to multiple annotation categories.
+
+Negative correlations
+```{r netplot-cP-GSEAneg, fig.width=18, fig.height=12}
+library(ggnewscale)
+
+cnetplot(gseGO_results_neg, categorySize="pvalue",
+         foldChange=geneList_Pearson_neg, showCategory=8)
+```
+
+Positive correlations
+```{r netplot-cP-GSEApos, fig.width=18, fig.height=12}
+cnetplot(gseGO_results_pos, categorySize="pvalue",
+         foldChange=geneList_Pearson_neg, showCategory=8)
+```
+
+#### Publication plot
+Plots the number of publications trend based on the query result from PubMed Central.
+```{r pubmed-cP-GSEA, fig.width=8, fig.height=4}
+library(europepmc)
+terms <- gseGO_results_neg$Description[1:4]
+pmcplot(terms, 2011:2021, proportion=FALSE)
+```
+
+## camera
+
+This method was proposed by Wu and Smyth in 2012. [camera](https://www.rdocumentation.org/packages/limma/versions/3.28.14/topics/camera) performs a competitive test in the sense defined by [Goeman and Buhlmann](https://doi.org/10.1093/bioinformatics/btm051). It tests whether the genes in the set are highly ranked in terms of differential expression relative to genes not in the set and thereby accounts for inter-gene correlation. As input camera only needs a count matrix and a design matrix. No prior differential expression (DE) is required, as camera performs a DE internally. The advantage of this method is that we obtain the information whether a significant pathway is up- or downregulated.
+
+### Preparations
+First, we have to prepare the gene lists and create the design matrix.
+```{r prepare-camera}
+gmt_KEGG <- read.gmt("data/c2.cp.kegg.v7.4.symbols.gmt.txt")
+gmt_Hallmark <- read.gmt("data/h.all.v7.4.symbols.gmt.txt")
+
+#Function for converting gene name data frame into list
+geneList <- function(source) {
+  pathwayNames <- levels(source$term)
+  newList<- vector("list")
+
+  for (pathway in pathwayNames) {
+    genes <- source$gene[source$term == pathway]
+    newList[[length(newList) + 1]] <- genes 
+  }
+  names(newList) <- pathwayNames
+  return(newList)
+}
+
+geneList_KEGG <- geneList(gmt_KEGG)
+geneList_Hallmark <- geneList(gmt_Hallmark)
+
+# Create design matrix
+patAnno_DMSO <- patAnno[patAnno$treatment == "DMSO",]
+designMat <- model.matrix(~ 0 + FSC.SSC, patAnno_DMSO)
+
+# Create count matrix (use vst data)
+counts_df_DMSO <- counts_df[, colnames(counts_df) %in% patAnno_DMSO$ID]
+```
+
+Convert Ensembl identifiers to gene symbols
+```{r convert-ids}
+library(annotate)
+# Convert Ensembl IDs to Entrez IDs
+entrezID = mapIds(org.Hs.eg.db,
+                  keys=row.names(counts_df_DMSO),
+                  column="ENTREZID",
+                  keytype="ENSEMBL",
+                  multiVals="first")
+
+# Convert Entrez IDs to gene symbols
+gene_symbols <- getSYMBOL(na.omit(as.vector(entrezID)),
+                          data="org.Hs.eg.db")
+
+# Create new df with gene symbols as row names
+counts_df_symbols <- add_column(counts_df_DMSO, entrezID) %>%
+  drop_na(entrezID) %>% add_column(gene_symbols) %>%
+  dplyr::select(-entrezID) %>% drop_na(gene_symbols) %>%
+  distinct(gene_symbols, .keep_all=TRUE) %>%
+  remove_rownames %>% column_to_rownames(var="gene_symbols")
+
+dim(counts_df_symbols)
+```
+
+Split the counts data frame in two:
+One df for the genes in DMSO samples associated with apoptosis, and a second one for genes associated with viability.
+```{r}
+genes_apoptosis <- cluster_df_neg$symbol
+genes_viability <- cluster_df_pos$symbol
+
+counts_df_symbols_neg <- counts_df_symbols[rownames(counts_df_symbols) %in% genes_apoptosis,]
+dim(counts_df_symbols_neg)
+counts_df_symbols_pos <- counts_df_symbols[rownames(counts_df_symbols) %in% genes_viability,]
+dim(counts_df_symbols_pos)
+```
+
+### Results for negative correlation
+Run camera function on apoptotic gene list
+```{r run-camera-neg}
+cameraRes_KEGGneg <- limma::camera(counts_df_symbols_neg, geneList_KEGG,
+                                  designMat, inter.gene.cor=0.01)
+cameraRes_Hallmarkneg <- limma::camera(counts_df_symbols_neg, geneList_Hallmark,
+                                       designMat, inter.gene.cor=0.01)
+```
+
+Plot most significant pathways as dotplot
+```{r plot-camera-neg, fig.width=20, fig.height=10}
+# Add information about total number of genes in pathways to calculate gene ratio
+#cameraRes_kegg <- mapply(cbind, cameraRes_kegg, "TGenes"=lengths(geneList_kegg))
+
+camera_dotplot <- function(result){
+  plot <- result %>%
+  rownames_to_column(var="Pathway") %>%
+  arrange(FDR) %>% slice_head(n=10) %>%
+  ggplot(aes(x=Direction, y=Pathway, group=Direction, col=FDR)) +
+    geom_point(size=5) +
+    theme(axis.title=element_blank(),
+          axis.text=element_text(face="bold")) +
+    scale_colour_gradientn(colours=c("#FF0000", "#E90F97", "#0858FB"))
+  return(plot)
+}
+
+pKEGGneg <- camera_dotplot(cameraRes_KEGGneg)
+pHallmarkneg <- camera_dotplot(cameraRes_Hallmarkneg)
+
+plot_grid(pKEGGneg, pHallmarkneg, n=2)
+```
+
+### Results for positive correlation
+Run camera function on genes associated with viability (high expression in healthy cells)
+```{r run-camera-pos}
+cameraRes_KEGGpos <- limma::camera(counts_df_symbols_pos, geneList_KEGG,
+                                  designMat, inter.gene.cor=0.01)
+cameraRes_Hallmarkpos <- limma::camera(counts_df_symbols_pos, geneList_Hallmark,
+                                       designMat, inter.gene.cor=0.01)
+```
+
+Plot most significant pathways as dotplot
+```{r plot-camera-pos, fig.width=20, fig.height=10}
+pKEGGpos <- camera_dotplot(cameraRes_KEGGpos)
+pHallmarkpos <- camera_dotplot(cameraRes_Hallmarkpos)
+
+plot_grid(pKEGGpos, pHallmarkpos, n=2)
+```
+
+# Session Info Details
+```{r, echo=FALSE, eval=TRUE}
+sessionInfo()
+```

@@ -1,0 +1,1570 @@
+---
+title: "Survival analysis"
+author: "Caroline Lohoff"
+date: "April 26 2022"
+output:
+  BiocStyle::html_document:
+    toc_float: true
+---
+
+# Description
+The aim of this analysis is to see whether there is an association between viability of the CLL cells in the (DMSO) samples and outcome of the patients. 
+For this purpose, a Cox proportional-hazards model is used, which is a regression model commonly used in biomedical research for investigating the association between the survival time of patients and one or more predictor variables. Univariate analysis describes the survival according to one factor under investigation (e.g. viability), but ignores the impact of any others.
+Multivariate analysis is used to assess simultaneously the effect of several risk factors on survival time.
+The Cox proportional hazards regression analysis works for both quantitative predictor variables such as viability or age and categorical variables such as gender or IGHV status ([STHDA](http://www.sthda.com/english/wiki/cox-proportional-hazards-model)).
+
+Besides viability, the impact of IgHV status (somatic hypermutation of IgHV), TP53 mutational status, methylation cluster and age on time to next treatment and overall survival will be investigated as well. 
+If there is an association those variables could be used as prognostic CLL biomarkers that can predict the outcome. 
+
+We will use two metrics for calculating the Cox regression model, which can be calculated with the coxph function from the survival package. 
+
+* 1. metric: time = OS, endpoint = died
+* 2. metric: time = TTT, endpoint = treatedAfter
+
+The following abbreviations are used in this script:
+
+* OS: overall survival in years
+* TFT: time to first treatment
+* TTT: time to next treatment
+* LKA: last known alive
+
+
+# Load libraries and data sets
+
+Set global options
+```{r setup, include=FALSE, cache = FALSE}
+knitr::opts_knit$set(root.dir = "~/Documents/R/drugseq_test")
+knitr::opts_chunk$set(warning = FALSE, message = FALSE)
+```
+
+Load libraries
+```{r load-libs}
+suppressPackageStartupMessages({
+  library(plyr)
+  library(tidyverse)
+  library(DESeq2)
+  library(survival)  # computing survival analyses
+  library(survminer) # visualizing survival analysis
+  library(gridExtra) # several plots in a grid
+  library(cowplot)
+  library(maxstat)
+  library(glmnet)
+  library(mofaCLL)
+  library(pheatmap)
+})
+```
+
+Set global ggplot variables
+```{r set-ggplot}
+theme_set(theme_bw() + theme(axis.text = element_text(size=12), 
+                             axis.title = element_text(size=14),
+                             legend.title = element_text(size=14),
+                             legend.text = element_text(size=12),
+                             plot.title = element_text(size=16,
+                                                       hjust=0.5,face="bold")))
+```
+
+Load datasets
+```{r}
+# Load meta data including genotyping info
+load("./data/patmeta_210324.RData")
+patMeta$pretreated <- patMeta$treatment
+
+# Load survival data
+load("./data/survival_190516.RData")
+names(survT)[names(survT) == "treatment"] <- "treatment_bin"
+
+# Load dds data set containing 1106 samples and count matrix
+load("./output/ddsDrug_htseq_batchPilot1c234_20220426.RData")
+
+# Add columns to DESeq object from survival data
+sur_vec <- c("sampleDate", "LKA", "OS", "died", "diagDate", "TFT", "TTT",
+             "treatment_bin", "firstTreatDate", "lastKnownUntreated", "treatedAfter")
+ddsDrug@colData@listData <- lapply(sur_vec, function(n) {
+  ddsDrug[[n]] <- survT[match(ddsDrug$sampleID, survT$sampleID), n]
+}) %>% bind_cols() %>% sjmisc::add_columns(ddsDrug@colData@listData)
+
+# Add columns to DESeq object from patient meta data
+col_vec <- c("diagnosis", "gender", "pretreated", "Methylation_Cluster", "trisomy12", "NOTCH1", "TP53",
+             "ATM", "FBXW7", "MED12", "BRAF", "SF3B1", "del11q", "del17p", "del13q")
+ddsDrug@colData@listData <- lapply(col_vec, function(n) {
+  ddsDrug[[n]] <- patMeta[match(ddsDrug$patID, patMeta$Patient.ID), n]
+}) %>% bind_cols() %>% sjmisc::add_columns(ddsDrug@colData@listData)
+
+names(ddsDrug@colData@listData)[names(ddsDrug@colData@listData) == "Methylation_Cluster"] <- "Methylation"
+ddsDrug$IGHVpat <- patMeta[match(ddsDrug$patID, patMeta$Patient.ID),]$IGHV.status
+ddsDrug$IGHV <- ifelse(is.na(ddsDrug$IGHV), ddsDrug$IGHVpat, ddsDrug$IGHV)
+ddsDrug$IGHVpat <- NULL
+
+# Add meta data to the samples from the pilot batch
+ddsDrug$diagnosis[ddsDrug$batch == "pilot"] <- "CLL" 
+ddsDrug$trisomy12[ddsDrug$batch == "pilot"] <- 0
+ddsDrug$IGHV[ddsDrug$batch == "pilot" & ddsDrug$patID %in% c("PID1095", "PID1222")] <- "U"
+ddsDrug$IGHV[ddsDrug$batch == "pilot" & ddsDrug$patID %in% c("PID1177", "PID1210")] <- "M"
+ddsDrug$gender[ddsDrug$batch == "pilot" & ddsDrug$patID %in% c("PID1095", "PID1222")] <- "f"
+ddsDrug$gender[ddsDrug$batch == "pilot" & ddsDrug$patID %in% c("PID1177", "PID1210")] <- "m"
+
+# Add age of patients on day of sample extraction
+ddsDrug$age <- ageTab[match(ddsDrug$sampleID, ageTab$sampleID),]$age
+
+# Keep only CLL samples and remove baseline
+ddsDrug <- ddsDrug[ ,ddsDrug$diagnosis == "CLL" & ddsDrug$treatment != "Baseline"]
+
+# Retrieve patient annotations from dds object as data frame
+patAnno_all <- colData(ddsDrug) %>% as_tibble()
+patAnno <- patAnno_all %>%
+  dplyr::select(-c(fileName, Replicate, time, Barcode,
+                   Input.concentration, RIN, IDplate, Library.concentration,
+                   Libary.molarity, Average.fragment.size))
+
+# Extract treatments including DMSO
+allTreat <- patAnno %>% 
+  distinct(treatment) %>% pull(treatment)
+```
+
+# Boxplots for viability
+
+Per patient one blood sample was taken and used for ten different drug treatments and for a DMSO control sample. 
+
+## Overall viability
+
+All samples (DMSO and treatments) of each patient are grouped together. The viability per patient is shown in a boxplot. 
+```{r,fig.height=8, fig.width=24}
+# Define color palette
+cp <- c("#2CB902", "#FD7306", "#FF1EBE", "#0137A4", "#C8C701")
+
+patAnno %>%
+  group_by(patID) %>%
+  ggplot(aes(reorder(patID, FSC.SSC, median),
+             FSC.SSC, color=batch)) +
+  geom_boxplot() +
+  xlab("Patients") +
+  ylab("Viability (after 48h incubation)") +
+  ggtitle("Viability of all samples per patient") +
+  scale_color_manual(values=cp) +
+  theme(axis.text.x = element_text(angle=90, vjust=0.5, hjust=1))
+```
+The samples from one patient (DMSO and treatment) have a rather similar viability (FSC.SSC).
+The main question is whether the differences in viability are due to technical issues or if they describe biological differences between the patients. If the latter is the case, the differences in sample viability would be mostly due to the inter-patient heterogeneity. 
+Nevertheless, the treatments have little impact on the cell viability. 
+
+The huge differences in viability across samples is even more visible, if only the DMSO samples are shown.
+```{r,fig.height=8, fig.width=22}
+patAnno %>%
+  dplyr::filter(treatment == "DMSO") %>%
+  group_by(patID) %>%
+  ggplot(aes(x=patID, y=FSC.SSC, col=patID)) +
+  geom_point(size=4) +
+  ylab("Viability (48h incubation)") +
+  ggtitle("Viability of DMSO sample per patient") +
+  theme(axis.text.x = element_text(angle=90, vjust=0.5, hjust=1))
+```
+
+## Normalized viability
+
+### All patients
+
+Are there differences in viability between the treatments, when viability is normalized to DMSO?
+```{r,fig.height=6, fig.width=10}
+df_allTrPat <- patAnno %>%
+  mutate(treatment = factor(treatment,
+                              levels = allTreat)) %>%
+  group_by(treatment)
+    
+median <- ddply(df_allTrPat, .(treatment), summarise,
+                  med = median(FSC.SSC.norm))
+
+ggplot(df_allTrPat, aes(x=treatment, y=FSC.SSC.norm, col=treatment)) +
+  geom_boxplot() +
+  geom_text(data = median, aes(x=treatment, y=med, label=round(med, 2)), 
+              size = 3, vjust = -0.5) +
+  stat_summary(fun.y=mean, geom="errorbar", width = .75, linetype = "dashed") +
+  ylab("Norm. viability (48h incubation)") +
+  ggtitle("Normalized viability per treatment") +
+  theme(axis.text.x = element_text(angle=90, vjust=0.5, hjust=1))
+```
+In this plot it is difficult to see a tendency, as the viability of the treatment samples is strongly fluctuating. 
+However, the median viability of the kinase inhibitors (Ibrutinib, Duvelisib, MK2206, Trametinib, and Everolimus) is lower than the DMSO viability. Thus, these drugs have an effect on the CLL cell status. This is also true for the MDM2 inhibitor Nutlin 3a and for the combination of Ibrutinib and the NR2F1 activator compound 26. In this combinatorial treatment the effect is most likely due to Ibrutinib, as C26 alone has almost no impact on cell viability (on average across all patients). Selinexor is a selective inhibitor of nuclear export, but often has no impact on cell viability. Interestingly, the treatment of CLL cells with IBET 762, a BET bromodomain inhibitor, leads to a higher viability in comparison to cells in DMSO. 
+
+Due to this plot, Duvelisib has a stronger impact on cell viability than Ibrutinib. Thus, the hypothesis can be made that Duvelisib samples have more differentially expressed genes than Ibrutinib samples. 
+(Edit: This was shown in the differential expression script.)
+
+#### Correlation of treatments with viability
+
+Assumption from MOFA factors (grouping):
+The treatments have a stronger correlation with viability than the DMSO samples.
+(Of course, because treatments should lower viability)
+
+Filter genes
+```{r filter-genes}
+# Only use protein coding genes and include only CLL samples in analysis
+ddsAll <- ddsDrug[rowData(ddsDrug)$biotype == "protein_coding" & !rowData(ddsDrug)$symbol %in% c(NA, ""),]
+
+# Remove all mitochondrial and artificial chromosomes
+ddsAll <- ddsAll[rowData(ddsAll)$chromosome %in% c(1:22,"X","Y")]
+
+# Remove genes on Y chromosome which could introduce some bias
+ddsAll <- ddsAll[rowData(ddsAll)$chromosome != "Y"]
+# ddsAll <- ddsAll[!rowData(ddsAll)$chromosome %in% c("X","Y")]
+
+# Keep only genes with a minimum of 10 counts in any sample
+keep_counts <- apply(counts(ddsAll), 1, function(x) any(x >= 10))
+ddsAll <- ddsAll[keep_counts,]
+
+# Keep only genes expressed in at least 10% of all samples
+n <- round(ncol(counts(ddsAll)) * 0.9)
+keep_counts_expr <- apply(counts(ddsAll), 1, function(x) sum(x == 0) < n)
+ddsAll <- ddsAll[keep_counts_expr,]
+dim(ddsAll)
+```
+
+Preparations
+```{r}
+# Variance stabilisation transformation
+RNAnorm_all <- vst(ddsAll)
+
+# Invariant filtering of 5000 most variable genes
+exprMat <- assay(RNAnorm_all)
+sds <- rowSds(exprMat)
+exprMat_5000 <- exprMat[order(sds, decreasing=T)[1:5000],]
+
+# Calculate PCA
+pcaRes5000 <- prcomp(t(exprMat_5000), scale=TRUE, center=TRUE)  
+varExp5000 <- (pcaRes5000$sdev^2 / sum(pcaRes5000$sdev^2))*100
+pcaTab5000 <- data.frame(pcaRes5000$x[,1:10]) %>%
+  rownames_to_column("ID") %>% left_join(patAnno)
+names(varExp5000) <- colnames(pcaRes5000$x)
+```
+
+Function for correlation plot
+```{r}
+cor_plot_tr <- function(drug, xcol, ycol, xcor, ycor){
+  df_tr <- filter(pcaTab5000, treatment == drug)
+  plot <- ggplot(df_tr, aes(x=.data[[xcol]], y=.data[[ycol]])) +
+    scattermore::geom_scattermore(pointsize=3, alpha=0.9) +
+    ggtitle(drug) +
+    geom_smooth(method="glm") + labs(x=xcol, y=ycol) +
+    annotate(x=xcor, y=ycor,
+             label=paste("R = ", round(cor(df_tr[[xcol]],
+                                         df_tr[[ycol]],
+                                         method = "spearman"),2)), 
+             geom="text", size=5)
+  return(plot)
+}
+```
+
+***Correlation of PC1 and FSC.SSC of samples from one treatment***
+```{r, fig.height=20, fig.width=14}
+allTreatDMSO <- as.data.frame(colData(ddsAll)) %>%
+  distinct(treatment) %>% pull(treatment)
+
+plot_list <- lapply(allTreatDMSO, function(tr) {
+  cor_plot_tr(drug=tr, xcol="PC1", ycol="FSC.SSC", xcor=60, ycor=84)
+})
+
+plot_grid(plotlist = plot_list, ncol=3)
+```
+Especially Ibrutinib, Duvelisib, Everolimus and Nutlin (cor. coefficient smaller than -0.5) have a stronger correlation with viability than DMSO. Thus, these treatments are more effective than other treatments.
+
+
+### Remove outlier patients
+
+Function for plotting normalized viability of a subset of patients 
+```{r}
+viability_box <- function(col, cond){
+  df <- patAnno %>%
+  filter(patAnno[[col]] == cond) %>%
+  mutate(treatment = factor(treatment,
+                              levels = allTreat)) %>%
+  group_by(treatment)
+    
+  median <- ddply(df, .(treatment), summarise,
+                  med = median(FSC.SSC.norm))
+    
+  plot <- ggplot(df, aes(x=treatment, y=FSC.SSC.norm, col=treatment)) +
+  geom_boxplot() +
+  geom_text(data = median, aes(x=treatment, y=med, label=round(med, 2)), 
+              size = 3, vjust = -0.5) +
+  stat_summary(fun.y=mean, geom="errorbar", width = .75, linetype = "dashed") +
+  ylab("Norm. viability (48h incubation)") +
+  ggtitle(sprintf("Normalized viability of %s %s patients", col, cond)) +
+  theme(axis.text.x = element_text(angle=90, vjust=0.5, hjust=1))
+  return(plot)
+}
+```
+
+The outliers in the plot above with normalized viability of less than 0.4 belong to patient P0880. This patient has an unmethylated IGHV status, is pre-treated and has an overall very low viability after 48 hours of incubation (< 20% in most samples).
+The opposite is patient P0108 who was also pre-treated but has a normalized viability of greater than 1 for most samples.
+```{r,fig.height=6, fig.width=16}
+patP0880 <- viability_box(col="patID", cond="P0880")
+patP0108 <- viability_box(col="patID", cond="P0108")
+
+plot_grid(patP0880, patP0108, ncol=2)
+```
+
+Both patients will be excluded from further plots. 
+```{r}
+patAnno <- patAnno[!patAnno$patID %in% c("P0880", "P0108"), ]
+```
+
+Furthermore, two high viability outliers in Trametinib (smp719) and Nutlin (smp466) will be excluded.
+```{r}
+patAnno <- patAnno[!patAnno$ID %in% c("smp466", "smp719"), ]
+```
+
+### Patients grouped by IGHV status
+
+We can compare the normalized viability between groups of patients to see differences in treatment effects. 
+
+```{r,fig.height=6, fig.width=16}
+IGHVwt <- viability_box(col="IGHV", cond="U")
+IGHVm <- viability_box(col="IGHV", cond="M")
+
+plot_grid(IGHVwt, IGHVm, ncol=2)
+```
+The drugs have a slightly stronger effect in patients with wild type IGHV status in comparison to patients with methylated IGHV, as the normalized viability is lower in 6 of 10 drugs. 
+
+### Patients grouped by TP53 status
+
+```{r,fig.height=6, fig.width=16}
+TP53wt <- viability_box(col="TP53", cond=0)
+TP53m <- viability_box(col="TP53", cond=1)
+
+plot_grid(TP53wt, TP53m, ncol=2)
+```
+The drugs have a stronger effect in TP53 wild type patient samples in terms of viability.
+
+### Patients grouped by methylation cluster
+
+```{r,fig.height=6, fig.width=22}
+LP <- viability_box(col="Methylation", cond="LP")
+IP <- viability_box(col="Methylation", cond="IP")
+HP <- viability_box(col="Methylation", cond="HP")
+
+plot_grid(LP, IP, HP, ncol=3)
+```
+The viability in patients with low-programming methylation cluster is lower than in intermediate programming clusters in 5 treatments, and lower than HP viability in 6 treatments.
+IP viability is lower than HP viability in 7 treatments. 
+The effect of MK2206 appears to be the same across the patient groups. 
+
+### Patients grouped by pre-treatment
+
+```{r,fig.height=6, fig.width=16}
+treated <- viability_box(col="treatedAfter", cond=TRUE)
+untreated <- viability_box(col="treatedAfter", cond=FALSE)
+
+plot_grid(treated, untreated, ncol=2)
+```
+Overall, the untreated patients showed a slightly stronger response to the drugs. 
+
+
+# Correlation of viability with other factors
+
+## Prepare data frame
+
+To test the hypotheses based on the boxplots, Spearman correlation coefficients are calculated and in the next chapter Cox regression models. 
+Therefore, only DMSO samples are used so that we have one control sample per patient. 
+```{r}
+# Remove pilot because it has no meta data and keep only DMSO samples
+testTab <- patAnno[patAnno$batch != "pilot" & patAnno$treatment == "DMSO", ]
+
+# Change designations
+testTab$sex <- testTab$gender
+testTab$gender[testTab$gender == "m"] <- 1
+testTab$gender[testTab$gender == "f"] <- 2
+
+testTab$IGHV.name <- testTab$IGHV
+testTab$IGHV[testTab$IGHV == "U"] <- 0
+testTab$IGHV[testTab$IGHV == "M"] <- 1
+
+testTab$TP53.name <- testTab$TP53
+testTab$TP53.name <- as.character(testTab$TP53.name)
+testTab$TP53.name[testTab$TP53 == 0] <- "wt"
+testTab$TP53.name[testTab$TP53 == 1] <- "m"
+
+testTab$MethylationID <- NA
+testTab$MethylationID[testTab$Methylation == "LP"] <- 0
+testTab$MethylationID[testTab$Methylation == "IP"] <- 1
+testTab$MethylationID[testTab$Methylation == "HP"] <- 2
+
+# New columns with viability or age rounded to tens
+testTab$FSC.SSC.round <- round(testTab$FSC.SSC / 10) * 10
+testTab$age.round <- round(testTab$age / 10) * 10
+
+# New column with viability difference before and after incubation
+# (to compare how fast cells die)
+testTab$FSC.SSC.diff <- testTab$FSC.SSC.d0 - testTab$FSC.SSC
+```
+
+Group samples by viability (define two groups)
+```{r}
+testTab <- testTab %>%
+  mutate(viability_median = ifelse(FSC.SSC > median(FSC.SSC),
+                           "above_median", "below_median"))
+
+testTab$viability_median <- factor(testTab$viability_median,
+    levels = c("below_median", "above_median"), ordered = TRUE)
+```
+
+Group samples by viability (define three groups)
+```{r}
+viability_low <- patAnno[patAnno$FSC.SSC < 33 & patAnno$treatment == "DMSO", ]$patID
+viability_high <- patAnno[patAnno$FSC.SSC > 66 & patAnno$treatment == "DMSO", ]$patID
+viability_medium <- setdiff(patAnno[patAnno$treatment == "DMSO", ]$patID,
+                             c(viability_low, viability_high))
+
+# Add definition to testTab
+testTab$viability <- "medium"
+testTab$viability[testTab$patID %in% viability_low] <- "low"
+testTab$viability[testTab$patID %in% viability_high] <- "high"
+
+testTab$viability <- factor(testTab$viability,
+    levels = c("low", "medium", "high"), ordered = TRUE)
+```
+
+Group samples by viability difference (define two groups)
+```{r}
+testTab <- testTab %>%
+  mutate(viability_diff = ifelse(FSC.SSC.diff > median(FSC.SSC.diff),
+                           "high_diff", "low_diff"))
+
+testTab$viability_diff <- factor(testTab$viability_diff,
+    levels = c("low_diff", "high_diff"), ordered = TRUE)
+```
+
+## Correlation plots
+
+Function for correlation plot
+```{r}
+cor_plot <- function(xcol, ycol, xcor, ycor){
+  plot <- ggplot(testTab,
+                 aes(x=.data[[xcol]], y=.data[[ycol]])) +
+    scattermore::geom_scattermore(pointsize=3, alpha=0.9) +
+    ggtitle(sprintf("Correlation of %s and %s", xcol, ycol)) +
+    geom_smooth(method="glm") +
+    labs(x=xcol, y=ycol) +
+    annotate(x=xcor, y=ycor,
+             label=paste("R = ", round(cor(testTab[[xcol]],
+                                         testTab[[ycol]],
+                                         method = "spearman"),2)), 
+             geom="text", size=5)
+  return(plot)
+}
+```
+The Pearson correlation is a measure of the strength and the direction of a linear relationship between two variables. This test statistic relies on various assumptions such as normally distributed data with few outliers and a linear relationship between the two factors. 
+
+Instead of using the Pearson product-moment correlation, Spearman's test statistic is used to estimate a rank-based measure of association, as it is more robust and can be used if the data do not necessarily come from a bivariate normal distribution.
+
+### Viability
+
+Show correlation between outcome and viability after unfreezing the cells
+```{r, fig.height=4, fig.width=14}
+cor_viab_age <- cor_plot(xcol="FSC.SSC.d0", ycol="age", xcor=58, ycor=89)
+cor_viab_os <- cor_plot(xcol="FSC.SSC.d0", ycol="OS", xcor=57, ycor=6.25)
+cor_viab_ttt <- cor_plot(xcol="FSC.SSC.d0", ycol="TTT", xcor=56, ycor=5.25)
+
+plot_grid(cor_viab_age, cor_viab_os, cor_viab_ttt, ncol=3)
+```
+
+Show correlation of various factors with viability after 48h of incubation
+```{r, fig.height=4, fig.width=14}
+cor_viab_age <- cor_plot(xcol="FSC.SSC", ycol="age", xcor=20, ycor=86)
+cor_viab_os <- cor_plot(xcol="FSC.SSC", ycol="OS", xcor=81, ycor=6.25)
+cor_viab_ttt <- cor_plot(xcol="FSC.SSC", ycol="TTT", xcor=81, ycor=5.25)
+
+plot_grid(cor_viab_age, cor_viab_os, cor_viab_ttt, ncol=3)
+```
+There is almost no correlation between viability and age. With increasing age the CLL cells seem to have a higher viability after 48 hours of incubation.
+
+Show correlation of various factors with difference in viability before and after incubation
+```{r, fig.height=4, fig.width=15}
+cor_viab_age <- cor_plot(xcol="FSC.SSC.diff", ycol="age", xcor=58, ycor=87)
+cor_viab_os <- cor_plot(xcol="FSC.SSC.diff", ycol="OS", xcor=58, ycor=6.25)
+cor_viab_ttt <- cor_plot(xcol="FSC.SSC.diff", ycol="TTT", xcor=58, ycor=5.25)
+
+plot_grid(cor_viab_age, cor_viab_os, cor_viab_ttt, ncol=3)
+```
+As the correlation coefficient is almost zero, we can conclude that there is no correlation between age and dying rate of cells. 
+
+### PC1
+
+Show correlation between outcome and PC1
+```{r, fig.height=4, fig.width=14}
+# Add PC1 and PC2 to testTab
+testTab$PC1 <- pcaTab5000[match(testTab$patID, pcaTab5000$patID),]$PC1
+testTab$PC2 <- pcaTab5000[match(testTab$patID, pcaTab5000$patID),]$PC2
+
+cor_viab_age <- cor_plot(xcol="PC1", ycol="age", xcor=78, ycor=88)
+cor_viab_os <- cor_plot(xcol="PC1", ycol="OS", xcor=77, ycor=6.25)
+cor_viab_ttt <- cor_plot(xcol="PC1", ycol="TTT", xcor=76, ycor=5.25)
+plot_grid(cor_viab_age, cor_viab_os, cor_viab_ttt, ncol=3)
+```
+
+# Univariate Cox regression
+The functions defined in this chapter are based on the functions from the [mofaCLL package](https://github.com/Huber-group-EMBL/mofaCLL) used for the paper [Multi-omics reveals clinically relevant proliferative drive associated with mTOR-MYC-OXPHOS activity in chronic lymphocytic leukemia](https://www.nature.com/articles/s43018-021-00216-6).
+
+Define function for cox regression test
+```{r}
+com <- function(response, time, endpoint, scale=FALSE) {  
+  
+  if (scale) {
+    #calculate z-score
+    response <- (response - mean(response, na.rm=TRUE))/sd(response, na.rm=TRUE)
+  }
+  surv <- coxph(Surv(time, endpoint) ~ response) 
+  
+  # create data frame
+  tibble(p = summary(surv)[[7]][,5], 
+         HR = summary(surv)[[7]][,2], 
+         lower = summary(surv)[[8]][,3], 
+         higher = summary(surv)[[8]][,4])
+}
+```
+
+Define function for Kaplan-Meier plot
+```{r}
+km <- function(response, time, endpoint,
+               titlePlot = "KM plot", pval = NULL,
+               stat = "maxstat", maxTime = NULL, showTable = FALSE,
+               table_ratio = c(0.7,0.3), showP = FALSE, yLabelAdjust = 0) { 
+  
+  #function for km plot
+  survS <- tibble(time = time, endpoint = endpoint)
+  
+  if (!is.null(maxTime)) 
+    survS <- mutate(survS, endpoint = ifelse(time > maxTime, FALSE, endpoint),
+                    time = ifelse(time > maxTime, maxTime, time))
+  
+  if (stat == "maxstat") {
+    ms <- maxstat.test(Surv(time, endpoint)  ~ response, 
+                               data = survS,
+                               smethod = "LogRank",
+                               minprop = 0.2, 
+                               maxprop = 0.8, 
+                               alpha = NULL)
+    
+    survS$group <- factor(ifelse(response >= ms$estimate, "high", "low"))
+    #p <- com(survS$group, survS$time, survS$endpoint)$p
+    
+  } else if (stat == "median") {
+    med <- median(response, na.rm = TRUE)
+    survS$group <- factor(ifelse(response >= med, "high", "low"))
+    #p <- com(survS$group, survS$time, survS$endpoint)$p
+    
+  } else if (stat == "binary") {
+    survS$group <- factor(response)
+    if (nlevels(survS$group) > 2) {
+      sdf <- survdiff(Surv(survS$time,survS$endpoint) ~ survS$group)
+      #p <- 1 - pchisq(sdf$chisq, length(sdf$n) - 1)
+    } else {
+      #p <- com(survS$group, survS$time, survS$endpoint)$p
+    }
+  }
+  
+  if (is.null(pval)) pval = TRUE
+  #if (is.null(pval)) {
+  #  if(p < 1e-16) {
+  #    pAnno <- bquote(italic("P")~"< 1e-16")
+  #  } else {
+  #    pval <- round(p, 2)
+  #    pAnno <- bquote(italic("P")~"="~.(pval))
+  #  }
+  #} else {
+  #   pval <- round(p, 2)
+  #   pAnno <- bquote(italic("P")~"="~.(pval))
+  #}
+
+  if (!showP) pAnno <- ""
+  
+  p <- ggsurvplot(survfit(Surv(time, endpoint) ~ group, data = survS), 
+                  data = survS, pval = TRUE, conf.int = FALSE, palette = "Set1",
+                  legend = ifelse(showTable, "none","top"),
+                  ylab = "Fraction", xlab = "Time (years)", title = titlePlot,
+                  risk.table = showTable, legend.labs = sort(unique(survS$group)),
+                  ggtheme = mofaCLL::theme_half + theme(plot.title = element_text(hjust=0.5),
+                                               panel.border = element_blank(),
+                                               axis.title.y = element_text(vjust=yLabelAdjust)))
+  p
+  
+  if (!showTable) {
+    p <- p$plot + annotate("text",label=pAnno, x = 0.1, y=0.1, hjust =0, size =5)
+    return(p)
+  } else {
+    #construct a table
+    pp <- p$plot + annotate("text",label=pAnno, x = 0.1, y=0.1, hjust =0, size=5)
+    pt <- p$table + ylab("") + xlab("") + theme(plot.title = element_text(hjust=0, size =10))
+    p <- plot_grid(pp,pt, rel_heights = table_ratio, nrow =2, align = "v")
+    return(p)
+  }
+}
+```
+
+## Cox regression using viability
+
+Fit a Cox proportional hazards regression model to time-dependent data
+```{r}
+resOS <- filter(testTab, !is.na(OS)) %>%
+  do(com(.$FSC.SSC, .$OS, .$died, FALSE)) %>%
+  mutate(p.adj = p.adjust(p, method = "BH")) %>%
+  mutate(time = "OS") %>%
+  mutate(Endpoint = "died")
+
+resTTT <- filter(testTab, !is.na(TTT)) %>%
+  do(com(.$FSC.SSC, .$TTT, .$treatedAfter, FALSE)) %>%
+  mutate(p.adj = p.adjust(p, method = "BH")) %>%
+  mutate(time = "TTT") %>%
+  mutate(Endpoint = "treatedAfter")
+
+plotTab <- bind_rows(resOS, resTTT)
+plotTab
+```
+
+Hazard ratio plot with P-value
+```{r}
+ggplot(plotTab, aes(x=time, y=HR, col=time, dodge=time)) +
+  geom_hline(yintercept = 1, linetype = "dotted") +
+  geom_point(position = position_dodge(width=0.8)) +
+  geom_errorbar(position = position_dodge(width=0.8), 
+                aes(ymin=lower, ymax=higher), width=0.3, size=1) + 
+  geom_text(position = position_dodge2(width=0.8),
+            aes(x=as.numeric(as.factor(time))+0.15,
+                label = sprintf("italic(P)~'='~'%s'",round(p,2))),
+            color = "black",size=4, parse=TRUE) +
+  xlab("") + ylab("Hazard ratio") +
+  ylim(-0.5,2) + 
+  coord_flip() + theme_bw() +
+  scale_color_manual(values = c(OS="#DE762D", TTT="#C433F1"))
+```
+Kaplan-Meier plot for DMSO viability after 48 hours
+```{r}
+res.cox <- coxph(Surv(TTT, treatedAfter) ~ FSC.SSC, data = testTab)
+ggsurvplot(survfit(res.cox), conf.int=FALSE, data=testTab,
+           legend.labs=c("DMSO viability after 48 hours (time to treatment)"),
+           ggtheme = theme_minimal())
+
+res.cox <- coxph(Surv(OS, died) ~ FSC.SSC, data = testTab)
+ggsurvplot(survfit(res.cox), conf.int=FALSE, data=testTab,
+           legend.labs=c("DMSO viability after 48 hours (overall survival)"),
+           ggtheme = theme_minimal())
+```
+There is no association between viability and outcome. 
+
+Kaplan-Meier plot for DMSO viability after unfreezing
+```{r}
+res.cox <- coxph(Surv(TTT, treatedAfter) ~ FSC.SSC.d0, data = testTab)
+ggsurvplot(survfit(res.cox), conf.int=FALSE, data=testTab,
+           legend.labs=c("DMSO viability after unfreezing (time to treatment)"),
+           ggtheme = theme_minimal())
+
+res.cox <- coxph(Surv(OS, died) ~ FSC.SSC.d0, data = testTab)
+ggsurvplot(survfit(res.cox), conf.int=FALSE, data=testTab,
+           legend.labs=c("DMSO viability after unfreezing (overall survival)"),
+           ggtheme = theme_minimal())
+```
+
+Kaplan-Meier plot for PC1
+```{r}
+res.cox <- coxph(Surv(TTT, treatedAfter) ~ PC1, data = pcaTab5000)
+ggsurvplot(survfit(res.cox), conf.int=FALSE, data=pcaTab5000,
+           legend.labs=c("PC1 (time to treatment)"),
+           ggtheme = theme_minimal())
+
+res.cox <- coxph(Surv(OS, died) ~ PC1, data = pcaTab5000)
+ggsurvplot(survfit(res.cox), conf.int=FALSE, data=pcaTab5000,
+           legend.labs=c("PC1 (overall survival)"),
+           ggtheme = theme_minimal())
+```
+There is no association between PC1 and outcome. 
+
+## Cox regression using grouped viability
+
+```{r, fig.height=5, fig.width=12}
+viability_groups <- function(viab_col){
+  plot <- testTab %>%
+  group_by(.data[[viab_col]]) %>%
+  ggplot(aes(x=.data[[viab_col]], y=FSC.SSC,
+             col=.data[[viab_col]])) +
+  geom_violin() +
+  xlab("DMSO samples grouped by viability") +
+  ggtitle("Viability of DMSO samples across groups") +
+  geom_jitter(height = 0, width = 0.1)
+  return(plot)
+}
+
+plot_grid(viability_groups("viability_median"),
+          viability_groups("viability"), ncol=2)
+```
+
+Fit a Cox proportional hazards regression model to time-dependent data
+```{r}
+cox_reg <- function(viab_col){
+  resOS <- filter(testTab, !is.na(OS)) %>%
+  group_by(.data[[viab_col]]) %>%
+  do(com(.$FSC.SSC, .$OS, .$died, FALSE)) %>%
+  ungroup() %>%
+  arrange(p) %>%
+  mutate(p.adj = p.adjust(p, method = "BH")) %>%
+  mutate(time = "OS") %>%
+  mutate(Endpoint = "died")
+
+  resTTT <- filter(testTab, !is.na(TTT)) %>%
+  group_by(.data[[viab_col]]) %>%
+  do(com(.$FSC.SSC, .$TTT, .$treatedAfter, FALSE)) %>%
+  ungroup() %>%
+  arrange(p) %>%
+  mutate(p.adj = p.adjust(p, method = "BH")) %>%
+  mutate(time = "TTT") %>%
+  mutate(Endpoint = "treatedAfter")
+
+  plotTab <- bind_rows(resOS, resTTT)
+  return(plotTab)
+}
+
+cox_viab2 <- cox_reg("viability_median")
+cox_viab3 <- cox_reg("viability")
+cox_viab3
+```
+
+Plot p value and hazard ratio
+```{r, fig.height=3, fig.width=6}
+cox_plot <- function(tab, viab_col){
+  
+  plot <- ggplot(tab, aes(x=.data[[viab_col]], y=HR,
+                          col=time, dodge=time)) +
+    geom_hline(yintercept = 1, linetype = "dotted") +
+    geom_point(position = position_dodge(width=0.8)) +
+    geom_errorbar(position = position_dodge(width=0.8), 
+                  aes(ymin=lower, ymax=higher), width=0.3, size=1) + 
+    geom_text(position = position_dodge2(width=0.8),
+              aes(x=as.numeric(as.factor(.data[[viab_col]]))+0.15,
+                  label = sprintf("italic(P)~'='~'%s'",round(p,2))),
+              color = "black",size=4, parse=TRUE) +
+    xlab("Viability") + ylab("Hazard ratio") +
+    ylim(-0.5,4) +coord_flip() + theme_bw() +
+    scale_color_manual(values = c(OS="#DE762D", TTT="#C433F1"))
+  return(plot)
+}
+
+cox_plot2 <- cox_plot(cox_viab2, "viability_median")
+cox_plot3 <- cox_plot(cox_viab3, "viability")
+plot_grid(cox_plot2, cox_plot3, ncol=2)
+```
+
+Kaplan-Meier plot for grouped viability based on two groups
+```{r, fig.width=18, fig.height=6}
+plotList <- list()
+plotList[["TTT"]] <- km(testTab$viability_median, testTab$TTT, testTab$treatedAfter,
+                        "Time to treatment", stat = "binary", maxTime = 5, showTable=TRUE)
+plotList[["OS"]] <- km(testTab$viability_median, testTab$OS, testTab$died,
+                       "Overall survival", stat = "binary", maxTime = 6, showTable=TRUE)
+
+grid.arrange(grobs = plotList, ncol = 2)
+```
+
+Kaplan-Meier plot for grouped viability based on three groups
+```{r, fig.width=18, fig.height=6}
+plotList <- list()
+plotList[["TTT"]] <- km(testTab$viability, testTab$TTT, testTab$treatedAfter,
+                        "Time to treatment", stat = "binary", maxTime = 4, showTable=TRUE)
+plotList[["OS"]] <- km(testTab$viability, testTab$OS, testTab$died,
+                       "Overall survival", stat = "binary", maxTime = 6, showTable=TRUE)
+grid.arrange(grobs = plotList, ncol = 2)
+```
+The difference in overall survival and time to next treatment is rather low between the viability groups. Patients with low viability samples have a slightly worse outcome than patients with medium or high viability samples. 
+Medium and high viability samples are quite similar, although patients with medium viability samples (33%-66% viable cells per sample) have a slightly better outcome. 
+
+Kaplan-Meier plot for difference in viability between unfreezing samples and 48 hours of incubtion
+```{r, fig.width=18, fig.height=6}
+plotList <- list()
+plotList[["TTT"]] <- km(testTab$viability_diff, testTab$TTT, testTab$treatedAfter,
+                        "Time to treatment", stat = "binary", maxTime = 5, showTable=TRUE)
+plotList[["OS"]] <- km(testTab$viability_diff, testTab$OS, testTab$died,
+                       "Overall survival", stat = "binary", maxTime = 6, showTable=TRUE)
+grid.arrange(grobs = plotList, ncol = 2)
+```
+
+The difference in viability (i.e. the velocity of cells dying) is not associated with outcome. 
+
+***We can draw the conclusion that viability is not associated with outcome of the patients. The differences in viability of DMSO samples are technical.***
+
+
+## Cox regression using grouped age
+
+KM plot for patients grouped by age
+```{r, fig.width=18, fig.height=6}
+ageTab <- filter(testTab, age.round %in% c(60, 70, 80, 90)) %>%
+  mutate(subgroup = ifelse(age.round == 60, paste0(age.round,"_years"),
+                           ifelse(age.round == 70, paste0(age.round,"_years"),
+                                  ifelse(age.round == 80, paste0(age.round,"_years"),
+                           "90_years"))))
+plotList <- list()
+
+plotList[["TTT"]] <- km(ageTab$subgroup, ageTab$TTT, ageTab$treatedAfter,
+                        "Time to treatment", stat = "binary", maxTime = 5, showTable=TRUE)
+
+plotList[["OS"]] <- km(ageTab$subgroup, ageTab$OS, ageTab$died,
+                       "Overall survival", stat = "binary", maxTime = 5, showTable=TRUE)
+
+# Predicted survival proportion with respect to age
+grid.arrange(grobs = plotList, ncol = 2)
+```
+
+
+# Multivariate Cox regression
+
+Function to run multivariate Cox model
+```{r multi-cox}
+runCox <- function(survTab, riskTab, time.arg, endpoint.arg) {
+  
+  index1 <- grep("patID", colnames(survTab))
+  index2 <- grep(time.arg, colnames(survTab))
+  index3 <- grep(endpoint.arg, colnames(survTab))
+
+  survTab <- select(survTab, c(index1, index2, index3))
+  names(survTab)[2] <- "time"
+  names(survTab)[3] <- "endpoint"
+  survTab <- survTab %>% filter(!is.na(time), !is.na(endpoint))
+
+  resTab <- right_join(survTab, riskTab, by="patID") %>%
+    select(-patID)
+
+  surv1 <- coxph(Surv(time, endpoint) ~ ., data=resTab)
+  return(surv1)
+}
+```
+
+Function for italicize gene names
+```{r}
+italicizeGene <- function(featureNames) {
+  geneNameList <- c("SF3B1","NOTCH1","TP53")
+  specialCase <- "TP53/del17p"
+  formatedList <- sapply(featureNames, function(n) {
+    if (n %in% geneNameList) {
+      #substitute(paste(italic(sprintf("%s", n))))
+      sprintf("italic('%s')",n)
+    } else if (n == specialCase) {
+      #substitute(paste(italic("TP53"), italic("del17p"),sep="/"))
+      sprintf("italic('TP53')~'/del17p'")
+    } 
+    else {
+      sprintf("'%s'",n)
+    }
+  })
+  return(formatedList)
+}
+```
+
+## Hazard ratio plot
+
+Function to plot hazard ratio
+```{r}
+plotHazard <- function(survRes, title = "") {
+  sumTab <- summary(survRes)$coefficients
+  confTab <- summary(survRes)$conf.int
+  
+  #correct feature name
+  nameOri <- rownames(sumTab)
+  nameMod <- substr(nameOri, 1, nchar(nameOri) -1)
+  plotTab <- tibble(feature = rownames(sumTab),
+                    nameMod = substr(nameOri, 1, nchar(nameOri) -1),
+                    HR = sumTab[,2],
+                    p = sumTab[,5],
+                    Upper = confTab[,4],
+                    Lower = confTab[,3]) %>%
+    mutate(feature = ifelse(nameMod %in% names(survRes$xlevels),
+                            nameMod, feature)) %>%
+    mutate(feature = str_replace(feature, "[.]","/")) %>%
+    mutate(feature = str_replace(feature, "[_]","-")) %>%
+    arrange(desc(abs(p))) %>%
+    #mutate(feature = italicizeGene(feature)) %>%
+    mutate(feature = factor(feature,
+                            levels = c("viability", "Sex-male", "IGHV-mutated",
+                                       "NOTCH1", "SF3B1", "TP53/del17p"))) %>%
+    mutate(type = ifelse(HR >1 ,"up","down")) %>%
+    mutate(Upper = ifelse(Upper > 10, 10, Upper))
+
+  ggplot(plotTab, aes(x=feature, y=HR, color=type)) +
+    geom_hline(yintercept=1, linetype="dotted", color="grey50") +
+    geom_point(position = position_dodge(width=0.8), size=3, color="black") +
+    geom_errorbar(aes(ymin=Lower, ymax=Upper),
+                  width=0.3, size=1, color="grey20") +
+    geom_text(position = position_nudge(x=0.3),
+              aes(y=HR, label=sprintf("italic(P)~'='~'%s'",
+                                           round(p, 2))),
+              color="black", size=4.5, parse=TRUE) +
+    expand_limits(y=c(-0.5,0))+
+    ggtitle(title) +
+    #scale_y_log10() +
+    #scale_x_discrete(labels = parse(text = levels(plotTab$feature))) +
+    ylab("Hazard ratio") +
+    coord_flip() + mofaCLL::theme_full +
+    theme(legend.position = "none",
+          axis.title.y = element_blank())
+}
+```
+
+Prepare data
+```{r}
+survTab <- testTab %>%
+  select(patID, OS, died, TFT, TTT, treatedAfter)
+
+riskTab <- testTab %>%
+  select(patID,sex,FSC.SSC,IGHV,TP53,NOTCH1,del17p,SF3B1) %>%
+  mutate(TP53 = as.numeric(TP53)) %>%
+  mutate(del17p = as.numeric(del17p)) %>%
+  mutate(`TP53.del17p` = ifelse(testTab$TP53 == 0 & testTab$del17p == 0, 0,
+                                ifelse(testTab$TP53 == 1 & testTab$del17p == 1, 1,
+                                       1))) %>%
+  mutate(IGHV = factor(IGHV, levels = c(0,1))) %>%
+  mutate(viability = FSC.SSC) %>%
+  select(-TP53, -del17p, -FSC.SSC) %>%
+  dplyr::rename(IGHV_mutated = IGHV,
+                Sex_male = sex)
+```
+
+Plot time to treatment and overall survival
+```{r, fig.width=12, fig.height=6}
+# Time to treatment
+resTTT <- runCox(survTab, riskTab, "TTT", "treatedAfter")
+haTTT <- plotHazard(resTTT, title="Time to treatment")
+
+# Overall survival
+resOS <- runCox(survTab, riskTab, "OS", "died")
+haOS <- plotHazard(resOS,"Overall survival")
+
+plot_grid(haTTT, haOS, ncol=2)
+```
+Hazard ratio summary:
+
+* HR = 1: No effect
+* HR < 1: Reduction in the hazard
+* HR > 1: Increase in the hazard (A hazard ratio above 1 indicates a covariate that is positively associated with the event probability, and thus negatively associated with the length of survival.)
+
+## Kaplan-Meier plots
+
+### IGHV and viability
+KM plot for subgroup defined by IGHV status and viability values
+```{r, fig.width=18, fig.height=7}
+groupTab <- filter(testTab, !is.na(IGHV)) %>%
+  mutate(subgroup = ifelse(FSC.SSC > median(FSC.SSC),
+                           sprintf("IGHV-%s_highViab", IGHV.name),
+                           sprintf("IGHV-%s_lowViab", IGHV.name)))
+
+plotList <- list()
+
+plotList[["TTT"]] <- km(groupTab$subgroup, groupTab$TTT, groupTab$treatedAfter,
+                        "Time to treatment", stat = "binary", maxTime = 5, showTable=TRUE)
+
+plotList[["OS"]] <- km(groupTab$subgroup, groupTab$OS, groupTab$died,
+                       "Overall survival", stat = "binary", maxTime = 6, showTable=TRUE)
+
+grid.arrange(grobs = plotList, ncol = 2)
+```
+Patients with an unmethylated IGHV status have a shorter time to next treatment and a lower overall survival than patients with M-IGHV.
+Within each group (U-IGHV or M-IGHV), the samples with a high viability of cells have a longer time to next treatment and a slightly higher overall survival. As seen in the hazard plot above, having IGHV-M reduces the hazard. 
+
+### TP53 and viability
+KM plot for subgroup defined by TP53 status and viability values
+```{r, fig.width=18, fig.height=6}
+groupTab <- filter(testTab, !is.na(TP53)) %>%
+  mutate(subgroup = ifelse(FSC.SSC > median(FSC.SSC),
+                           sprintf("TP53%s_highViab", TP53.name),
+                           sprintf("TP53%s_lowViab", TP53.name)))
+plotList <- list()
+
+plotList[["TTT"]] <- km(groupTab$subgroup, groupTab$TTT, groupTab$treatedAfter,
+                        "Time to treatment", stat = "binary", maxTime = 4, showTable=TRUE)
+plotList[["OS"]] <- km(groupTab$subgroup, groupTab$OS, groupTab$died,
+                       "Overall survival", stat = "binary", maxTime = 5, showTable=TRUE)
+
+grid.arrange(grobs = plotList, ncol = 2)
+```
+Patients with wild type TP53 have a higher overall survival than patients with mutated TP53. As seen in the hazard plot above, a mutated TP53 status increases the hazard. 
+As before, samples with a higher cell viability are associated with better outcome.
+
+### Trisomy12 and viability
+KM plot for subgroup defined by trisomy12 status and viability values
+```{r, fig.width=18, fig.height=6}
+groupTab <- filter(testTab, !is.na(trisomy12)) %>%
+  mutate(subgroup = ifelse(FSC.SSC > median(FSC.SSC),
+                           paste0(trisomy12,"trisomy12_highViab"),
+                           paste0(trisomy12,"trisomy12_lowViab"))) 
+
+plotList <- list()
+plotList[["TTT"]] <- km(groupTab$subgroup, groupTab$TTT, groupTab$treatedAfter,
+                        "Time to treatment", stat = "binary", maxTime = 4, showTable=TRUE)
+plotList[["OS"]] <- km(groupTab$subgroup, groupTab$OS, groupTab$died,
+                       "Overall survival", stat = "binary", maxTime = 5, showTable=TRUE)
+
+grid.arrange(grobs = plotList, ncol = 2)
+```
+
+### Methylation and viability
+KM plot for subgroup defined by methylation cluster and viability values
+```{r, fig.width=18, fig.height=8}
+groupTab <- filter(testTab, !is.na(Methylation)) %>%
+  mutate(subgroup = ifelse(FSC.SSC > median(FSC.SSC),
+                           paste0(Methylation,"_highViab"),
+                           paste0(Methylation,"_lowViab"))) 
+
+plotList <- list()
+plotList[["TTT"]] <- km(groupTab$subgroup, groupTab$TTT, groupTab$treatedAfter,
+                        "Time to treatment", stat = "binary", maxTime = 5, showTable=TRUE)
+plotList[["OS"]] <- km(groupTab$subgroup, groupTab$OS, groupTab$died,
+                       "Overall survival", stat = "binary", maxTime = 6, showTable=TRUE)
+
+grid.arrange(grobs = plotList, ncol = 2)
+```
+
+
+# Explanation of Cox regression function
+
+## One covariate
+
+### Sex and survival
+
+The association between sex and survival can be calculated directly via the coxph function from the survival package.
+```{r}
+res.cox <- coxph(Surv(OS, died) ~ gender, data = testTab)
+summary(res.cox)
+```
+Which information is saved in the result of the cox regression?
+
+The Cox regression results can be interpreted as follow:
+
+* Statistical significance: The column marked “z” gives the Wald statistic value, which corresponds to the ratio of each regression coefficient to its standard error (z = coef/se(coef)). The wald statistic evaluates, whether the beta coefficient of a given variable is statistically different from 0. From the output above, we can conclude that the variable gender has highly statistically significant coefficients.
+
+* Regression coefficients (coef): A positive sign indicates that the hazard (risk of death) is higher, and thus the prognosis worse, for subjects with higher values of that variable. The variable sex is encoded as a numeric vector. 1: male, 2: female. The R summary for the Cox model for the variable gender gives the hazard ratio (HR) for the second group relative to the first group, that is, female versus male. The beta coefficient for sex = 0.79 indicates that males have a lower risk of death (lower survival rates) than females.
+
+* Hazard ratios: The exponential coefficients (exp(coef) = exp(0.79) = 2.2) give the effect size of covariates. For example, being female (sex=2) increases the hazard by a factor of 0.79, or 21%. Being female is associated with poor prognostic.
+
+* Confidence intervals of the hazard ratios: The summary output gives upper and lower 95% confidence intervals for the hazard ratio (exp(coef)).
+
+* Global statistical significance of the model. Finally, the output gives p-values for three alternative tests for overall significance of the model: likelihood-ratio test, Wald test, and score logrank statistics. These three methods are asymptotically equivalent. For large enough N, they will give similar results. For small N, they may differ. The Likelihood ratio test has better behavior for small sample sizes, so it is generally preferred.
+
+Descriptions are based on [STHDA, Cox Proportional-Hazards Model](http://www.sthda.com/english/wiki/cox-proportional-hazards-model#compute-the-cox-model).
+
+For displaying how estimated survival depends upon the value of a covariate of interest, a small data frame is constructed with two rows, one for each value of gender.
+```{r}
+sex_df <- with(testTab,
+               data.frame(gender = c(1, 2))
+               )
+sex_df
+```
+
+Having fit a Cox model to the data, the predicted survival proportion can be visualized at any given point in time for a particular risk group.
+```{r}
+fit <- survfit(res.cox, newdata=sex_df)
+ggsurvplot(fit, conf.int=FALSE, data=testTab,
+           legend.labs=c("Male", "Female"),
+           ggtheme = theme_minimal())
+```
+
+### Viability and survival
+
+Association between viability and survival
+```{r}
+res.cox <- coxph(Surv(OS, died) ~ FSC.SSC.round, data = testTab)
+viability_df <- with(testTab,
+                     data.frame(FSC.SSC.round = c(10, 20, 30, 40, 50, 60, 70, 80, 90)))
+fit <- survfit(res.cox, newdata=viability_df)
+ggsurvplot(fit, conf.int=FALSE, data=testTab,
+           legend.labs=c("10%", "20%", "30%", "40%", "50%",
+                         "60%", "70%", "80%", "90%"),
+           fun="cumhaz", ggtheme = theme_minimal())
+```
+When plotting the cumulative hazard function (f(y) = -log(y)), we can see that a higher viability (FSC.SCC) of the samples leads to a higher survival probability. 
+
+## Multiple covariates
+
+Applying the univariate coxph function to multiple covariates at once.
+```{r}
+covariates <- c("gender", "age",  "IGHV", "trisomy12", "FSC.SSC")
+univ_formulas <- sapply(covariates,
+                        function(x) as.formula(paste('Surv(OS, died)~', x)))
+                        
+univ_models <- lapply(univ_formulas, function(x){coxph(x, data = testTab)})
+
+# Extract data 
+univ_results <- lapply(univ_models, function(x){ 
+                          x <- summary(x)
+                          p.value<-signif(x$wald["pvalue"], digits=2)
+                          wald.test<-signif(x$wald["test"], digits=2)
+                          beta<-signif(x$coef[1], digits=2);#coeficient beta
+                          HR <-signif(x$coef[2], digits=2);#exp(beta)
+                          HR.confint.lower <- signif(x$conf.int[,"lower .95"], 2)
+                          HR.confint.upper <- signif(x$conf.int[,"upper .95"],2)
+                          HR <- paste0(HR, " (", 
+                                       HR.confint.lower, "-", HR.confint.upper, ")")
+                          res<-c(beta, HR, wald.test, p.value)
+                          names(res)<-c("beta", "HR (95% CI for HR)", "wald.test", 
+                                        "p.value")
+                          return(res)
+                         })
+
+res <- t(as.data.frame(univ_results, check.names = FALSE))
+as.data.frame(res)
+```
+The output above shows the regression beta coefficients, the effect sizes (given as hazard ratios) and statistical significance for each of the variables in relation to overall survival. Each factor is assessed through separate univariate Cox regressions.
+
+The variables gender, age, IGHV and trisomy12 have highly statistically significant coefficients, while the coefficient for viability is not significant. Thus, other covariates are stronger associated with survival than the measured viability of the samples.
+
+Gender, age and trisomy 12 have positive beta coefficients, while IGHV has a negative coefficient. Thus, older age, being female and trisomy 12 are associated with poorer survival, whereas mutated IGHV status is associated with better survival.
+
+Now, we want to describe how the factors jointly influence the survival. Therefore, we perform a multivariate Cox regression analysis. A Cox regression of time to death on the time-constant covariates is specified as follow:
+```{r}
+res.cox.multiple <- coxph(Surv(OS, died) ~ age + gender + IGHV + trisomy12, data = testTab)
+summary(res.cox.multiple)
+```
+The p-value for all three overall tests (likelihood, Wald, and score) are significant, indicating that the model is significant. These tests evaluate the omnibus null hypothesis that all of the betas are 0. In the above example, the test statistics are in close agreement, and the omnibus null hypothesis is soundly rejected.
+
+In the multivariate Cox analysis, the covariates age and IGHV remain significant (p < 0.05), whereas the covariate trisomy12 fails to be significant.
+
+For displaying how estimated survival depends upon the value of a covariate of interest we construct a data frame with two rows as before. The only difference is that all other covariates are fixed to their average values (if they are continuous variables) or to their lowest level (if they are discrete variables).
+```{r}
+sex_df <- with(testTab,
+               data.frame(gender = c(1, 2), 
+                          age = rep(mean(age, na.rm = TRUE), 2),
+                          IGHV = c(0, 0),
+                          trisomy12 = c(0, 0)
+                          )
+               )
+```
+
+As before, this data frame is passed to the survfit() function
+```{r}
+fit <- survfit(res.cox.multiple, newdata = sex_df)
+ggsurvplot(fit, conf.int=FALSE, data=testTab,
+           legend.labs=c("Male", "Female"),
+           ggtheme = theme_minimal())
+```
+
+Predicted survival proportion with respect to the IgHV status. 
+```{r}
+IGHV_df <- with(testTab,
+               data.frame(IGHV = c(0, 1), 
+                          age = rep(mean(age, na.rm = TRUE), 2),
+                          gender = c(1, 1),
+                          trisomy12 = c(0, 0)
+                          )
+               )
+
+fit <- survfit(res.cox.multiple, newdata = IGHV_df)
+ggsurvplot(fit, conf.int = FALSE, data = testTab,
+           legend.labs=c("IGHV-U", "IGHV-M"),
+           ggtheme = theme_minimal())
+```
+
+# Summary
+In this analysis, we described the Cox regression model for assessing simultaneously the relationship between multiple risk factors and patient’s survival time. 
+Covariates such as IGHV or TP53 are stronger associated with survival than the measured viability (FSC.SCC) of the samples. Nevertheless, low viability samples often had a worse outcome than samples with high cell viability.
+
+Patients with wild type TP53 have a higher overall survival than patients with mutated TP53. Thus, a mutated TP53 status increases the hazard (risk of death). Patients with an unmethylated IGHV status have a shorter time to next treatment and a lower overall survival than patients with M-IGHV. Therefore, having IGHV-U increases the hazard.This analysis also confirmed that lowly programmed CLL (LP-CLL) shows faster disease progression andworse clinivcal outcome than highly programmed CLL.
+(references 5-7 in CLL-PD paper).
+
+
+# FACS data all samples
+In this part we analyse the viability information of all samples. In the previous part we only considered samples for which we have also RNAseq information. 
+As the survival analysis is independent of the gene expression information, the result is more robust if we include more samples. 
+
+Load data
+```{r}
+FACS <- readxl::read_xlsx("./data/FACS_data_all_CLL_samples_20220426.xlsx") 
+```
+
+Select only DMSO sample per patient
+```{r}
+FACS <- filter(FACS, Treatment == "DMSO")
+```
+
+Filter viability on day 0 (sample quality after unfreezing the cells and before incubation for 48 hours)
+As some samples had an issue while storing, we only consider the samples if the viability is larger than 70%.
+```{r}
+# FACS <- filter(FACS, FSC.SSC.d0 >= 70.0)
+```
+
+Before we can add columns from other data frames, we need the sampleIDs per patient. 
+```{r, eval=FALSE, include=FALSE}
+# Add columns to FACS df from survival data
+facs_id <- FACS$patID
+length(facs_id)
+rna_id <- unique(patAnno_all$patID)
+length(rna_id)
+# 23 patients from FACS df are not in ddsDrug object
+
+# Map sampleID column to FACS df
+FACS$sampleID <- ddsDrug[match(FACS$patID, ddsDrug$patID),]$sampleID
+
+FACS$sampleID <- ifelse(is.na(ddsDrug[match(FACS$patID, ddsDrug$patID),]$sampleID),
+                        NA, ddsDrug[match(FACS$patID, ddsDrug$patID),]$sampleID)
+
+ddsDrug$IGHV <- ifelse(is.na(ddsDrug$IGHV), ddsDrug$IGHVpat, ddsAll$IGHV)
+
+
+
+
+
+sur_vec <- c("sampleDate", "LKA", "OS", "died", "diagDate", "TFT", "TTT",
+             "treatment_bin", "firstTreatDate", "lastKnownUntreated", "treatedAfter")
+FACS <- lapply(sur_vec, function(n) {
+  FACS[[n]] <- survT[match(FACS$sampleID, survT$sampleID), n]
+}) %>% bind_cols() %>% sjmisc::add_columns(ddsDrug@colData@listData)
+
+# Add columns to FACS df from patient meta data
+col_vec <- c("diagnosis", "gender", "treatment", "Methylation_Cluster", "trisomy12", "NOTCH1", "TP53",
+             "ATM", "FBXW7", "MED12", "BRAF", "SF3B1", "del11q", "del17p", "del13q")
+#ddsDrug@colData@listData <- lapply(col_vec, function(n) {
+#  ddsDrug[[n]] <- patMeta[match(ddsDrug$patID, patMeta$Patient.ID), n]
+#}) %>% bind_cols() %>% sjmisc::add_columns(ddsDrug@colData@listData)
+
+#names(ddsDrug@colData@listData)[names(ddsDrug@colData@listData) == "Methylation_Cluster"] <- "Methylation"
+ddsDrug$treatment <- patMeta[match(ddsDrug$patID, patMeta$Patient.ID),]$treatment
+ddsDrug$IGHVpat <- patMeta[match(ddsDrug$patID, patMeta$Patient.ID),]$IGHV.status
+ddsDrug$IGHV <- ifelse(is.na(ddsDrug$IGHV), ddsDrug$IGHVpat, ddsDrug$IGHV)
+ddsDrug$IGHVpat <- NULL
+
+# Add meta data to the samples from the pilot batch
+ddsDrug$diagnosis[ddsDrug$batch == "pilot"] <- "CLL" 
+#ddsDrug$trisomy12[ddsDrug$batch == "pilot"] <- 0
+ddsDrug$IGHV[ddsDrug$batch == "pilot" & ddsDrug$patID %in% c("PID1095", "PID1222")] <- "U"
+ddsDrug$IGHV[ddsDrug$batch == "pilot" & ddsDrug$patID %in% c("PID1177", "PID1210")] <- "M"
+#ddsDrug$gender[ddsDrug$batch == "pilot" & ddsDrug$patID %in% c("PID1095", "PID1222")] <- "f"
+#ddsDrug$gender[ddsDrug$batch == "pilot" & ddsDrug$patID %in% c("PID1177", "PID1210")] <- "m"
+
+# Add age of patients on day of sample extraction
+ddsDrug$age <- ageTab[match(ddsDrug$sampleID, ageTab$sampleID),]$age
+
+# Keep only CLL samples and remove baseline
+ddsDrug <- ddsDrug[ ,ddsDrug$diagnosis == "CLL" & ddsDrug$treatment != "Baseline"]
+
+# Retrieve patient annotations from dds object as data frame
+patAnno_all <- colData(ddsDrug) %>% as_tibble()
+patAnno <- patAnno_all %>%
+  dplyr::select(-c(fileName, expID, expBatch, Replicate, time, Barcode,
+                   Input.concentration, RIN, IDplate, Library.concentration,
+                   Libary.molarity, Average.fragment.size))
+
+# Extract treatments including DMSO
+allTreat <- patAnno %>% 
+  distinct(treatment) %>% pull(treatment)
+```
+
+
+# Association of viability with CLL-PD
+
+CLL-PD values can be calculated with the function "CLLPDestimate" from the R package mofaCLL. 
+As input, a gene expression matrix with variance stabilized counts is required. 
+
+## Load data and add annotations
+```{r}
+# Load dds data set containing 1106 samples and count matrix
+load("./output/ddsDrug_htseq_batchPilot1c234_20220426.RData")
+
+# Load meta data including genotyping info
+load("./data/patmeta_210324.RData")
+patMeta$pretreated <- patMeta$treatment
+
+# Add columns to DESeq object using patient meta data
+col_vec <- c("diagnosis", "gender", "pretreated", "Methylation_Cluster", "trisomy12", "NOTCH1", "TP53",
+             "ATM", "FBXW7", "MED12", "BRAF", "SF3B1", "del11q", "del17p", "del13q")
+ddsDrug@colData@listData <- lapply(col_vec, function(n) {
+  ddsDrug[[n]] <- patMeta[match(ddsDrug$patID, patMeta$Patient.ID), n]
+}) %>% bind_cols() %>% sjmisc::add_columns(ddsDrug@colData@listData)
+
+names(ddsDrug@colData@listData)[names(ddsDrug@colData@listData) == "Methylation_Cluster"] <- "Methylation"
+ddsDrug$IGHVpat <- patMeta[match(ddsDrug$patID, patMeta$Patient.ID),]$IGHV.status
+ddsDrug$IGHV <- ifelse(is.na(ddsDrug$IGHV), ddsDrug$IGHVpat, ddsDrug$IGHV)
+ddsDrug$IGHVpat <- NULL
+ddsDrug$IGHV[ddsDrug$batch == "pilot" & ddsDrug$patID %in% c("PID1095", "PID1222")] <- "U"
+ddsDrug$IGHV[ddsDrug$batch == "pilot" & ddsDrug$patID %in% c("PID1177", "PID1210")] <- "M"
+ddsDrug$IGHV[ddsDrug$IGHV == "U"] <- 0
+ddsDrug$IGHV[ddsDrug$IGHV == "M"] <- 1
+
+# Add meta data to the samples from the pilot batch
+ddsDrug$diagnosis[ddsDrug$batch == "pilot"] <- "CLL" 
+ddsDrug$trisomy12[ddsDrug$batch == "pilot"] <- 0
+ddsDrug$gender[ddsDrug$batch == "pilot" & ddsDrug$patID %in% c("PID1095", "PID1222")] <- "f"
+ddsDrug$gender[ddsDrug$batch == "pilot" & ddsDrug$patID %in% c("PID1177", "PID1210")] <- "m"
+
+dim(ddsDrug)
+```
+
+Filter genes by counts and diagnosis
+```{r}
+# Only use protein coding genes and include only CLL samples in analysis
+ddsAll <- ddsDrug[rowData(ddsDrug)$biotype == "protein_coding" & !rowData(ddsDrug)$symbol %in% c(NA, ""),
+                  ddsDrug$diagnosis == "CLL" & ddsDrug$treatment != "Baseline" & ddsDrug$Replicate == 1]
+
+# Remove all mitochondrial and artificial chromosomes
+ddsAll <- ddsAll[rowData(ddsAll)$chromosome %in% c(1:22,"X","Y")]
+
+# Remove genes on Y chromosome which could introduce some bias
+ddsAll <- ddsAll[rowData(ddsAll)$chromosome != "Y"]
+
+# Keep only genes with a minimum of 10 counts in any sample
+keep_counts <- apply(counts(ddsAll), 1, function(x) any(x >= 10))
+ddsAll <- ddsAll[keep_counts,]
+
+# Keep only genes expressed in at least 30% of all samples, 
+expr_min <- round(ncol(counts(ddsAll)) * 0.7)
+keep_counts_expr <- apply(counts(ddsAll), 1, function(x) sum(x == 0) < expr_min)
+ddsAll <- ddsAll[keep_counts_expr,]
+
+# Replace spaces in treatment names
+ddsAll$treatment <- str_replace_all(ddsAll$treatment,"[- ]","_")
+
+# Extract count matrix
+exprMat_raw <- assay(ddsAll)
+
+# Extract patient annotation
+patAnno <- data.frame(colData(ddsAll))
+dim(ddsAll)
+```
+
+## Estimate CLL-PD for all samples
+
+Variance stabilization transformation of the raw data
+```{r vst}
+ddsAll.norm <- varianceStabilizingTransformation(ddsAll)
+exprMat <- assay(ddsAll.norm)
+```
+
+```{r}
+CLLPD_allTr <- CLLPDestimate(
+  exprMatrix = exprMat,
+  identifier = "ensembl_gene_id",
+  topVariant = 5000,
+  normalize = TRUE,
+  repeats = 20
+  )
+```
+The parameter ***normazlize*** specifies whether each row-wise z-score for the input matrix should be used. The normalization is generally recommended, unless the input matrix is already a z-score matrix.
+
+repeats ***specifies*** the number of repetitions for the cross-validation. A higher number will generally lead to better stability but takes a longer time. Normally a number between 20 to 100 should be adequate.
+
+The function CLLPDestimate will firstly subset the expression matrix in the mofaCLL package to a reduced one that contains the genes presented in both the mofaCLL matrix and the user-specified matrix. Then, a repeated cross-validation on a LASSO linear regression model will be performed to select a best linear model to predict CLL-PD in the mofaCLL cohort, using the reduced expression matrix. Finally, the selected model will be applied to the user-specified expression matrix and predict CLL-PD for the samples.
+
+### Result interpretation
+
+The output of CLLPDestimate is a list object containing three elements:
+
+1. estimated_CLLPD is a numeric vector that contains the estimated CLL-PD values for the samples in the user-specified expression matrix.
+```{r}
+head(CLLPD_allTr$estimated_CLLPD, 6)
+```
+The estimated CLL-PD values are relative numbers that indicate the relative aggressiveness of the CLL samples. Therefore, the current state of the CLLPDestimate function is providing a proof of concept that will allow further refinement into a robustly measurable biomarker.
+
+2. featureCoefficient is a data frame that contains the features with non-zero coefficients used by the selected model to estimate CLL-PD.
+```{r}
+head(CLLPD_allTr$featureCoefficient, 6)
+```
+
+3. trainingR2 is numeric vector that contains the variance explained values (R2 values) of CLL-PD from repeated cross-validations in the mofaCLLcohort. This value can be a quality check to see whether the genes provided in the user-specified matrix are good enough to re-capture CLL-PD in the original built-in cohort.
+```{r}
+head(CLLPD_allTr$trainingR2, 6)
+```
+
+To see the correlation between CLL-PD and viability, we create a data frame as input for a correlation plot
+```{r}
+plotTab <- tibble(cllpd = CLLPD_allTr$estimated_CLLPD,
+                  viability48 = patAnno$FSC.SSC,
+                  viability0 = patAnno$FSC.SSC.d0)
+```
+
+Function for correlation plot
+```{r}
+plot_corPD <- function(column, ytitle){
+  cor_res <- cor.test(plotTab$cllpd, plotTab[[column]],
+                      method="spearman")
+
+  annoCoef <- paste("'coefficient ='~",format(cor_res$estimate, digits=2))
+  annoP <- paste("italic(P)~'='~",formatNum(cor_res$p.value, digits=1, format="e"))
+
+  plot <- ggplot(plotTab, aes(x = cllpd, y = .data[[column]])) + 
+    geom_point(shape = 21, fill =colList[3], size=3) + 
+    geom_smooth(method = "lm", se=FALSE, color = "grey50", linetype ="dashed" ) + 
+    annotate("text", x = 2, y = Inf, label = annoCoef,
+           hjust=1, vjust =1.5, size = 5, parse = TRUE, col= colList[1]) +
+    annotate("text", x = 2, y = Inf, label = annoP,
+             hjust=1, vjust =3, size = 5, parse = TRUE, col= colList[1]) +
+    ylab(ytitle) + xlab("CLL-PD") +
+    theme_full 
+
+  return(plot)
+}
+```
+
+Correlation of CLL-PD with viability after 48 hours
+```{r}
+plotViabPD <- plot_corPD(column="viability48",
+                         ytitle="Viability after 48h")
+plotViabPD
+```
+
+## Estimate CLL-PD for DMSO and each treatment separately
+
+```{r}
+allTreatDMSO <- patAnno %>%
+  distinct(treatment) %>% pull(treatment)
+
+
+plot_list_cllpd <- lapply(allTreatDMSO, function(tr) {
+  
+  # Extract sample IDs for each treatment
+  ids <- patAnno[patAnno$treatment == tr,]$ID
+  
+  # Subset expression matrix
+  exprMat_sub <- exprMat[,colnames(exprMat) %in% ids]
+  
+  # Estimate CLL-PD values
+  cllpd_est <- CLLPDestimate(exprMatrix = exprMat_sub, identifier = "ensembl_gene_id",
+                           topVariant = 5000, normalize = TRUE, repeats = 50)
+
+  # Extract viability values for that treatment
+  viab <- patAnno[patAnno$treatment == tr,]$FSC.SSC
+  
+  # Create inputs for correlation plot
+  plotTab <- data.frame(x=cllpd_est$estimated_CLLPD, y=viab)
+
+  # Calculate Spearman correlation coefficient
+  cor_res <- cor.test(plotTab$x, plotTab$y,
+                      method="spearman")
+
+  annoCoef <- paste("'coefficient ='~",
+                    format(cor_res$estimate, digits=2))
+  annoP <- paste("italic(P)~'='~",
+                 formatNum(cor_res$p.value, digits=1, format="e"))
+
+  # Create correlation plot
+  plot <- ggplot(plotTab, aes(x = x, y = y)) + 
+    geom_point(shape = 21, fill =colList[3], size=3) + 
+    geom_smooth(method = "lm", se=FALSE, color = "grey50", linetype ="dashed" ) + 
+    annotate("text", x = 2, y = Inf, label = annoCoef,
+           hjust=1, vjust =1.5, size = 5, parse = TRUE, col= colList[1]) +
+    annotate("text", x = 2, y = Inf, label = annoP,
+             hjust=1, vjust =3, size = 5, parse = TRUE, col= colList[1]) +
+    ylab("Viability") + xlab("CLL-PD") +
+    theme_full 
+  plot
+})
+names(plot_list_cllpd) <- allTreatDMSO
+```
+
+By plotting the correlation of the viability values of each treatment with the CLL-PD values of the respective treatment, we can see whether there is an association between the effect of a particular treatment with CLL-PD. 
+```{r, fig.width=12, fig.height=16}
+plot_grid(plotlist=plot_list_cllpd, ncol=3,
+          labels=allTreatDMSO)
+```
+Most of the treatments have a stronger correlation between viability and CLL-PD than DMSO.
+
+
+### Correlation of patient mutation information with CLL-PD
+
+The patients are ordered by CLL-PD. This information is plotted together with the mutation information.
+
+CLL-PD for DMSO patients
+```{r}
+ids_DMSO <- patAnno[patAnno$treatment == "DMSO",]$ID
+exprMat_DMSO <- exprMat[,colnames(exprMat) %in% ids_DMSO]
+cllpd_DMSO <- CLLPDestimate(exprMatrix = exprMat_DMSO, identifier = "ensembl_gene_id",
+                           topVariant = 5000, normalize = TRUE, repeats = 50)
+```
+
+```{r}
+#Prepare data frame
+patAnno_DMSO <- patAnno[patAnno$treatment == "DMSO", ]
+annoCol <- patAnno_DMSO %>%
+  select(ID, TP53, del17p, SF3B1, trisomy12, IGHV, pretreated)
+annoCol$cllpd <- cllpd_DMSO$estimated_CLLPD
+annoCol <- annoCol[order(annoCol$cllpd),,drop = FALSE]
+annoCol <- annoCol %>%
+  mutate(CLLPD = annoCol$cllpd) %>%
+  select(-ID, -cllpd)
+
+## Create "matrix" as input
+plotMat <- t(annoCol)
+# replace NAs by 0
+plotMat[is.na(plotMat)] <- 0
+
+# Convert matrix to numeric
+plotMatnum <- matrix(as.numeric(plotMat),
+                  ncol = ncol(plotMat))
+rownames(plotMatnum) <- rownames(plotMat)
+colnames(plotMatnum) <- colnames(plotMat)
+
+# Settings
+breaks <- c(0,0.5,1)
+colors <- c("white","black")
+rowLabs <- rownames(plotMat)
+
+# Subset annotation columns tp only include CLL-PD
+annoCol <- select(annoCol, CLLPD)
+```
+
+Plot heatmap
+```{r, fig.width=10, fig.height=4}
+plotGeneHeatmap <- pheatmap(plotMatnum, cluster_cols = FALSE, cluster_rows = FALSE, 
+                            annotation_col = annoCol, border_color = "black",
+         breaks = breaks, color = colors, show_colnames = T, fontsize=12,
+         labels_col = patAnno_DMSO[colnames(plotMatnum),]$patID,
+         labels_row = parse(text = rowLabs), fontsize_col=5,
+         fontsize_row=10, legend = FALSE, silent = TRUE)$gtable
+plot_grid(plotGeneHeatmap)
+```
+
+### With correcting for batch effect
+
+```{r}
+# Remove batch effect
+exprMat_adj <- limma::removeBatchEffect(exprMat_DMSO, patAnno_DMSO$patID)
+
+# Calculate CLL-PD
+cllpd_DMSO <- CLLPDestimate(exprMatrix = exprMat_adj, identifier = "ensembl_gene_id",
+                           topVariant = 5000, normalize = TRUE, repeats = 50)
+```
+
+```{r}
+#Prepare data frame
+annoCol <- patAnno_DMSO %>%
+  select(ID, TP53, del17p, SF3B1, trisomy12, IGHV, pretreated)
+annoCol$cllpd <- cllpd_DMSO$estimated_CLLPD
+annoCol <- annoCol[order(annoCol$cllpd),,drop = FALSE]
+annoCol <- annoCol %>%
+  mutate(CLLPD = annoCol$cllpd) %>%
+  select(-ID, -cllpd)
+
+## Create "matrix" as input
+plotMat <- t(annoCol)
+# replace NAs by 0
+plotMat[is.na(plotMat)] <- 0
+
+# Convert matrix to numeric
+plotMatnum <- matrix(as.numeric(plotMat),
+                  ncol = ncol(plotMat))
+rownames(plotMatnum) <- rownames(plotMat)
+colnames(plotMatnum) <- colnames(plotMat)
+
+# Settings
+breaks <- c(0,0.5,1)
+colors <- c("white","black")
+rowLabs <- rownames(plotMat)
+
+# Subset annotation columns tp only include CLL-PD
+annoCol <- select(annoCol, CLLPD)
+```
+
+Plot heatmap
+```{r, fig.width=10, fig.height=4}
+plotGeneHeatmap <- pheatmap(plotMatnum, cluster_cols = FALSE, cluster_rows = FALSE, 
+                            annotation_col = annoCol, border_color = "black",
+         breaks = breaks, color = colors, show_colnames = T, fontsize=13,
+         labels_col = patAnno_DMSO[colnames(plotMatnum),]$patID,
+         labels_row = parse(text = rowLabs), fontsize_col=6,
+         fontsize_row=10, legend = FALSE, silent = TRUE)$gtable
+plot_grid(plotGeneHeatmap)
+```
+
+# Session Info Details
+```{r, echo=FALSE, eval=TRUE}
+sessionInfo()
+```

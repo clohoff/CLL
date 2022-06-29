@@ -1,0 +1,289 @@
+---
+title: "Check alignment quality by STAR of batch 3"
+author: "Caroline Lohoff"
+date: "December 20 2021"
+output:
+  BiocStyle::html_document:
+    toc_float: true
+---
+
+# Set options and load packages and data
+
+Set global options
+```{r setup, include=FALSE, cache = FALSE}
+#knitr::opts_knit$set(root.dir = rprojroot::find_rstudio_root_file())
+knitr::opts_knit$set(root.dir = "~/Documents/R/drugseq_test")
+knitr::opts_chunk$set(warning = FALSE, message = FALSE)
+```
+
+Load packages
+```{r}
+library(tidyverse)
+```
+
+Load patient annotation information into data frame
+```{r}
+patAnno <- readxl::read_xlsx("./data/RNAseq_samples_pilot_batch1new_batch2_batch3.xlsx") %>%
+  mutate(fileName = str_replace(fileName, ".txt.gz","")) %>%
+  mutate(Replicate = as.factor(Replicate)) %>%
+  select(-sequence) %>%
+  mutate(cell = ifelse(patID == "Jurkat","Jurkat","Primary")) %>%
+  select(fileName, expBatch, patID, sampleID, batch, cell)
+```
+
+Select only CLL samples
+```{r}
+patAnnoCLL <- subset(patAnno, diagnosis %in% c("CLL", "Jurkat", NA))
+```
+
+# Quality information from STAR alignment (genome mapping)
+
+Define function
+```{r}
+processLog <- function(fileName) {
+    outTab <- tibble(allLine = read_lines(fileName)) %>%
+      separate(allLine, c("entry","value"),"[|]", remove = FALSE) %>%
+      mutate(value = str_remove_all(value, "[\t%]"),
+             entry = str_trim(entry,"both")) %>%
+      mutate(value = as.numeric(value)) %>%
+      filter(!is.na(value)) %>% select(-allLine)
+    
+    outTab
+}
+```
+
+Load bam files from pilot batch, batch 1 new, batch 2, and batch 3
+```{r, warning=FALSE, error=FALSE}
+allFiles <- list.files("/Users/carolinelohoff/Documents/drugSeq/bam/pilot_batch1new_batch2_batch3/",
+                       recursive = TRUE, full.names = TRUE)
+allRecord <- lapply(allFiles, function(fileName){
+  baseName <- basename(fileName)
+  processLog(fileName) %>%
+    mutate(filename = str_remove(baseName, "Log.final.out"))
+  }) %>% bind_rows()
+```
+
+Check that all samples have patient annotations
+```{r}
+all(allRecord$filename %in% patAnno$fileName)
+all(patAnno$fileName %in% allRecord$filename) 
+
+allRecord <- left_join(allRecord, patAnno, by = c(filename = "fileName")) %>% arrange(entry)
+```
+
+Select only input files from samples with CLL
+```{r}
+allRecordCLL <- subset(allRecord, filename %in% patAnnoCLL$fileName)
+```
+
+Create multiple box plots
+```{r, fig.width=15, fig.height=25}
+diagBoxPlots <- lapply(unique(allRecordCLL$entry), function(n) {
+  plotTab <- filter(allRecordCLL, entry == n)
+  ggplot(plotTab, aes(x=batch, y=value)) +
+    geom_boxplot(outlier.shape = NA) +
+    ggbeeswarm::geom_quasirandom(aes(col=cell), groupOnX=TRUE) +
+    theme_bw() + theme(legend.position = "none") +
+    ggtitle(n)
+})
+cowplot::plot_grid(plotlist = diagBoxPlots, ncol=3)
+```
+The blue dots refer to primary CLL cells and the red dots to the Jurkat samples.
+
+# Quality information from HTseq (gene counting)
+
+**Problem**: tsv file contains batch 1 old and not batch 1 new
+
+Load data
+```{r}
+htTab <- read_tsv("./output/htseq_process_batch3_andPrevious_20211220.tsv")
+htTab <- htTab %>% mutate(batch = allRecord[match(fileName, allRecord$filename),]$batch,
+                          cell = allRecord[match(fileName, allRecord$filename),]$cell) %>%
+  mutate(percent = percent*100)
+htTabCLL <- subset(htTab, fileName %in% patAnnoCLL$fileName)
+```
+
+Create multiple box plots
+```{r, fig.width=10, fig.height=8}
+diagBoxPlots <- lapply(unique(htTabCLL$feature), function(n) {
+  plotTab <- filter(htTabCLL, feature == n)
+  ggplot(plotTab, aes(x=batch, y=percent)) +
+    geom_boxplot(outlier.shape = NA) +
+    ggbeeswarm::geom_quasirandom(aes(col = cell), groupOnX=TRUE) +
+    ylab("Percentage") +
+    theme_bw() + theme(legend.position = "none") +
+    ggtitle(n)
+})
+cowplot::plot_grid(plotlist = diagBoxPlots, ncol=3)
+```
+
+
+# Combine and save Star and HTseq
+Include all samples, not only CLL samples
+```{r}
+htTabReformated <- select(htTab, feature, count, percent, fileName) %>%
+  pivot_longer(c(count, percent), names_to = "type", values_to = "value") %>%
+  mutate(entry = ifelse(type == "count", feature, paste0(feature," %"))) %>%
+  select(value, entry, fileName) %>%
+  left_join(select(patAnno, fileName, expBatch, patID, sampleID, batch), by = "fileName") %>%
+  mutate(source = "HTseq") %>%
+  dplyr::rename(filename  = fileName)
+
+allRecordOut <- bind_rows(allRecord %>% mutate(source = "STAR"),
+                          htTabReformated)
+
+write_csv2(allRecordOut, file = "./output/STAR_HTseq_batch3_summary_20211220.csv")
+```
+
+
+# Salmon results
+
+## Load data
+
+Define function for loading data
+```{r}
+load_salmon <- function(dir_salmon){
+  lapply(dir_salmon, function(n) {
+    filename <- basename(n)
+    allLines <- read_lines(paste0(n,"/logs/salmon_quant.log"))
+    allLines <- allLines[str_detect(allLines, "Mapping rate =")]
+    mapRate <- str_split(allLines, "=")[[1]][2] %>% str_remove_all("[ %]") %>% as.numeric()
+  tibble(filename = filename, value = mapRate)
+  }) %>% bind_rows() %>%
+    left_join(patAnno, by = c(filename = "fileName"))
+}
+```
+
+Pilot batch
+```{r}
+allDir <- list.dirs("/Users/carolinelohoff/Documents/drugSeq/salmon/pilot/", recursive = FALSE)
+salmonOut.pilot <- load_salmon(allDir)
+```
+
+Batch 1 new
+```{r}
+allDir <- list.dirs("/Users/carolinelohoff/Documents/drugSeq/salmon/batch1_new/", recursive = FALSE)
+salmonOut.batch1new <- load_salmon(allDir)
+```
+
+Batch 2
+```{r}
+allDir <- list.dirs("/Users/carolinelohoff/Documents/drugSeq/salmon/batch2/", recursive = FALSE)
+salmonOut.batch2 <- load_salmon(allDir)
+```
+
+Batch 3
+```{r}
+allDir <- list.dirs("/Users/carolinelohoff/Documents/drugSeq/salmon/batch3/", recursive = FALSE)
+salmonOut.batch3 <- load_salmon(allDir)
+```
+
+
+## Plot mapping rate
+```{r, fig.height=4, fig.width=6}
+salmonOut <- bind_rows(salmonOut.pilot, salmonOut.batch1new,
+                       salmonOut.batch2, salmonOut.batch3)
+salmonOut <- salmonOut %>% mutate(cell = allRecord[match(filename, allRecord$filename),]$cell)
+salmonOutCLL <- subset(salmonOut, diagnosis %in% c("CLL", "Jurkat", NA))
+ggplot(salmonOut, aes(x=batch, y=value)) +
+  geom_boxplot(outlier.shape = NA) +
+  ggbeeswarm::geom_quasirandom(aes(col = cell)) +
+  ylab("Percentage")  +
+  theme_bw() + theme(legend.position = "none") +
+  ggtitle("Salmon mapping rate")
+```
+
+
+# Correlation quality features with cell viability (STAR & HTseq)
+
+Load data
+```{r}
+load("./data/patmeta_210324.RData")
+
+allRecordOut <- read_csv2("./output/STAR_HTseq_batch3_summary_20211220.csv") %>%
+  filter(str_detect(entry,"%"), batch == "batch1") %>%
+  select(entry, value, filename)
+
+patAnno <- readxl::read_xlsx("./data/RNAseq_samples_pilot_batch1new_batch2_batch3.xlsx") %>%
+  mutate(fileName = str_replace(fileName, ".txt.gz","")) %>%
+  mutate(diagnosis = patMeta[match(patID, patMeta$Patient.ID),]$diagnosis) %>%
+  mutate(diagnosis = ifelse(patID == "Jurkat","Jurkat",diagnosis))
+
+#Select only CLL samples
+patAnnoCLL <- subset(patAnno, diagnosis %in% c("CLL", "Jurkat", NA))
+
+patTest <- patAnno %>%
+  select(fileName, FSC.SSC.d0, FSC.SSC, FSC.SSC.norm) %>%
+  pivot_longer(-fileName, names_to = "metaVar", values_to = "metaValue")
+```
+
+Show results
+```{r}
+testTab <- full_join(allRecordOut, patTest, by = c(filename= "fileName")) %>%
+  filter(!is.na(value), !is.na(metaValue))
+  
+resTab <- group_by(testTab, entry, metaVar) %>% nest() %>%
+  mutate(m=map(data, ~cor.test(~value + metaValue, .,
+                              method = "spearman", use = "pairwise.complete.obs"))) %>%
+  mutate(res = map(m, broom::tidy)) %>% 
+  unnest(res) %>%
+  select(entry, metaVar, p.value, estimate) %>%
+  arrange(p.value)
+
+resTab %>% mutate_if(is.numeric, formatC) %>%
+  DT::datatable()
+```
+
+
+# Top 12 associations as scatter plot
+
+All samples
+```{r, fig.height=9, fig.width=12}
+pList <- lapply(seq(12), function(i) {
+  rec <- resTab[i,]
+  plotTab <- filter(testTab, entry == rec$entry, metaVar == rec$metaVar) %>%
+    mutate(diagnosis = patAnno[match(filename, patAnno$fileName),]$diagnosis)
+  ggplot(plotTab, aes(x=metaValue, y=value)) +
+    geom_point(aes(col = diagnosis)) + geom_smooth(method = "lm") +
+    theme_bw() +
+    xlab(rec$metaVar) + ylab(rec$entry)
+})
+
+cowplot::plot_grid(plotlist = pList, ncol=3)
+```
+
+Only CLL samples
+```{r, fig.height=9, fig.width=12}
+
+allRecordOutCLL <- subset(allRecordOut, filename %in% patAnnoCLL$fileName)
+patTestCLL <- subset(patTest, fileName %in% patAnnoCLL$fileName)
+
+testTabCLL <- full_join(allRecordOutCLL, patTestCLL, by = c(filename= "fileName")) %>%
+  filter(!is.na(value), !is.na(metaValue))
+  
+resTabCLL <- group_by(testTabCLL, entry, metaVar) %>% nest() %>%
+  mutate(m=map(data, ~cor.test(~value + metaValue, .,
+                              method = "spearman", use = "pairwise.complete.obs"))) %>%
+  mutate(res = map(m, broom::tidy)) %>% 
+  unnest(res) %>%
+  select(entry, metaVar, p.value, estimate) %>%
+  arrange(p.value)
+
+pList <- lapply(seq(12), function(i) {
+  rec <- resTabCLL[i,]
+  plotTab <- filter(testTabCLL, entry == rec$entry, metaVar == rec$metaVar) %>%
+    mutate(diagnosis = patAnnoCLL[match(filename, patAnnoCLL$fileName),]$diagnosis)
+  ggplot(plotTab, aes(x=metaValue, y=value)) +
+    geom_point(aes(col = "red")) + geom_smooth(method = "lm") +
+    theme_bw() +
+    xlab(rec$metaVar) + ylab(rec$entry) +
+    theme(legend.position="none")
+})
+
+cowplot::plot_grid(plotlist = pList, ncol=3)
+```
+
+# Session Info Details
+```{r, echo=FALSE, eval=TRUE}
+sessionInfo()
+```

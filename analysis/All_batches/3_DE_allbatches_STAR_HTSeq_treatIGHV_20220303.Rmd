@@ -1,0 +1,569 @@
+---
+title: "DE and pathway enrichment analysis (treatment + IGHV) of all batches, pre-processed with STAR + HTSeq"
+author: "Caroline Lohoff"
+date: "March 03 2022"
+output:
+  BiocStyle::html_document:
+    toc_float: true
+---
+
+# Description
+Old approach to assess treatment and IGHV status. 
+
+In this differential gene expression analysis, we combine the information about treatment and IGHV status in one column, e.g. Ibrutinib_0 and Ibrutinib_1. This design leads to weird p-value histograms. 
+
+Design formula: ~ 0 + patID + trIGHV
+
+
+# Load libraries and set options
+
+Set global options
+```{r setup, include=FALSE, cache = FALSE}
+knitr::opts_knit$set(root.dir = "~/Documents/R/drugseq_test")
+knitr::opts_chunk$set(warning = FALSE, message = FALSE)
+```
+
+Load libraries
+```{r}
+suppressPackageStartupMessages({
+  library(DESeq2)
+  library(tidyverse)
+  library(RColorBrewer)
+  library(pheatmap)
+  library(clusterProfiler)
+  library(enrichplot)
+  library(cowplot)
+  library(org.Hs.eg.db)
+  library(annotate)
+})
+```
+
+Set global ggplot variables
+```{r}
+theme_set(theme_bw() + theme(axis.text = element_text(size=12), 
+                             axis.title = element_text(size=16),
+                             legend.title = element_text(size=16),
+                             legend.text = element_text(size=14),
+                             plot.title = element_text(size=18,
+                                                       hjust=0.5,face="bold")))
+# Define color palette
+cp <- c("#2CB902", "#FD7306", "#FF1EBE", "#0137A4", "#C8C701")
+```
+
+# Load data and add annotations
+```{r}
+# Load dds data set containing 1106 samples and count matrix
+load("./output/ddsDrug_htseq_batchPilot1c234_20220207.RData")
+
+# Load meta data including genotyping info
+load("./data/patmeta_210324.RData")
+
+# Add columns to DESeq object using patient meta data
+col_vec <- c("diagnosis", "gender", "Methylation_Cluster", "trisomy12", "TP53")
+ddsDrug@colData@listData <- lapply(col_vec, function(n) {
+  ddsDrug[[n]] <- patMeta[match(ddsDrug$patID, patMeta$Patient.ID), n]
+}) %>% bind_cols() %>% sjmisc::add_columns(ddsDrug@colData@listData)
+
+names(ddsDrug@colData@listData)[names(ddsDrug@colData@listData) == "Methylation_Cluster"] <- "Methylation"
+ddsDrug$IGHVpat <- patMeta[match(ddsDrug$patID, patMeta$Patient.ID),]$IGHV.status
+ddsDrug$IGHV <- ifelse(is.na(ddsDrug$IGHV), ddsDrug$IGHVpat, ddsDrug$IGHV)
+
+# Add meta data to the samples from the pilot batch
+ddsDrug$diagnosis[ddsDrug$batch == "pilot"] <- "CLL" 
+ddsDrug$trisomy12[ddsDrug$batch == "pilot"] <- 0
+ddsDrug$TP53[ddsDrug$batch == "pilot"] <- 0
+ddsDrug$IGHV[ddsDrug$batch == "pilot" & ddsDrug$patID %in% c("PID1095", "PID1222")] <- "U"
+ddsDrug$IGHV[ddsDrug$batch == "pilot" & ddsDrug$patID %in% c("PID1177", "PID1210")] <- "M"
+ddsDrug$gender[ddsDrug$batch == "pilot" & ddsDrug$patID %in% c("PID1095", "PID1222")] <- "f"
+ddsDrug$gender[ddsDrug$batch == "pilot" & ddsDrug$patID %in% c("PID1177", "PID1210")] <- "m"
+
+# Remove columns
+ddsDrug$IGHVpat <- NULL
+ddsDrug$fileName <- NULL
+ddsDrug$expID <- NULL
+ddsDrug$expBatch <- NULL
+ddsDrug$time <- NULL
+ddsDrug$Barcode <- NULL
+ddsDrug$RIN <- NULL
+
+dim(ddsDrug)
+```
+
+Filter genes, counts and diagnosis
+```{r}
+# Only use protein coding genes and include only CLL samples in analysis
+ddsAll <- ddsDrug[rowData(ddsDrug)$biotype == "protein_coding" & !rowData(ddsDrug)$symbol %in% c(NA, ""),
+                  ddsDrug$diagnosis == "CLL" & ddsDrug$treatment != "Baseline" & ddsDrug$Replicate == 1 & ddsDrug$IGHV %in% c("U", "M")]
+
+# Show chromosomes
+table(rowData(ddsAll)$chromosome)
+
+# Remove all mitochondrial and artificial chromosomes
+ddsAll <- ddsAll[rowData(ddsAll)$chromosome %in% c(1:22,"X","Y")]
+
+# Remove genes on Y chromosome which could introduce some bias
+ddsAll <- ddsAll[rowData(ddsAll)$chromosome != "Y"]
+# ddsAll <- ddsAll[!rowData(ddsAll)$chromosome %in% c("X","Y")]
+table(rowData(ddsAll)$chromosome)
+
+# Keep only genes with a minimum of 10 counts in any sample
+keep_counts <- apply(counts(ddsAll), 1, function(x) any(x >= 10))
+ddsAll <- ddsAll[keep_counts,]
+
+# Extract count matrix
+counts_df <- as.data.frame(ddsAll@assays@data@listData$counts)
+
+dim(ddsAll)
+```
+
+After filtering, more genes remain in the data set pre-processed with Salmon. 
+
+```{r, eval=FALSE, include=FALSE}
+# Compare expression level of TP53 between the different conditions
+TP53 <- ddsAll["ENSG00000141510",] %>%
+  pivot_longer(everything(), names_to = "Condition")
+
+TP53 %>%
+  group_by(Condition) %>%
+  ggplot(aes(x=Condition, y=value, col=Condition)) +
+  geom_point() +
+  ylab("Normalized counts") +
+  ggtitle("Differential gene expression overview gene 1") 
+```
+
+## RNA-Seq count distribution
+
+To test whether the expression of genes between two or more groups is significantly different, we need an appropriate statistical model, which is determined by the count distribution. When we plot the distribution of counts for a single sample, we can visualize key features of RNA-Seq count data, including a large proportion of genes with low raw counts and many genes with zero counts. In comparison, a few genes have a high expression, as there is no maximum limit for reads per gene in RNA-Seq data. If there is no expression variation between biological replicates, the Poisson distribution is frequently used.
+If the biological variation cannot be modeled by the Poisson distribution, a negative binomial model can serve as a good model choice for DESeq2.
+```{r}
+ggplot(counts_df) +
+  geom_histogram(aes(x=smp659), stat="bin", bins=100) +
+  labs(x="Raw expression counts", y="Number of genes",
+       title="Distribution of raw counts within one sample")
+```
+
+## Statistics (variance and mean)
+
+The aim of DE analysis is to determine whether a gene’s mean expression between sample groups is different given the variation within groups. This is determined by testing the probability of the log2 fold changes between groups being significantly different from zero:
+
+Log2(mean(treatment)/mean(control)) = 0
+
+To explore the variation in the data, we will observe the variance in gene expression relative to the mean. Variance is the square of the standard deviation, representing how far away the expression of the individual samples are from the means. For RNA-Seq data the variance is expected to increase with the genes mean expression.
+```{r}
+DMSO <- ddsAll[, ddsAll$treatment == "DMSO"]
+DMSO_samples <- DMSO$ID
+
+# Calculate mean for each gene of DMSO samples
+mean_counts <- apply(counts_df[, DMSO_samples], 1, mean)
+# Calculate variance for each gene of DMSO samples
+variance_counts <- apply(counts_df[, DMSO_samples], 1, var)
+# Create a data frame
+statistics_df <- data.frame(mean_counts, variance_counts)
+# Plot the statistics
+ggplot(statistics_df) +
+  geom_point(aes(x=mean_counts, y=variance_counts)) +
+               scale_x_log10() +
+               scale_y_log10() +
+               labs(x="Mean counts per gene", y="Variance per gene") +
+               ggtitle("Statistics for DMSO samples")
+```
+Usually, this plot shows a diagonal for RNA-Seq data. Also, the range for variance is greater for lower mean counts than for higher mean counts.
+
+# Differential expression using DESeq
+
+Differential expression analysis of genomic data types uses linear models to determine the size and direction of the changes in gene expression. 
+
+Add new column with treatment and IGHV status combined
+```{r}
+combined <- data.frame(colData(ddsAll)) %>%
+  mutate(trIGHV = paste(ddsAll$treatment,ddsAll$IGHV,sep="_"))
+combined$trIGHV[combined$treatment == "DMSO"] <- "DMSO" 
+
+ddsAll$trIGHV <- combined[match(ddsAll$ID, combined$ID),]$trIGHV
+```
+
+## Create design matrix
+```{r}
+patAnno <- data.frame(colData(ddsAll)) %>% dplyr::select(patID, trIGHV) %>%
+  mutate(trIGHV = str_replace_all(trIGHV,"[- ]","_")) %>%
+  mutate(trIGHV = factor(trIGHV,
+                         levels = c("DMSO",setdiff(unique(trIGHV),"DMSO"))))
+designMat <- model.matrix(~ 0 + patID + trIGHV, patAnno)
+```
+
+Add design to dds objects
+```{r}
+ddsAll$condi <- factor(str_replace_all(ddsAll$trIGHV,"[- ]","_"))
+ddsAll$condi <- factor(ddsAll$condi,
+                       levels = c("DMSO",setdiff(levels(ddsAll$condi),c("DMSO"))))
+ddsAll$patID <- factor(ddsAll$patID)
+
+design(ddsAll) <- ~ patID + condi
+
+# Save dds object
+save(ddsAll, file = "./output/ddsAll_allbatches_STAR_HTSeq_treatIGHV_20220303.RData")
+```
+
+## Run DESeq2
+
+The DESeq function fits the raw counts to the negative binomial model. The final dds object contains all the information needed for performing DE testing between specific sample groups. New information such as shrunken dispersions, model coefficients, Wald test results, and gene-wise dispersions will be added to the dds object.
+```{r, echo=TRUE, eval=FALSE}
+library("BiocParallel")
+register(MulticoreParam(2))
+load("./output/ddsAll_allbatches_STAR_HTSeq_treatIGHV_20220303.RData")
+DEresDis <- DESeq(ddsAll)
+#ddsAllDis <- estimateDispersions(ddsAll)
+#DEresDis <- nbinomWaldTest(ddsAllDis, maxit=500)
+save(DEresDis, file = "./output/DEresDis_allbatches_STAR_HTSeq_treatIGHV_20220303.RData")
+```
+
+Get results
+```{r}
+load("./output/DEresDis_allbatches_STAR_HTSeq_treatIGHV_20220303.RData")
+
+# Omit any remaining rows, as these are typically genes with very small counts and little power
+DEresClean <- DEresDis[which(mcols(DEresDis)$betaConv),]
+
+# Furthermore, one can examine the counts for the rows that are not converging. Often, these genes have problematic distribution of counts, e.g. they contain outliers. If the rows do not represent DE genes, their p-values and adj p-values could be set to NA.
+```
+
+
+```{r}
+# Extract a vector with the names of all drug treatments
+allTreat <- patAnno %>% filter(treatment != "DMSO") %>%
+  distinct(treatment) %>% pull(treatment)
+
+allRes <- lapply(allTreat, function(tr) {
+  resTab <- results(DEresClean, 
+                    name = paste0("condi_",tr,"_vs_DMSO"),
+                    tidy = TRUE) %>% mutate(treatment = tr)
+}) %>% bind_rows() %>% mutate(symbol = rowData(ddsDrug)[row,]$symbol)
+
+names(allRes)[names(allRes) == "row"] <- "Ensembl"
+allRes <- allRes[, c(1, 9, 2, 3, 4, 5, 6, 7, 8)]
+```
+
+
+# Visualize DE results
+
+In this section we explore how well our data fit the model.
+
+## Dispersion 
+
+A measure of the variance for a given mean is described by a metric called dispersion. The DESeq2 model uses dispersion to assess the variability expression when modelling the counts. The dispersion is indirectly related to the mean and the variance of the data using the following formula, with alpha denoting the dispersion and mu the mean:
+
+Dispersion formula: Var = mu + alpha * mu^2
+
+An increase in variance will increase dispersion, while an increase in mean will decrease dispersion. Thus, for any two genes with the same mean expression a difference in dispersion will be caused by a difference in variance.
+
+The dispersion estimates are used to model the raw counts. If the dispersions do not follow the assumptions made by DESeq2, then the variation in the data could be poorly estimated and the DE results could be less accurate.
+```{r}
+plotDispEsts(DEresClean)
+```
+This plot looks quite good, as we expect the dispersion values to decrease with increasing mean and that they cluster around the fitted maximum likelihood line. Larger numbers of replicates can estimate the mean and variation more accurately, so yield less shrinkage.
+
+Each black dot is a gene with an associated mean and dispersion value. The red line represents information used across all genes to determine the most likely estimates of dispersion for a given gene expression value. Genes with inaccurately small estimates of variation could yield many false positive genes identified as DE although there are not. Therefore, the original gene-wise dispersion estimates (black dots) are shrunken toward the curve to yield more accurate estimates of dispersion (blue dots), which are used to model the counts for determining the DE genes. Extremely high dispersion values surrounded by blue circles are not shrunken due to the likelihood that the gene may have higher variability than other genes for biological or technical reasons. Reducing the variation could result in false positives.
+
+## P-value histogram
+
+```{r, fig.height=6, fig.width=10}
+ggplot(allRes, aes(x=pvalue)) + geom_histogram(binwidth=0.025) +
+  facet_wrap(~treatment) + xlim(0,1)
+```
+
+## Number of significant DE genes 
+
+10% FDR
+```{r,fig.height=5, fig.width=6}
+sumTab <- filter(allRes, padj < 0.1) %>%  #plot p-values instead of adjusted p-values 
+  group_by(treatment) %>% summarise(n=length(Ensembl)) %>%
+  arrange(desc(n)) %>% mutate(treatment = factor(treatment, levels = treatment))
+ggplot(sumTab, aes(x=treatment, y=n)) +
+  geom_bar(stat = "identity", fill="#0C3C9F") +
+  theme(axis.text.x = element_text(angle = 90, vjust=0.5, hjust=1))
+```
+
+25% FDR
+```{r,fig.height=5, fig.width=6}
+sumTab <- filter(allRes, padj < 0.25) %>%
+  group_by(treatment) %>% summarise(n=length(Ensembl)) %>%
+  arrange(desc(n)) %>% mutate(treatment = factor(treatment, levels = treatment))
+ggplot(sumTab, aes(x=treatment, y=n)) +
+  geom_bar(stat = "identity", fill="#0C3C9F") +
+  theme(axis.text.x = element_text(angle = 90, vjust=0.5, hjust=1))
+```
+The differences between the numbers of significant DE genes is quite big. Duvelisib (PI3-kinase inhibitor) has the most differentially expressed genes. Also in the PCA plot it was the most distinct treatment from DMSO. Furthermore, the effects of all compounds which are no kinase inhibitors namely Selinexor, Nutlin-3a, and C26 seem to be less strong, as they have less significant DE genes. 
+
+## Table of significant associations
+```{r, warning=FALSE}
+allRes %>% filter(padj < 0.1) %>% dplyr::select(Ensembl, symbol, log2FoldChange, pvalue, padj, treatment) %>%
+  mutate_if(is.numeric, formatC, digits=2) %>%
+  DT::datatable()
+```
+
+## Overlap of differentially expressed genes
+
+Prepare gene lists with all significant genes per treatment
+```{r}
+allRes.sig <- filter(allRes, padj < 0.25)
+geneList <- lapply(unique(allRes.sig$treatment), function(tr) {
+  filter(allRes.sig, treatment == tr)$Ensembl
+  })
+names(geneList) <- unique(allRes.sig$treatment)
+```
+
+```{r, fig.height=10, fig.width=15}
+UpSetR::upset(UpSetR::fromList(geneList), nsets = 50)
+```
+There is not much overlap. Ibrutinib has a larger overlap with Duvelisib than with other drugs. 
+
+
+# Pathway enrichment analysis
+
+## clusterProfiler
+clusterProfiler is a universal enrichment tool for interpreting omics data and supports several ontology and pathway annotations. The resulting data frame after DE analysis will be used as input.
+
+```{r prepare-cP}
+# Convert Ensembl IDs to Entrez IDs
+EntrezID = mapIds(org.Hs.eg.db,
+                    keys=allRes$Ensembl,
+                    column="ENTREZID",
+                    keytype="ENSEMBL",
+                    multiVals="first")
+
+# Create new df as input for ClusterProfiler
+cluster_df <- add_column(allRes, EntrezID, .before = "symbol") %>%
+  dplyr::select(-baseMean, -lfcSE, -stat, -pvalue, -padj)
+
+# Filter the logFC values: log2(1.5) = 0.58
+cluster_df <- cluster_df[abs(cluster_df$log2FoldChange) > 0.58,]
+```
+Filtering the log2 fold change values reduced the number of rows from 161496 to 32608.
+
+### ORA with "compareCluster" function
+[ClusterProfiler 4.0](https://doi.org/10.1016/j.xinn.2021.100141) was expanded for conducting biological theme comparison. 
+The provided function "compareCluster" calculates enriched functional profiles of each gene cluster and aggregates the results into a single object. Therefore, we can analyze the effects of all treatments at once. The disadvantage of "compareCluster" is that it can only perform over-representation analyses and not gene set enrichment analyses.
+
+```{r run-cP-KEGG}
+clusterResKEGG <- compareCluster(EntrezID~treatment, data=cluster_df, fun="enrichKEGG",
+                                 organism="hsa", pvalueCutoff=0.1, pAdjustMethod = "BH")
+```
+
+**Dotplot**  
+Each column in the dotplot represents an enrichment result of a treatment. For every treatment the five most significant pathways are depicted. To make the comparison among different clusters more informative, also not significant pathways are displayed if they are under the top five of any other treatment. The color gradient based on p-values may indicate which categories are more likely to have biological meanings. The size of the dots refers to the number of genes considered as significant within a pathway.
+```{r plot-cP-KEGG, fig.width=11, fig.height=7}
+dotplot(clusterResKEGG, showCategory = 5, size="Count", includeAll=TRUE)
+```
+The result indicates that nearly all drugs effect the pathways PI3K-Akt signaling, neuroactive ligand-receptor interaction, and calcium signaling. The rather few significant pathways identified after drug perturbation with C26 may be explained by the little number of significant DE genes (see bar plot above).
+
+### GSEA with "gseKEGG" function
+If we want to conduct a gene set enrichment analysis (GSEA) instead of an over-representation analysis, we have to use the "gseKEGG" function, which can only deal with one drug treatment at once. Thus, the function has to be packed into a for loop.
+
+Prepare the input list for clusterProfiler
+```{r prepare-cP-GSEA}
+geneList_LFC <- lapply(allTreat, function(tr) {
+  filter(cluster_df, treatment == tr)$log2FoldChange
+  })
+geneList_LFC <- lapply(geneList_LFC, function(n) na.omit(sort(n, decreasing = TRUE)))
+names(geneList_LFC) <- allTreat
+```
+
+Run ClusterProfiler individually on every treatment with the gseKEGG function.
+```{r run-cP-GSEA}
+gseGO_results <- vector("list", length(allTreat))
+names(gseGO_results) <- allTreat
+
+for(tr in allTreat) {
+  names(geneList_LFC[[tr]]) <- filter(cluster_df, treatment == tr)$EntrezID
+  
+  gseGO_results[[tr]] <- gseKEGG(geneList=geneList_LFC[[tr]], organism = "hsa",
+                                 pvalueCutoff = 0.1, pAdjustMethod = "BH")
+}
+```
+
+#### Dotplot
+Plot most important pathways for every drug treatment as dotplot.
+```{r dotplot-cP-GSEA, fig.width=18, fig.height=12}
+plot_list <- lapply(gseGO_results, function(tr) {
+    if (nrow(tr@result)) {
+    dotplot(tr, showCategory=5, split=".sign") + facet_grid(.~.sign) +
+        theme(axis.text.y=element_text(face="bold"))
+      }
+    })
+
+plot_grid(plotlist=plot_list, ncol=3, labels=allTreat)
+```
+
+#### Enrichment map
+Enrichment map organizes enriched terms into a network with edges connecting overlapping gene sets. In this way, mutually overlapping gene sets are tend to cluster together, making it easy to identify functional modules.
+```{r enrich-cP-GSEA, fig.width=20, fig.height=13}
+plot_list <- lapply(gseGO_results, function(tr) {
+    if (nrow(tr@result)) {
+      map <- pairwise_termsim(tr)
+      emapplot(map, showCategory = 10)
+      }
+  })
+
+plot_grid(plotlist=plot_list, ncol=3, labels=allTreat)
+```
+
+#### Cnetplot
+The cnetplot depicts the linkages of genes and biological concepts (e.g. GO terms or KEGG pathways) as a network. This might be helpful to identify genes which are involved in enriched pathways or may belong to multiple annotation categories.
+```{r netplot-cP-GSEA, fig.width=18, fig.height=12}
+library(ggnewscale)
+cnetplot1 <- cnetplot(gseGO_results$Ibrutinib, categorySize="pvalue",
+                      foldChange=geneList_LFC$Ibrutinib, showCategory = 3)
+cnetplot2 <- cnetplot(gseGO_results$Duvelisib, categorySize="pvalue",
+                      foldChange=geneList_LFC$Duvelisib, showCategory = 3)
+
+cowplot::plot_grid(cnetplot1, cnetplot2, ncol=2, labels=c("Ibrutinib", "Duvelisib"))
+```
+
+#### Publication plot
+Plots the number of publications trend based on the query result from PubMed Central.
+```{r pubmed-cP-GSEA, fig.width=6, fig.height=4}
+library(europepmc)
+terms <- gseGO_results$Duvelisib$Description[1:5]
+pmcplot(terms, 2011:2021, proportion=FALSE)
+```
+
+
+## camera
+
+This method was proposed by Wu and Smyth in 2012. [camera](https://www.rdocumentation.org/packages/limma/versions/3.28.14/topics/camera) performs a competitive test in the sense defined by [Goeman and Buhlmann](https://doi.org/10.1093/bioinformatics/btm051). It tests whether the genes in the set are highly ranked in terms of differential expression relative to genes not in the set and thereby accounts for inter-gene correlation. As input camera only needs a count matrix and a design matrix. No prior differential expression (DE) is required, as camera performs a DE internally. Again, we can perform a gene set enrichment analysis for every drug treatment individually.
+
+### Preparations
+First, we have to prepare the gene lists and create the design matrix.
+```{r prepare-camera, eval=FALSE, echo=FALSE}
+gmt_KEGG <- read.gmt("data/c2.cp.kegg.v7.4.symbols.gmt.txt")
+gmt_HallmarkE <- read.gmt("data/h.all.v7.4.entrez.gmt.txt")
+gmt_HallmarkS <- read.gmt("data/h.all.v7.4.symbols.gmt.txt")
+
+#Function for converting gene name data frame into list
+geneList <- function(source) {
+  pathwayNames <- levels(source$term)
+  newList<- vector("list")
+
+  for (pathway in pathwayNames) {
+    genes <- source$gene[source$term == pathway]
+    newList[[length(newList) + 1]] <- genes 
+    # alternative would be list.append function from rlist
+  }
+  names(newList) <- pathwayNames
+  return(newList)
+}
+
+geneList_kegg <- geneList(gmt_KEGG)
+geneList_HallmarkE <- geneList(gmt_HallmarkE)
+geneList_HallmarkS <- geneList(gmt_HallmarkS)
+
+# Create design matrix
+designMat <- model.matrix(~ 0 + treatment + patID, patAnno)
+```
+
+Variance stabilization transformation of the raw data
+```{r vst, eval=FALSE, echo=FALSE}
+ddsAllvst <- vst(ddsAll)
+counts_df <- as.data.frame(ddsAllvst@assays@data@listData)
+```
+
+Convert Ensembl identifiers to gene symbols
+```{r convert-ids, eval=FALSE, echo=FALSE}
+# Convert Ensembl IDs to Entrez IDs
+entrezID = mapIds(org.Hs.eg.db,
+                    keys=row.names(counts_df), #Column with Ensembl gene ids
+                    column="ENTREZID",
+                    keytype="ENSEMBL",
+                    multiVals="first")
+
+# Convert Entrez IDs to gene symbols
+gene_symbols <- getSYMBOL(na.omit(as.vector(entrezID)), data="org.Hs.eg.db")
+
+# Create new df with gene symbols as row names
+counts_df_symbols <- add_column(counts_df, entrezID) %>%
+  drop_na(entrezID) %>% add_column(gene_symbols) %>%
+  dplyr::select(-entrezID) %>% drop_na(gene_symbols) %>%
+  distinct(gene_symbols, .keep_all = TRUE) %>%
+  remove_rownames %>% column_to_rownames(var="gene_symbols")
+
+dim(counts_df_symbols)
+```
+
+Run camera function
+```{r run-camera, eval=FALSE, echo=FALSE}
+limmaRes_KEGG <- limma::camera(counts_df_symbols, geneList_kegg, designMat, inter.gene.cor=0.01)
+head(limmaRes_KEGG, n=5)
+```
+This resulting data frame represents a combination of all treatments. In order to see the different drug effects, the design matrix and count matrix need to be adjusted to only contain samples treated with the same drug. After that, the camera function is applied to the nine count matrices individually and the results are combined into a list object. 
+
+### Run camera function on every treatment individually
+```{r run-camera-individually, eval=FALSE, echo=FALSE}
+# Filter rows in design matrix for every treatment
+rows_subset <- list(c(3:ncol(designMat)), c(2, 4:ncol(designMat)), c(2:3, 5:ncol(designMat)),
+                    c(2:4, 6:ncol(designMat)), c(2:5, 7:ncol(designMat)), c(2:6, 8:ncol(designMat)),
+                    c(2:7, 9:ncol(designMat)), c(2:8, 10:ncol(designMat)), c(2:9, 11:ncol(designMat)))
+
+# Define function for sub-setting the count matrix and design matrix
+subsetTreatment <- function(countsDF, geneList) {
+  cameraList <- vector("list")
+  
+  for (drug in rows_subset) {
+    designMat_subset <- as.data.frame(designMat[, -drug]) %>%
+      dplyr::filter_at(vars(starts_with("treatment")), any_vars(. != 0))
+    designMat_subset <- cbind(Intercept = 1, designMat_subset)
+    designMat_subset <- designMat_subset[, -2]
+
+    counts_df_subset <- countsDF[, names(countsDF)[(names(countsDF) %in% row.names(designMat_subset))]]
+    
+    # Run camera and append result to list
+    cameraRes <- limma::camera(counts_df_subset, geneList, designMat_subset, inter.gene.cor=0.01)
+    cameraRes["Pathway"] <- rownames(cameraRes)  #add column
+    cameraRes$Pathway <- sub(".*?_", "", cameraRes$Pathway)
+    cameraList[[length(cameraList) + 1]] <- cameraRes
+  }
+  names(cameraList) <- allTreat 
+  return(cameraList)
+}
+
+# Run camera
+cameraRes_kegg <- subsetTreatment(counts_df_symbols, geneList_kegg)
+cameraRes_HallmarkE <- subsetTreatment(counts_df_symbols, geneList_HallmarkE)
+cameraRes_HallmarkS <- subsetTreatment(counts_df_symbols, geneList_HallmarkS)
+```
+
+Plot most important pathways for every drug treatment as dotplot (KEGG pathways).
+```{r plot-camera, fig.width=15, fig.height=13, eval=FALSE, echo=FALSE}
+# Add information about total number of genes in pathways to calculate gene ratio
+#cameraRes_kegg <- mapply(cbind, cameraRes_kegg, "TGenes"=lengths(geneList_kegg))
+
+plot_list <- lapply(cameraRes_kegg, function(tr) {
+  ggplot(tr[head(order(tr$FDR), 10), ],
+       aes(x=Direction, y=Pathway, group=Direction, col=FDR)) +
+    geom_point(size=5) +
+    theme(axis.title=element_blank(),
+          axis.text=element_text(face="bold")) +
+    scale_colour_gradientn(colours=c("#FF0000", "#E90F97", "#0858FB"))
+    })
+
+plot_grid(plotlist=plot_list, ncol=3, labels=allTreat)
+```
+
+```{r plot-cameraH, eval=FALSE, echo=FALSE, fig.width=15, fig.height=13}
+# Plot most important pathways for every drug treatment as dotplot (Hallmark pathways).
+
+plot_list <- lapply(cameraRes_HallmarkE, function(tr) {
+  ggplot(tr[head(order(tr$FDR), 10), ],
+       aes(x=Direction, y=Pathway, group=Direction, col=FDR)) +
+    geom_point(size=5) +
+    theme(axis.title=element_blank(),
+          axis.text=element_text(face="bold")) +
+    scale_colour_gradientn(colours=c("#FF0000", "#E90F97", "#0858FB"))
+    })
+
+plot_grid(plotlist=plot_list, ncol=3, labels=allTreat)
+```
+
+# Session Info Details
+```{r, echo=FALSE, eval=TRUE}
+sessionInfo()
+```

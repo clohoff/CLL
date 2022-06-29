@@ -1,0 +1,921 @@
+<!DOCTYPE html>
+
+<html>
+
+<head>
+
+<meta charset="utf-8" />
+<meta name="generator" content="pandoc" />
+<meta http-equiv="X-UA-Compatible" content="IE=EDGE" />
+
+
+<meta name="author" content="Caroline Lohoff (based on code from Junyan Lu)" />
+
+
+<title>Check alignment quality by STAR of batch 1 new, old, and combined</title>
+
+<script src="site_libs/header-attrs-2.11/header-attrs.js"></script>
+<script src="site_libs/jquery-3.6.0/jquery-3.6.0.min.js"></script>
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<link href="site_libs/bootstrap-3.3.5/css/cosmo.min.css" rel="stylesheet" />
+<script src="site_libs/bootstrap-3.3.5/js/bootstrap.min.js"></script>
+<script src="site_libs/bootstrap-3.3.5/shim/html5shiv.min.js"></script>
+<script src="site_libs/bootstrap-3.3.5/shim/respond.min.js"></script>
+<style>h1 {font-size: 34px;}
+       h1.title {font-size: 38px;}
+       h2 {font-size: 30px;}
+       h3 {font-size: 24px;}
+       h4 {font-size: 18px;}
+       h5 {font-size: 16px;}
+       h6 {font-size: 12px;}
+       code {color: inherit; background-color: rgba(0, 0, 0, 0.04);}
+       pre:not([class]) { background-color: white }</style>
+<script src="site_libs/jqueryui-1.11.4/jquery-ui.min.js"></script>
+<link href="site_libs/tocify-1.9.1/jquery.tocify.css" rel="stylesheet" />
+<script src="site_libs/tocify-1.9.1/jquery.tocify.js"></script>
+<script src="site_libs/navigation-1.1/tabsets.js"></script>
+<link href="site_libs/highlightjs-9.12.0/textmate.css" rel="stylesheet" />
+<script src="site_libs/highlightjs-9.12.0/highlight.js"></script>
+
+<link rel="icon" href="https://github.com/workflowr/workflowr-assets/raw/master/img/reproducible.png">
+<!-- Add a small amount of space between sections. -->
+<style type="text/css">
+div.section {
+  padding-top: 12px;
+}
+</style>
+
+
+
+<style type="text/css">
+  code{white-space: pre-wrap;}
+  span.smallcaps{font-variant: small-caps;}
+  span.underline{text-decoration: underline;}
+  div.column{display: inline-block; vertical-align: top; width: 50%;}
+  div.hanging-indent{margin-left: 1.5em; text-indent: -1.5em;}
+  ul.task-list{list-style: none;}
+    </style>
+
+<style type="text/css">code{white-space: pre;}</style>
+<script type="text/javascript">
+if (window.hljs) {
+  hljs.configure({languages: []});
+  hljs.initHighlightingOnLoad();
+  if (document.readyState && document.readyState === "complete") {
+    window.setTimeout(function() { hljs.initHighlighting(); }, 0);
+  }
+}
+</script>
+
+
+
+
+
+
+
+
+<style type = "text/css">
+.main-container {
+  max-width: 940px;
+  margin-left: auto;
+  margin-right: auto;
+}
+img {
+  max-width:100%;
+}
+.tabbed-pane {
+  padding-top: 12px;
+}
+.html-widget {
+  margin-bottom: 20px;
+}
+button.code-folding-btn:focus {
+  outline: none;
+}
+summary {
+  display: list-item;
+}
+pre code {
+  padding: 0;
+}
+</style>
+
+
+<style type="text/css">
+.dropdown-submenu {
+  position: relative;
+}
+.dropdown-submenu>.dropdown-menu {
+  top: 0;
+  left: 100%;
+  margin-top: -6px;
+  margin-left: -1px;
+  border-radius: 0 6px 6px 6px;
+}
+.dropdown-submenu:hover>.dropdown-menu {
+  display: block;
+}
+.dropdown-submenu>a:after {
+  display: block;
+  content: " ";
+  float: right;
+  width: 0;
+  height: 0;
+  border-color: transparent;
+  border-style: solid;
+  border-width: 5px 0 5px 5px;
+  border-left-color: #cccccc;
+  margin-top: 5px;
+  margin-right: -10px;
+}
+.dropdown-submenu:hover>a:after {
+  border-left-color: #adb5bd;
+}
+.dropdown-submenu.pull-left {
+  float: none;
+}
+.dropdown-submenu.pull-left>.dropdown-menu {
+  left: -100%;
+  margin-left: 10px;
+  border-radius: 6px 0 6px 6px;
+}
+</style>
+
+<script type="text/javascript">
+// manage active state of menu based on current page
+$(document).ready(function () {
+  // active menu anchor
+  href = window.location.pathname
+  href = href.substr(href.lastIndexOf('/') + 1)
+  if (href === "")
+    href = "index.html";
+  var menuAnchor = $('a[href="' + href + '"]');
+
+  // mark it active
+  menuAnchor.tab('show');
+
+  // if it's got a parent navbar menu mark it active as well
+  menuAnchor.closest('li.dropdown').addClass('active');
+
+  // Navbar adjustments
+  var navHeight = $(".navbar").first().height() + 15;
+  var style = document.createElement('style');
+  var pt = "padding-top: " + navHeight + "px; ";
+  var mt = "margin-top: -" + navHeight + "px; ";
+  var css = "";
+  // offset scroll position for anchor links (for fixed navbar)
+  for (var i = 1; i <= 6; i++) {
+    css += ".section h" + i + "{ " + pt + mt + "}\n";
+  }
+  style.innerHTML = "body {" + pt + "padding-bottom: 40px; }\n" + css;
+  document.head.appendChild(style);
+});
+</script>
+
+<!-- tabsets -->
+
+<style type="text/css">
+.tabset-dropdown > .nav-tabs {
+  display: inline-table;
+  max-height: 500px;
+  min-height: 44px;
+  overflow-y: auto;
+  border: 1px solid #ddd;
+  border-radius: 4px;
+}
+
+.tabset-dropdown > .nav-tabs > li.active:before {
+  content: "";
+  font-family: 'Glyphicons Halflings';
+  display: inline-block;
+  padding: 10px;
+  border-right: 1px solid #ddd;
+}
+
+.tabset-dropdown > .nav-tabs.nav-tabs-open > li.active:before {
+  content: "&#xe258;";
+  border: none;
+}
+
+.tabset-dropdown > .nav-tabs.nav-tabs-open:before {
+  content: "";
+  font-family: 'Glyphicons Halflings';
+  display: inline-block;
+  padding: 10px;
+  border-right: 1px solid #ddd;
+}
+
+.tabset-dropdown > .nav-tabs > li.active {
+  display: block;
+}
+
+.tabset-dropdown > .nav-tabs > li > a,
+.tabset-dropdown > .nav-tabs > li > a:focus,
+.tabset-dropdown > .nav-tabs > li > a:hover {
+  border: none;
+  display: inline-block;
+  border-radius: 4px;
+  background-color: transparent;
+}
+
+.tabset-dropdown > .nav-tabs.nav-tabs-open > li {
+  display: block;
+  float: none;
+}
+
+.tabset-dropdown > .nav-tabs > li {
+  display: none;
+}
+</style>
+
+<!-- code folding -->
+
+
+
+<style type="text/css">
+
+#TOC {
+  margin: 25px 0px 20px 0px;
+}
+@media (max-width: 768px) {
+#TOC {
+  position: relative;
+  width: 100%;
+}
+}
+
+@media print {
+.toc-content {
+  /* see https://github.com/w3c/csswg-drafts/issues/4434 */
+  float: right;
+}
+}
+
+.toc-content {
+  padding-left: 30px;
+  padding-right: 40px;
+}
+
+div.main-container {
+  max-width: 1200px;
+}
+
+div.tocify {
+  width: 20%;
+  max-width: 260px;
+  max-height: 85%;
+}
+
+@media (min-width: 768px) and (max-width: 991px) {
+  div.tocify {
+    width: 25%;
+  }
+}
+
+@media (max-width: 767px) {
+  div.tocify {
+    width: 100%;
+    max-width: none;
+  }
+}
+
+.tocify ul, .tocify li {
+  line-height: 20px;
+}
+
+.tocify-subheader .tocify-item {
+  font-size: 0.90em;
+}
+
+.tocify .list-group-item {
+  border-radius: 0px;
+}
+
+
+</style>
+
+
+
+</head>
+
+<body>
+
+
+<div class="container-fluid main-container">
+
+
+<!-- setup 3col/9col grid for toc_float and main content  -->
+<div class="row">
+<div class="col-xs-12 col-sm-4 col-md-3">
+<div id="TOC" class="tocify">
+</div>
+</div>
+
+<div class="toc-content col-xs-12 col-sm-8 col-md-9">
+
+
+
+
+<div class="navbar navbar-default  navbar-fixed-top" role="navigation">
+  <div class="container">
+    <div class="navbar-header">
+      <button type="button" class="navbar-toggle collapsed" data-toggle="collapse" data-target="#navbar">
+        <span class="icon-bar"></span>
+        <span class="icon-bar"></span>
+        <span class="icon-bar"></span>
+      </button>
+      <a class="navbar-brand" href="index.html">drugseq_test</a>
+    </div>
+    <div id="navbar" class="navbar-collapse collapse">
+      <ul class="nav navbar-nav">
+        <li>
+  <a href="index.html">Home</a>
+</li>
+<li>
+  <a href="about.html">About</a>
+</li>
+<li>
+  <a href="license.html">License</a>
+</li>
+      </ul>
+      <ul class="nav navbar-nav navbar-right">
+        
+      </ul>
+    </div><!--/.nav-collapse -->
+  </div><!--/.container -->
+</div><!--/.navbar -->
+
+<div id="header">
+
+
+
+<h1 class="title toc-ignore">Check alignment quality by STAR of batch 1 new, old, and combined</h1>
+<h4 class="author">Caroline Lohoff (based on code from Junyan Lu)</h4>
+<h4 class="date">December 22 2021</h4>
+
+</div>
+
+
+<p>
+<button type="button" class="btn btn-default btn-workflowr btn-workflowr-report" data-toggle="collapse" data-target="#workflowr-report">
+<span class="glyphicon glyphicon-list" aria-hidden="true"></span> workflowr <span class="glyphicon glyphicon-exclamation-sign text-danger" aria-hidden="true"></span>
+</button>
+</p>
+<div id="workflowr-report" class="collapse">
+<ul class="nav nav-tabs">
+<li class="active">
+<a data-toggle="tab" href="#summary">Summary</a>
+</li>
+<li>
+<a data-toggle="tab" href="#checks"> Checks <span class="glyphicon glyphicon-exclamation-sign text-danger" aria-hidden="true"></span> </a>
+</li>
+<li>
+<a data-toggle="tab" href="#versions">Past versions</a>
+</li>
+</ul>
+<div class="tab-content">
+<div id="summary" class="tab-pane fade in active">
+<p>
+<strong>Last updated:</strong> 2022-01-09
+</p>
+<p>
+<strong>Checks:</strong> <span class="glyphicon glyphicon-ok text-success" aria-hidden="true"></span> 5 <span class="glyphicon glyphicon-exclamation-sign text-danger" aria-hidden="true"></span> 2
+</p>
+<p>
+<strong>Knit directory:</strong> <code>drugseq_test/analysis/</code> <span class="glyphicon glyphicon-question-sign" aria-hidden="true" title="This is the local directory in which the code in this file was executed."> </span>
+</p>
+<p>
+This reproducible <a href="http://rmarkdown.rstudio.com">R Markdown</a> analysis was created with <a
+  href="https://github.com/jdblischak/workflowr">workflowr</a> (version 1.6.2). The <em>Checks</em> tab describes the reproducibility checks that were applied when the results were created. The <em>Past versions</em> tab lists the development history.
+</p>
+<hr>
+</div>
+<div id="checks" class="tab-pane fade">
+<div id="workflowr-checks" class="panel-group">
+<div class="panel panel-default">
+<div class="panel-heading">
+<p class="panel-title">
+<a data-toggle="collapse" data-parent="#workflowr-checks" href="#strongRMarkdownfilestronguncommittedchanges"> <span class="glyphicon glyphicon-exclamation-sign text-danger" aria-hidden="true"></span> <strong>R Markdown file:</strong> uncommitted changes </a>
+</p>
+</div>
+<div id="strongRMarkdownfilestronguncommittedchanges" class="panel-collapse collapse">
+<div class="panel-body">
+<p>The R Markdown is untracked by Git. To know which version of the R Markdown file created these results, you’ll want to first commit it to the Git repo. If you’re still working on the analysis, you can ignore this warning. When you’re finished, you can run <code>wflow_publish</code> to commit the R Markdown file and build the HTML.</p>
+</div>
+</div>
+</div>
+<div class="panel panel-default">
+<div class="panel-heading">
+<p class="panel-title">
+<a data-toggle="collapse" data-parent="#workflowr-checks" href="#strongEnvironmentstrongempty"> <span class="glyphicon glyphicon-ok text-success" aria-hidden="true"></span> <strong>Environment:</strong> empty </a>
+</p>
+</div>
+<div id="strongEnvironmentstrongempty" class="panel-collapse collapse">
+<div class="panel-body">
+<p>Great job! The global environment was empty. Objects defined in the global environment can affect the analysis in your R Markdown file in unknown ways. For reproduciblity it’s best to always run the code in an empty environment.</p>
+</div>
+</div>
+</div>
+<div class="panel panel-default">
+<div class="panel-heading">
+<p class="panel-title">
+<a data-toggle="collapse" data-parent="#workflowr-checks" href="#strongSeedstrongcodesetseed20211129code"> <span class="glyphicon glyphicon-ok text-success" aria-hidden="true"></span> <strong>Seed:</strong> <code>set.seed(20211129)</code> </a>
+</p>
+</div>
+<div id="strongSeedstrongcodesetseed20211129code" class="panel-collapse collapse">
+<div class="panel-body">
+<p>The command <code>set.seed(20211129)</code> was run prior to running the code in the R Markdown file. Setting a seed ensures that any results that rely on randomness, e.g. subsampling or permutations, are reproducible.</p>
+</div>
+</div>
+</div>
+<div class="panel panel-default">
+<div class="panel-heading">
+<p class="panel-title">
+<a data-toggle="collapse" data-parent="#workflowr-checks" href="#strongSessioninformationstrongrecorded"> <span class="glyphicon glyphicon-ok text-success" aria-hidden="true"></span> <strong>Session information:</strong> recorded </a>
+</p>
+</div>
+<div id="strongSessioninformationstrongrecorded" class="panel-collapse collapse">
+<div class="panel-body">
+<p>Great job! Recording the operating system, R version, and package versions is critical for reproducibility.</p>
+</div>
+</div>
+</div>
+<div class="panel panel-default">
+<div class="panel-heading">
+<p class="panel-title">
+<a data-toggle="collapse" data-parent="#workflowr-checks" href="#strongCachestrongnone"> <span class="glyphicon glyphicon-ok text-success" aria-hidden="true"></span> <strong>Cache:</strong> none </a>
+</p>
+</div>
+<div id="strongCachestrongnone" class="panel-collapse collapse">
+<div class="panel-body">
+<p>Nice! There were no cached chunks for this analysis, so you can be confident that you successfully produced the results during this run.</p>
+</div>
+</div>
+</div>
+<div class="panel panel-default">
+<div class="panel-heading">
+<p class="panel-title">
+<a data-toggle="collapse" data-parent="#workflowr-checks" href="#strongFilepathsstrongabsolute"> <span class="glyphicon glyphicon-exclamation-sign text-danger" aria-hidden="true"></span> <strong>File paths:</strong> absolute </a>
+</p>
+</div>
+<div id="strongFilepathsstrongabsolute" class="panel-collapse collapse">
+<div class="panel-body">
+<p>
+Using absolute paths to the files within your workflowr project makes it difficult for you and others to run your code on a different machine. Change the absolute path(s) below to the suggested relative path(s) to make your code more reproducible.
+</p>
+<table class="table table-condensed table-hover">
+<thead>
+<tr>
+<th style="text-align:left;">
+absolute
+</th>
+<th style="text-align:left;">
+relative
+</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td style="text-align:left;">
+~/Documents/R/drugseq_test
+</td>
+<td style="text-align:left;">
+..
+</td>
+</tr>
+</tbody>
+</table>
+</div>
+</div>
+</div>
+<div class="panel panel-default">
+<div class="panel-heading">
+<p class="panel-title">
+<a data-toggle="collapse" data-parent="#workflowr-checks" href="#strongRepositoryversionstrongahrefhttpsgitembldejludrugseqtree4039c41558a49e9634df60a08e1bca8b2b112cdbtargetblank4039c41a"> <span class="glyphicon glyphicon-ok text-success" aria-hidden="true"></span> <strong>Repository version:</strong> <a href="https://git.embl.de/jlu/drugseq/tree/4039c41558a49e9634df60a08e1bca8b2b112cdb" target="_blank">4039c41</a> </a>
+</p>
+</div>
+<div id="strongRepositoryversionstrongahrefhttpsgitembldejludrugseqtree4039c41558a49e9634df60a08e1bca8b2b112cdbtargetblank4039c41a" class="panel-collapse collapse">
+<div class="panel-body">
+<p>
+Great! You are using Git for version control. Tracking code development and connecting the code version to the results is critical for reproducibility.
+</p>
+<p>
+The results in this page were generated with repository version <a href="https://git.embl.de/jlu/drugseq/tree/4039c41558a49e9634df60a08e1bca8b2b112cdb" target="_blank">4039c41</a>. See the <em>Past versions</em> tab to see a history of the changes made to the R Markdown and HTML files.
+</p>
+<p>
+Note that you need to be careful to ensure that all relevant files for the analysis have been committed to Git prior to generating the results (you can use <code>wflow_publish</code> or <code>wflow_git_commit</code>). workflowr only checks the R Markdown file, but you know if there are other scripts or data files that it depends on. Below is the status of the Git repository when the results were generated:
+</p>
+<pre><code>
+Ignored files:
+    Ignored:    .DS_Store
+    Ignored:    .Rhistory
+    Ignored:    .Rproj.user/
+    Ignored:    analysis/.DS_Store
+    Ignored:    code/.DS_Store
+    Ignored:    data/.DS_Store
+
+Untracked files:
+    Untracked:  .RData
+    Untracked:  analysis/1_process_batch1_combined_untrimmed.Rmd
+    Untracked:  analysis/1_process_batch1new_trimmed.Rmd
+    Untracked:  analysis/1_process_batch1new_untrimmed.Rmd
+    Untracked:  analysis/1_process_batch2_trimmed.Rmd
+    Untracked:  analysis/1_process_batch2_untrimmed.Rmd
+    Untracked:  analysis/1_process_batch3_trimmed.Rmd
+    Untracked:  analysis/1_process_batch3_untrimmed.Rmd
+    Untracked:  analysis/1_process_batch3only_untrimmed.Rmd
+    Untracked:  analysis/1_process_htseq_batch1new.Rmd
+    Untracked:  analysis/1_process_htseq_batch2.Rmd
+    Untracked:  analysis/1_process_htseq_batch3.Rmd
+    Untracked:  analysis/2_qualityCheck_Batch2_Salmon_trimmedNEW.Rmd
+    Untracked:  analysis/2_qualityCheck_Batch2_Salmon_untrimmedNEW.Rmd
+    Untracked:  analysis/2_qualityCheck_Batch2_trimmed.Rmd
+    Untracked:  analysis/2_qualityCheck_Batch3_Salmon_untrimmedNEW.Rmd
+    Untracked:  analysis/2_qualityCheck_Batch3_untrimmed.Rmd
+    Untracked:  analysis/2_qualityCheck_HTseq_batch1new.Rmd
+    Untracked:  analysis/2_qualityCheck_HTseq_batch2.Rmd
+    Untracked:  analysis/2_qualityCheck_bam_batch1all.Rmd
+    Untracked:  analysis/2_qualityCheck_bam_batch1new.Rmd
+    Untracked:  analysis/2_qualityCheck_bam_batch2NEW.Rmd
+    Untracked:  analysis/2_qualityCheck_bam_batch3NEW.Rmd
+    Untracked:  analysis/2_qualityCheck_pilotAndBatch1new_trimmed.Rmd
+    Untracked:  analysis/2_qualityCheck_pilotAndBatch1new_untrimmed.Rmd
+    Untracked:  analysis/3_differentialExpression_batch1new_HTseq.Rmd
+    Untracked:  analysis/3_differentialExpression_batch1new_trimmed.Rmd
+    Untracked:  analysis/3_differentialExpression_batch1new_untrimmed.Rmd
+    Untracked:  analysis/3_differentialExpression_batch2_trimmedNEW.Rmd
+    Untracked:  analysis/3_differentialExpression_batch2_untrimmed.Rmd
+    Untracked:  analysis/3_differentialExpression_batch3_untrimmed.Rmd
+    Untracked:  analysis/4_fastQC_batch1new.Rmd
+    Untracked:  analysis/Camera_function_limma.R
+    Untracked:  analysis/hsa04145.pathview.png
+    Untracked:  analysis/hsa04145.png
+    Untracked:  analysis/hsa04145.xml
+    Untracked:  analysis/hsa05332.pathview.png
+    Untracked:  analysis/hsa05332.png
+    Untracked:  analysis/hsa05332.xml
+    Untracked:  code/Changes_in_RNAseq_samples_all.R
+    Untracked:  code/genAlign_salmon_QuantSeq_batch1new_trimmed.R
+    Untracked:  code/genAlign_salmon_QuantSeq_batch1new_untrimmed.R
+    Untracked:  code/genAlign_salmon_QuantSeq_batch2_trimmed.R
+    Untracked:  code/genAlign_salmon_QuantSeq_batch2_untrimmed.R
+    Untracked:  code/genAlign_salmon_QuantSeq_batch3_trimmed.R
+    Untracked:  code/genAlign_salmon_QuantSeq_batch3_untrimmed.R
+    Untracked:  code/genAlign_salmon_QuantSeq_twoRuns_trimmed.R
+    Untracked:  code/genAlign_salmon_QuantSeq_twoRuns_untrimmed.R
+    Untracked:  code/genAlign_star_QuantSeq_batch1combined.R
+    Untracked:  code/genAlign_star_QuantSeq_batch1new.R
+    Untracked:  code/genAlign_star_QuantSeq_batch2.R
+    Untracked:  code/genAlign_star_QuantSeq_batch3.R
+    Untracked:  code/genCount_batch1new.R
+    Untracked:  code/genCount_batch2.R
+    Untracked:  code/genCount_batch3.R
+    Untracked:  code/genCount_combined.R
+    Untracked:  code/genFastQC_batch1new.R
+    Untracked:  code/genFastQC_batch2.R
+    Untracked:  code/genFastQC_batch3.R
+    Untracked:  code/genFastQC_combined.R
+    Untracked:  data/4_differentialExpression.RData
+    Untracked:  data/RNAseq_samples_pilot_batch1_batch2_batch3.xlsx
+    Untracked:  data/RNAseq_samples_pilot_batch1new.xlsx
+    Untracked:  data/RNAseq_samples_pilot_batch1new_batch2.xlsx
+    Untracked:  data/RNAseq_samples_pilot_batch1new_batch2_batch3.xlsx
+    Untracked:  data/RNAseq_samples_pilot_batch1old.xlsx
+    Untracked:  data/RNAseq_samples_pilot_batch1old_batch1new_batch2.xlsx
+    Untracked:  data/RNAseq_samples_pilot_batch1old_batch1new_batch2_batch3.xlsx
+    Untracked:  data/RNAseq_samples_pilot_batch1old_new_combined.xlsx
+    Untracked:  data/RNAseq_samples_pilot_batch3.xlsx
+    Untracked:  data/bamList_batch1.txt
+    Untracked:  data/bamList_batch1new.txt
+    Untracked:  data/bamList_batch1new_DMSO.txt
+    Untracked:  data/bamList_batch2.txt
+    Untracked:  data/bamList_batch3.txt
+    Untracked:  data/bamList_pilot.txt
+    Untracked:  data/bamList_pilot_DMSO.txt
+    Untracked:  data/c2.cp.kegg.v7.4.entrez.gmt.txt
+    Untracked:  data/c2.cp.kegg.v7.4.symbols.gmt.txt
+    Untracked:  data/ddsCLL_Salmon_190702.RData
+    Untracked:  data/ddsrna_180717.RData
+    Untracked:  data/drosphila_example_de.csv
+    Untracked:  data/fastqFiles_batch1.txt
+    Untracked:  data/fastqFiles_batch1new.txt
+    Untracked:  data/fastqFiles_batch2.txt
+    Untracked:  data/fastqFiles_batch3.txt
+    Untracked:  data/fastqFiles_pilot.txt
+    Untracked:  data/h.all.v7.4.entrez.gmt.txt
+    Untracked:  data/h.all.v7.4.symbols.gmt.txt
+    Untracked:  data/human_c6_v5p2.rdata
+    Untracked:  data/patmeta_210324.RData
+    Untracked:  data/~$RNAseq_samples_all.xlsx
+    Untracked:  data/~$RNAseq_samples_all_batch1new.xlsx
+    Untracked:  data/~$RNAseq_samples_pilot_batch1old_new_combined.xlsx
+    Untracked:  differentialExpression.RData
+    Untracked:  drugseq_test.Rproj
+    Untracked:  hsa05332.pathview.png
+    Untracked:  hsa05332.png
+    Untracked:  hsa05332.xml
+    Untracked:  output/
+
+Unstaged changes:
+    Modified:   _workflowr.yml
+    Modified:   analysis/_site.yml
+    Deleted:    analysis/bamQC.Rmd
+    Deleted:    analysis/bamQC_HAP1.Rmd
+    Deleted:    analysis/calcCoverage.Rmd
+    Deleted:    analysis/differentialExpression_batch1.Rmd
+    Deleted:    analysis/differentialExpression_batch1_HTseq.Rmd
+    Deleted:    analysis/process.Rmd
+    Deleted:    analysis/process_htseq.Rmd
+    Deleted:    analysis/qualityCheck_HTseq.Rmd
+    Deleted:    analysis/qualityCheck_pilotAndBatch1.Rmd
+    Deleted:    analysis/qualityCheck_pilotAndBatch1_trimmed.Rmd
+    Deleted:    code/fastqFiles.txt
+    Deleted:    code/genAlign_salmon_QuantSeq.R
+    Deleted:    code/genAlign_star_QuantSeq.R
+    Deleted:    code/genCount.R
+    Deleted:    code/genFastQC.R
+    Deleted:    data/RNAseq_samples_all.xlsx
+    Deleted:    drugseq.Rproj
+
+</code></pre>
+<p>
+Note that any generated files, e.g. HTML, png, CSS, etc., are not included in this status report because it is ok for generated content to have uncommitted changes.
+</p>
+</div>
+</div>
+</div>
+</div>
+<hr>
+</div>
+<div id="versions" class="tab-pane fade">
+<p>
+There are no past versions. Publish this analysis with <code>wflow_publish()</code> to start tracking its development.
+</p>
+<hr>
+</div>
+</div>
+</div>
+<div id="set-options-and-load-packages-and-data" class="section level1">
+<h1>Set options and load packages and data</h1>
+<p>Set global options</p>
+<p>Load packages</p>
+<pre class="r"><code>library(tidyverse)</code></pre>
+<p>Load patient annotation information into data frame</p>
+<pre class="r"><code>patAnno &lt;- readxl::read_xlsx(&quot;./data/RNAseq_samples_pilot_batch1old_new_combined.xlsx&quot;) %&gt;%
+  mutate(fileName = str_replace(fileName, &quot;.txt.gz&quot;,&quot;&quot;)) %&gt;%
+  mutate(Replicate = as.factor(Replicate)) %&gt;%
+  select(-sequence) %&gt;%
+  mutate(cell = ifelse(patID == &quot;Jurkat&quot;,&quot;Jurkat&quot;,&quot;Primary&quot;)) %&gt;%
+  select(fileName, expBatch, patID, sampleID, batch, cell)</code></pre>
+</div>
+<div id="quality-information-from-star-alignment-genome-mapping" class="section level1">
+<h1>Quality information from STAR alignment (genome mapping)</h1>
+<p>Define function</p>
+<pre class="r"><code>processLog &lt;- function(fileName) {
+    outTab &lt;- tibble(allLine = read_lines(fileName)) %&gt;%
+      separate(allLine, c(&quot;entry&quot;,&quot;value&quot;),&quot;[|]&quot;, remove = FALSE) %&gt;%
+      mutate(value = str_remove_all(value, &quot;[\t%]&quot;),
+             entry = str_trim(entry,&quot;both&quot;)) %&gt;%
+      mutate(value = as.numeric(value)) %&gt;%
+      filter(!is.na(value)) %&gt;% select(-allLine)
+    
+    outTab
+}</code></pre>
+<p>Load bam files from pilot batch, batch 1 old, batch 1 new, and batch 1 combined</p>
+<pre class="r"><code>allFiles &lt;- list.files(&quot;~/Documents/drugSeq/bam/pilot_batch1old_new_combined/&quot;,
+                       recursive = TRUE, full.names = TRUE)
+allRecord &lt;- lapply(allFiles, function(fileName){
+  baseName &lt;- basename(fileName)
+  processLog(fileName) %&gt;%
+    mutate(filename = str_remove(baseName, &quot;Log.final.out&quot;))
+}) %&gt;% bind_rows()</code></pre>
+<p>Check that all samples have patient annotations</p>
+<pre class="r"><code>all(allRecord$filename %in% patAnno$fileName)</code></pre>
+<pre><code>[1] TRUE</code></pre>
+<pre class="r"><code>all(patAnno$fileName %in% allRecord$filename) </code></pre>
+<pre><code>[1] TRUE</code></pre>
+<pre class="r"><code>allRecord &lt;- left_join(allRecord, patAnno, by = c(filename = &quot;fileName&quot;)) %&gt;% arrange(entry)</code></pre>
+<p>Create multiple box plots</p>
+<pre class="r"><code>diagBoxPlots &lt;- lapply(unique(allRecord$entry), function(n) {
+  plotTab &lt;- filter(allRecord, entry == n)
+  ggplot(plotTab, aes(x=batch, y=value)) +
+    geom_boxplot(outlier.shape = NA) +
+    ggbeeswarm::geom_quasirandom(aes(col=cell), groupOnX=TRUE) +
+    theme_bw() + theme(legend.position = &quot;none&quot;) +
+    ggtitle(n)
+})
+cowplot::plot_grid(plotlist = diagBoxPlots, ncol=3)</code></pre>
+<p><img src="figure/2_qualityCheck_bam_batch1all.Rmd/unnamed-chunk-6-1.png" width="1440" style="display: block; margin: auto;" /></p>
+<br>
+<p>
+<button type="button" class="btn btn-default btn-workflowr btn-workflowr-sessioninfo" data-toggle="collapse" data-target="#workflowr-sessioninfo" style="display: block;">
+<span class="glyphicon glyphicon-wrench" aria-hidden="true"></span> Session information
+</button>
+</p>
+<div id="workflowr-sessioninfo" class="collapse">
+<pre class="r"><code>devtools::session_info()</code></pre>
+<pre><code>─ Session info ───────────────────────────────────────────────────────────────
+ setting  value
+ version  R version 4.1.2 (2021-11-01)
+ os       macOS Big Sur 10.16
+ system   x86_64, darwin17.0
+ ui       X11
+ language (EN)
+ collate  en_US.UTF-8
+ ctype    en_US.UTF-8
+ tz       Europe/Berlin
+ date     2022-01-09
+ pandoc   2.14.0.3 @ /Applications/RStudio.app/Contents/MacOS/pandoc/ (via rmarkdown)
+
+─ Packages ───────────────────────────────────────────────────────────────────
+ package     * version date (UTC) lib source
+ assertthat    0.2.1   2019-03-21 [1] CRAN (R 4.1.0)
+ backports     1.4.1   2021-12-13 [1] CRAN (R 4.1.0)
+ beeswarm      0.4.0   2021-06-01 [1] CRAN (R 4.1.0)
+ bit           4.0.4   2020-08-04 [1] CRAN (R 4.1.0)
+ bit64         4.0.5   2020-08-30 [1] CRAN (R 4.1.0)
+ broom         0.7.10  2021-10-31 [1] CRAN (R 4.1.0)
+ bslib         0.3.1   2021-10-06 [1] CRAN (R 4.1.0)
+ cachem        1.0.6   2021-08-19 [1] CRAN (R 4.1.0)
+ callr         3.7.0   2021-04-20 [1] CRAN (R 4.1.0)
+ cellranger    1.1.0   2016-07-27 [1] CRAN (R 4.1.0)
+ cli           3.1.0   2021-10-27 [1] CRAN (R 4.1.0)
+ colorspace    2.0-2   2021-06-24 [1] CRAN (R 4.1.0)
+ cowplot       1.1.1   2020-12-30 [1] CRAN (R 4.1.0)
+ crayon        1.4.2   2021-10-29 [1] CRAN (R 4.1.0)
+ DBI           1.1.1   2021-01-15 [1] CRAN (R 4.1.0)
+ dbplyr        2.1.1   2021-04-06 [1] CRAN (R 4.1.0)
+ desc          1.4.0   2021-09-28 [1] CRAN (R 4.1.0)
+ devtools      2.4.3   2021-11-30 [1] CRAN (R 4.1.0)
+ digest        0.6.29  2021-12-01 [1] CRAN (R 4.1.0)
+ dplyr       * 1.0.7   2021-06-18 [1] CRAN (R 4.1.0)
+ ellipsis      0.3.2   2021-04-29 [1] CRAN (R 4.1.0)
+ evaluate      0.14    2019-05-28 [1] CRAN (R 4.1.0)
+ fansi         0.5.0   2021-05-25 [1] CRAN (R 4.1.0)
+ farver        2.1.0   2021-02-28 [1] CRAN (R 4.1.0)
+ fastmap       1.1.0   2021-01-25 [1] CRAN (R 4.1.0)
+ forcats     * 0.5.1   2021-01-27 [1] CRAN (R 4.1.0)
+ fs            1.5.2   2021-12-08 [1] CRAN (R 4.1.0)
+ generics      0.1.1   2021-10-25 [1] CRAN (R 4.1.0)
+ ggbeeswarm    0.6.0   2017-08-07 [1] CRAN (R 4.1.0)
+ ggplot2     * 3.3.5   2021-06-25 [1] CRAN (R 4.1.0)
+ git2r         0.29.0  2021-11-22 [1] CRAN (R 4.1.0)
+ glue          1.5.1   2021-11-30 [1] CRAN (R 4.1.0)
+ gtable        0.3.0   2019-03-25 [1] CRAN (R 4.1.0)
+ haven         2.4.3   2021-08-04 [1] CRAN (R 4.1.0)
+ highr         0.9     2021-04-16 [1] CRAN (R 4.1.0)
+ hms           1.1.1   2021-09-26 [1] CRAN (R 4.1.0)
+ htmltools     0.5.2   2021-08-25 [1] CRAN (R 4.1.0)
+ httpuv        1.6.3   2021-09-09 [1] CRAN (R 4.1.0)
+ httr          1.4.2   2020-07-20 [1] CRAN (R 4.1.0)
+ jquerylib     0.1.4   2021-04-26 [1] CRAN (R 4.1.0)
+ jsonlite      1.7.2   2020-12-09 [1] CRAN (R 4.1.0)
+ knitr         1.36    2021-09-29 [1] CRAN (R 4.1.0)
+ labeling      0.4.2   2020-10-20 [1] CRAN (R 4.1.0)
+ later         1.3.0   2021-08-18 [1] CRAN (R 4.1.0)
+ lifecycle     1.0.1   2021-09-24 [1] CRAN (R 4.1.0)
+ lubridate     1.8.0   2021-10-07 [1] CRAN (R 4.1.0)
+ magrittr      2.0.1   2020-11-17 [1] CRAN (R 4.1.0)
+ memoise       2.0.1   2021-11-26 [1] CRAN (R 4.1.0)
+ modelr        0.1.8   2020-05-19 [1] CRAN (R 4.1.0)
+ munsell       0.5.0   2018-06-12 [1] CRAN (R 4.1.0)
+ pillar        1.6.4   2021-10-18 [1] CRAN (R 4.1.0)
+ pkgbuild      1.3.0   2021-12-09 [1] CRAN (R 4.1.0)
+ pkgconfig     2.0.3   2019-09-22 [1] CRAN (R 4.1.0)
+ pkgload       1.2.4   2021-11-30 [1] CRAN (R 4.1.0)
+ prettyunits   1.1.1   2020-01-24 [1] CRAN (R 4.1.0)
+ processx      3.5.2   2021-04-30 [1] CRAN (R 4.1.0)
+ promises      1.2.0.1 2021-02-11 [1] CRAN (R 4.1.0)
+ ps            1.6.0   2021-02-28 [1] CRAN (R 4.1.0)
+ purrr       * 0.3.4   2020-04-17 [1] CRAN (R 4.1.0)
+ R6            2.5.1   2021-08-19 [1] CRAN (R 4.1.0)
+ Rcpp          1.0.7   2021-07-07 [1] CRAN (R 4.1.0)
+ readr       * 2.1.1   2021-11-30 [1] CRAN (R 4.1.0)
+ readxl        1.3.1   2019-03-13 [1] CRAN (R 4.1.0)
+ remotes       2.4.2   2021-11-30 [1] CRAN (R 4.1.0)
+ reprex        2.0.1   2021-08-05 [1] CRAN (R 4.1.0)
+ rlang         0.4.12  2021-10-18 [1] CRAN (R 4.1.0)
+ rmarkdown     2.11    2021-09-14 [1] CRAN (R 4.1.0)
+ rprojroot     2.0.2   2020-11-15 [1] CRAN (R 4.1.0)
+ rstudioapi    0.13    2020-11-12 [1] CRAN (R 4.1.0)
+ rvest         1.0.2   2021-10-16 [1] CRAN (R 4.1.0)
+ sass          0.4.0   2021-05-12 [1] CRAN (R 4.1.0)
+ scales        1.1.1   2020-05-11 [1] CRAN (R 4.1.0)
+ sessioninfo   1.2.2   2021-12-06 [1] CRAN (R 4.1.0)
+ stringi       1.7.6   2021-11-29 [1] CRAN (R 4.1.0)
+ stringr     * 1.4.0   2019-02-10 [1] CRAN (R 4.1.0)
+ testthat      3.1.1   2021-12-03 [1] CRAN (R 4.1.0)
+ tibble      * 3.1.6   2021-11-07 [1] CRAN (R 4.1.0)
+ tidyr       * 1.1.4   2021-09-27 [1] CRAN (R 4.1.0)
+ tidyselect    1.1.1   2021-04-30 [1] CRAN (R 4.1.0)
+ tidyverse   * 1.3.1   2021-04-15 [1] CRAN (R 4.1.0)
+ tzdb          0.2.0   2021-10-27 [1] CRAN (R 4.1.0)
+ usethis       2.1.5   2021-12-09 [1] CRAN (R 4.1.0)
+ utf8          1.2.2   2021-07-24 [1] CRAN (R 4.1.0)
+ vctrs         0.3.8   2021-04-29 [1] CRAN (R 4.1.0)
+ vipor         0.4.5   2017-03-22 [1] CRAN (R 4.1.0)
+ vroom         1.5.7   2021-11-30 [1] CRAN (R 4.1.0)
+ withr         2.4.3   2021-11-30 [1] CRAN (R 4.1.2)
+ workflowr     1.6.2   2020-04-30 [1] CRAN (R 4.1.0)
+ xfun          0.28    2021-11-04 [1] CRAN (R 4.1.0)
+ xml2          1.3.3   2021-11-30 [1] CRAN (R 4.1.0)
+ yaml          2.2.1   2020-02-01 [1] CRAN (R 4.1.0)
+
+ [1] /Library/Frameworks/R.framework/Versions/4.1/Resources/library
+
+──────────────────────────────────────────────────────────────────────────────</code></pre>
+</div>
+</div>
+
+
+<!-- Adjust MathJax settings so that all math formulae are shown using
+TeX fonts only; see
+http://docs.mathjax.org/en/latest/configuration.html.  This will make
+the presentation more consistent at the cost of the webpage sometimes
+taking slightly longer to load. Note that this only works because the
+footer is added to webpages before the MathJax javascript. -->
+<script type="text/x-mathjax-config">
+  MathJax.Hub.Config({
+    "HTML-CSS": { availableFonts: ["TeX"] }
+  });
+</script>
+
+
+
+
+</div>
+</div>
+
+</div>
+
+<script>
+
+// add bootstrap table styles to pandoc tables
+function bootstrapStylePandocTables() {
+  $('tr.odd').parent('tbody').parent('table').addClass('table table-condensed');
+}
+$(document).ready(function () {
+  bootstrapStylePandocTables();
+});
+
+
+</script>
+
+<!-- tabsets -->
+
+<script>
+$(document).ready(function () {
+  window.buildTabsets("TOC");
+});
+
+$(document).ready(function () {
+  $('.tabset-dropdown > .nav-tabs > li').click(function () {
+    $(this).parent().toggleClass('nav-tabs-open');
+  });
+});
+</script>
+
+<!-- code folding -->
+
+<script>
+$(document).ready(function ()  {
+
+    // temporarily add toc-ignore selector to headers for the consistency with Pandoc
+    $('.unlisted.unnumbered').addClass('toc-ignore')
+
+    // move toc-ignore selectors from section div to header
+    $('div.section.toc-ignore')
+        .removeClass('toc-ignore')
+        .children('h1,h2,h3,h4,h5').addClass('toc-ignore');
+
+    // establish options
+    var options = {
+      selectors: "h1,h2,h3",
+      theme: "bootstrap3",
+      context: '.toc-content',
+      hashGenerator: function (text) {
+        return text.replace(/[.\\/?&!#<>]/g, '').replace(/\s/g, '_');
+      },
+      ignoreSelector: ".toc-ignore",
+      scrollTo: 0
+    };
+    options.showAndHide = true;
+    options.smoothScroll = true;
+
+    // tocify
+    var toc = $("#TOC").tocify(options).data("toc-tocify");
+});
+</script>
+
+<!-- dynamically load mathjax for compatibility with self-contained -->
+<script>
+  (function () {
+    var script = document.createElement("script");
+    script.type = "text/javascript";
+    script.src  = "https://mathjax.rstudio.com/latest/MathJax.js?config=TeX-AMS-MML_HTMLorMML";
+    document.getElementsByTagName("head")[0].appendChild(script);
+  })();
+</script>
+
+</body>
+</html>

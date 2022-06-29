@@ -1,0 +1,903 @@
+---
+title: "DE of treatment, IGHV, and viability of all batches, pre-processed with STAR + HTSeq"
+author: "Caroline Lohoff"
+date: "April 22 2022"
+output:
+  BiocStyle::html_document:
+    toc_float: true
+---
+
+# Description
+Design: ~ FSC.SSC + IGHV + IGHV:patIDgroup + IGHV:treatment
+
+--> does not work well because design matrix is not of full rank
+
+In this script a differential expression analysis is performed which considers the different drug treatments as well as the IGHV status, while correcting for the variance in the data set due to patient effects and viability (in terms of FSC.SSC.DMSO). 
+In this analysis, we focus on the BTK inhibitor Ibrutinib as well as on the PI3-kinase inhibitor Duvelisib. 
+Since both drugs target the same pathway, namely the B cell receptor pathway, we want to find the differences in the mode of action of those two drugs. As shown in previous studies, the IGHV mutation status is quite important for the mode of action of those drugs. Thus, we include the IGHV status as a covariate in the design formula. 
+For the evaluation of the results we include also a drug with a totally different mode of action, namely the MDM2 inhibitor Nutlin 3a. In this way we can show that the obtained results for Ibrutinib and Duvelisib are not arbitrary. 
+
+In order to compare the treatments with DMSO and additionally consider the genotype, a nested design is chosen for DESeq2.
+In other words we have an experiment with individual patients grouped by IGHV mutational status, where we seek to test the group-specific effect of a treatment, while controlling for individual effects. The individuals are nested within the groups: a patient can only be in one of the groups, although each individual has one or more observations across conditions.
+A detailed description of this design can be viewed in the [DESeq2 vignette](http://bioconductor.org/packages/devel/bioc/vignettes/DESeq2/inst/doc/DESeq2.html#group-specific-condition-effects-individuals-nested-within-groups).
+
+# Preparations
+
+## Load libraries and set options
+
+Set global options
+```{r setup, include=FALSE, cache = FALSE}
+knitr::opts_knit$set(root.dir = "~/Documents/R/drugseq_test")
+knitr::opts_chunk$set(warning = FALSE, message = FALSE)
+```
+
+Load libraries
+```{r}
+suppressPackageStartupMessages({
+  library(DESeq2)
+  library(tidyverse)
+  library(RColorBrewer)
+  library(pheatmap)
+  library(clusterProfiler)
+  library(enrichplot)
+  library(cowplot)
+  library(org.Hs.eg.db)
+  library(annotate)
+  library(ggvenn)
+  library(BiocParallel)
+  library(CoefExplainer)
+})
+register(MulticoreParam(2))
+```
+
+Set global ggplot variables
+```{r}
+theme_set(theme_bw() + theme(axis.text = element_text(size=12), 
+                             axis.title = element_text(size=14),
+                             legend.title = element_text(size=14),
+                             legend.text = element_text(size=12),
+                             plot.title = element_text(size=16,
+                                                       hjust=0.5,face="bold")))
+# Define color palette
+cp <- c("#2CB902", "#FD7306", "#FF1EBE", "#0137A4", "#C8C701")
+```
+
+## Load data and add annotations
+```{r}
+# Load dds data set containing 1106 samples and count matrix
+load("./output/ddsDrug_htseq_batchPilot1c234_20220426.RData")
+
+# Load meta data including genotyping info
+load("./data/patmeta_210324.RData")
+
+# Add columns to DESeq object using patient meta data
+col_vec <- c("diagnosis", "gender", "Methylation_Cluster", "trisomy12", "NOTCH1", "TP53")
+ddsDrug@colData@listData <- lapply(col_vec, function(n) {
+  ddsDrug[[n]] <- patMeta[match(ddsDrug$patID, patMeta$Patient.ID), n]
+}) %>% bind_cols() %>% sjmisc::add_columns(ddsDrug@colData@listData)
+
+names(ddsDrug@colData@listData)[names(ddsDrug@colData@listData) == "Methylation_Cluster"] <- "Methylation"
+ddsDrug$IGHVpat <- patMeta[match(ddsDrug$patID, patMeta$Patient.ID),]$IGHV.status
+ddsDrug$IGHV <- ifelse(is.na(ddsDrug$IGHV), ddsDrug$IGHVpat, ddsDrug$IGHV)
+
+# Add meta data to the samples from the pilot batch
+ddsDrug$diagnosis[ddsDrug$batch == "pilot"] <- "CLL" 
+ddsDrug$trisomy12[ddsDrug$batch == "pilot"] <- 0
+ddsDrug$NOTCH1[ddsDrug$batch == "pilot"] <- 0
+ddsDrug$TP53[ddsDrug$batch == "pilot"] <- 0
+ddsDrug$IGHV[ddsDrug$batch == "pilot" & ddsDrug$patID %in% c("PID1095", "PID1222")] <- "U"
+ddsDrug$IGHV[ddsDrug$batch == "pilot" & ddsDrug$patID %in% c("PID1177", "PID1210")] <- "M"
+ddsDrug$gender[ddsDrug$batch == "pilot" & ddsDrug$patID %in% c("PID1095", "PID1222")] <- "f"
+ddsDrug$gender[ddsDrug$batch == "pilot" & ddsDrug$patID %in% c("PID1177", "PID1210")] <- "m"
+
+# Rename IGHV status from 'U' and 'M' to 0 and 1
+ddsDrug$IGHV[ddsDrug$IGHV == "U"] <- 0
+ddsDrug$IGHV[ddsDrug$IGHV == "M"] <- 1
+ddsDrug$IGHV <- as.factor(ddsDrug$IGHV)
+
+# Remove columns
+ddsDrug$IGHVpat <- NULL
+ddsDrug$fileName <- NULL
+ddsDrug$expID <- NULL
+ddsDrug$expBatch <- NULL
+ddsDrug$time <- NULL
+ddsDrug$Barcode <- NULL
+ddsDrug$RIN <- NULL
+
+dim(ddsDrug)
+```
+
+Filter genes, counts and diagnosis
+```{r}
+# Only use protein coding genes and include only CLL samples in analysis
+ddsAll <- ddsDrug[rowData(ddsDrug)$biotype == "protein_coding" & !rowData(ddsDrug)$symbol %in% c(NA, ""),
+                  ddsDrug$diagnosis == "CLL" & ddsDrug$treatment != "Baseline" & ddsDrug$Replicate == 1]
+
+# Show chromosomes
+table(rowData(ddsAll)$chromosome)
+
+# Remove all mitochondrial and artificial chromosomes
+ddsAll <- ddsAll[rowData(ddsAll)$chromosome %in% c(1:22,"X","Y")]
+
+# Remove genes on Y chromosome which could introduce some bias
+ddsAll <- ddsAll[rowData(ddsAll)$chromosome != "Y"]
+# ddsAll <- ddsAll[!rowData(ddsAll)$chromosome %in% c("X","Y")]
+table(rowData(ddsAll)$chromosome)
+
+# Keep only genes with a minimum of 10 counts in any sample
+keep_counts <- apply(counts(ddsAll), 1, function(x) any(x >= 10))
+ddsAll <- ddsAll[keep_counts,]
+
+# Keep only genes expressed in at least 30% of all samples, 
+# since most genes have a basal expression. 
+# With this function the sparsity of the expression matrix is reduced.
+expr_min <- round(ncol(counts(ddsAll)) * 0.7)
+keep_counts_expr <- apply(counts(ddsAll), 1, function(x) sum(x == 0) < expr_min)
+ddsAll <- ddsAll[keep_counts_expr,]
+dim(ddsAll)
+
+# Remove patients without DMSO sample, since no comparison is possible
+patIDs <- unique(ddsAll$patID)
+vec <- c()
+
+for(id in patIDs){
+  if(ddsDrug$treatment[ddsDrug$patID == id] == "DMSO"){
+    vec <- append(vec, id)
+  }
+}
+removepat <- setdiff(patIDs, vec)
+ddsAll <- ddsAll[, !ddsAll$patID %in% removepat]
+
+# Replace spaces in treatment names
+ddsAll$treatment <- str_replace_all(ddsAll$treatment,"[- ]","_")
+
+# Extract count matrix
+counts_df <- data.frame(assay(ddsAll))
+
+# Extract patient annotation
+patAnno <- data.frame(colData(ddsAll))
+dim(ddsAll)
+```
+
+Variance stabilization transformation of the raw data
+```{r vst}
+ddsAllnorm <- varianceStabilizingTransformation(ddsAll)
+```
+
+
+# Differential expression using DESeq2
+
+Differential expression analysis of genomic data types uses linear models to determine the size and direction of the changes in gene expression.
+
+## Preparations
+
+Define treatments of interest
+```{r}
+IbrDuvNut <- c("Ibrutinib", "Duvelisib", "Nutlin_3a")
+IbrDuvNutDMSO <- c(IbrDuvNut, "DMSO")
+```
+
+As we see have seen in the PCAs in the quality control scripts, viability (FSC.SSC) is the major source of variation between the samples. 
+Since we are interested in the differences between the treatments and not in the differences due to viability, viability can be used as a covariate in the design formula for DESeq. 
+Furthermore, the visual representation of the heatmap showing the most significant DE genes can be corrected for viability. 
+For reasons of best practice, this correction of the gene expression matrix should not be done before conducting DESeq to prevent removing important information from the count matrix. Thus, viability is only used as a covariate and not used for adjusting the raw counts.
+
+There are different options how to include the viability as a covariate. 
+One option is to use the normalized viability (FSC.SSC.norm). Here, all DMSO samples are set to one. The viabilities of the drug-perturbed samples from one patient are adjusted according to the viability of the DMSO sample of this patient. This can also be explained by the following formula: 
+
+viability.DMSO.norm = viability(DMSO) / viability(DMSO) = 1.00
+viability.drug.norm = viability(drug) / viability(DMSO)
+
+One drawback of this method is that we only compare the viability of the samples within each patient, but not across patients. Furthermore, the DMSO samples need to be adjusted as well. 
+
+A second option overcomes these drawbacks by using the viability of the DMSO sample for all drug samples of an individual patient. This enables correcting for the inter-patient ground truth viability.
+
+A new column is added to the ddsAll object in which the viability of the DMSO sample after 48 hours of incubation is added to all samples from one patient. The information about the viability of the treatment samples after 48 hours is still available in the original column.
+```{r}
+ddsAll$FSC.SSC.DMSO <- 0
+patIDs <- data.frame(ddsAll@colData@listData) %>%
+  distinct(patID) %>% pull(patID)
+
+for(id in patIDs){
+  viability <- ddsAll$FSC.SSC[ddsAll$patID == id & ddsAll$treatment == "DMSO"]
+  ddsAll$FSC.SSC.DMSO[ddsAll$patID == id] <- viability
+}
+```
+
+Subset dds object into different objects with one treatment and DMSO
+```{r}
+ddstr <- lapply(IbrDuvNut, function(tr) {
+  # Select treatment
+  patIDtr <- unique(ddsAll$patID[ddsAll$treatment == tr])
+  # Subset dds object
+  ddsdrug <- ddsAll[, ddsAll$treatment %in% c(tr, "DMSO") & ddsAll$patID %in% patIDtr]
+  ddsdrug$treatment <- factor(ddsdrug$treatment, levels = c(tr, "DMSO"))
+  ddsdrug_final <- ddsdrug
+})
+names(ddstr) <- IbrDuvNut
+
+ddsIbrutinib_exprMat <- data.frame(assay(ddstr$Ibrutinib))
+```
+
+
+### Add design matrix to dds objects
+
+For each treatment a design matrix is created and added to the dds object.
+As covariates for the design formula, IGHV and DMSO-adjusted viability are used. Furthermore, the patient IDs are considered to enable pairwise testing. 
+```{r, include=TRUE, eval=FALSE}
+for(drug in IbrDuvNut){
+    
+  # Extract dds object
+  dds <- ddstr[[drug]]
+    
+  # Exclude rows with a non-specified genotype (NA)
+  dds <- dds[, dds$IGHV %in% c(0, 1)]
+    
+  # Extract number of patients for each IGHV group
+  g0 <- unique(dds$patID[dds$IGHV == 0])
+  g1 <- unique(dds$patID[dds$IGHV == 1])
+    
+  # Add new column to rename the patients
+  dds$patIDgroup <- NA
+
+  for(pat in g0){
+    dds$patIDgroup[dds$patID == pat] <- which(g0 == pat)
+  }
+  for(pat in g1){
+    dds$patIDgroup[dds$patID == pat] <- which(g1 == pat)
+  }
+  dds$patIDgroup <- factor(dds$patIDgroup)
+    
+  # Create data frame to set differences
+  patAnno <- data.frame(colData(dds)) %>%
+    dplyr::select(FSC.SSC, IGHV, treatment, patIDgroup) %>%
+    mutate(treatment = factor(treatment,
+                              levels = c("DMSO",setdiff(unique(treatment),"DMSO"))))
+  patAnno$FSC.SSC <- as.numeric(patAnno$FSC.SSC)
+  
+  # Round to tens in order to avoid matrix not full rank
+  # (otherwise redundancy to IGHV column)
+  #patAnno$FSC.SSC.DMSO <- round(patAnno$FSC.SSC.DMSO / 10) * 10
+    
+  # Create design matrix
+  #designMat <- model.matrix(~ FSC.SSC.DMSO + IGHV + IGHV:patIDgroup + IGHV:treatment, patAnno)
+  designMat <- model.matrix(~ FSC.SSC + IGHV + IGHV:patIDgroup + IGHV:treatment, patAnno)
+    
+  # Remove empty columns in design matrix
+  all.zero <- apply(designMat, 2, function(x) all(x==0))
+  remove <- which(all.zero)
+  if(length(remove) > 0){
+    designMat <- designMat[,-remove]
+  }
+  print(dim(designMat))
+
+  # Add the design matrix to dds object
+  design(dds) <- designMat
+
+  # Save dds object
+  save(dds, file = sprintf("./DE/dds_IGHVpatIDviabDMSO_%s_STAR_20220422.RData", drug))
+}
+```
+
+## CoefExplainer to analyse design matrix
+
+[CoefExplainer](https://github.com/const-ae/CoefExplainer) by Constantin Ahlmann-Eltze helps to understand how the coefficients of a categorical linear model can be interpreted. In this example we model the expression of IGHV with a nested design formula which compares Ibrutinib with DMSO and also takes into account the patient variation, DMSO viability and the mutation status of IGHV.
+
+Preparations
+```{r}
+# Extract Ibrutinib and DMSO data frame
+df <- as.data.frame(ddstr$Ibrutinib@colData)
+df <- df[!is.na(df$IGHV), ]
+
+# We have two groups of IGHV status, 0 and 1, representing IGHV wild type and IGHV mutation. 
+# Next, we want to find out how many patients are in each group. 
+IGHV0 <- unique(df$patID[df$IGHV == 0])
+length(IGHV0)
+IGHV1 <- unique(df$patID[df$IGHV == 1])
+length(IGHV1)
+# Almost half of the patients have an IGHV mutation.
+
+# Add new column "patIDgroup" which distinguishes the individuals nested within an IGHV group.
+# Thus, we redefine the patient IDs for IGHV wt and mutation, respectively.
+df$patIDgroup <- "P"
+
+for(pat in IGHV0){
+  df$patIDgroup[df$patID == pat] <- which(IGHV0 == pat)
+}
+
+for(pat in IGHV1){
+  df$patIDgroup[df$patID == pat] <- which(IGHV1 == pat)
+}
+df$patIDgroup <- factor(df$patIDgroup)
+
+# Extract patient annotation data frame
+patAnno <- df %>%
+  dplyr::select(IGHV, treatment, patIDgroup, FSC.SSC.DMSO) %>%
+  mutate(treatment = factor(treatment,
+                            levels = c("DMSO",setdiff(unique(treatment),"DMSO"))))
+
+# Create a small example data set with two patients per IGHV mutation status and different levels of viability.
+smp <- c("smp6", "smp7", "smp16", "smp17", "smp149", "smp150", "smp241", "smp242")
+patAnno_small <- patAnno[rownames(patAnno) %in% smp, ]
+patAnno_small$patIDgroup <- as.factor(as.numeric(patAnno_small$patIDgroup))
+patAnno_small$FSC.SSC.DMSO <- as.factor(patAnno_small$FSC.SSC.DMSO)
+
+# Add column for TP53 expression (counts)
+#counts_df$smp191[rownames(counts_df) == "ENSG00000141510"]
+geneTP53 <- c(193, 200, 424, 70, 69, 37, 152, 127)
+patAnno_small$TP53expression <- geneTP53
+# The expression of the gene TP53 is always higher in DMSO sampes than in Ibrutinib samples.
+
+# Parse the nested design formula for our linear model to CoefExplainer
+coefExplFit <- CoefExplainer(patAnno_small,
+                             TP53expression ~ FSC.SSC.DMSO + IGHV + IGHV:patIDgroup + IGHV:treatment)
+```
+
+Beeswarm plot for each group:
+This plot shows for each group, how the coefficients are combined to arrive at the prediction for that group (blue line) and how that line compares against the true group mean (red line).
+```{r, fig.height=5, fig.width=15}
+plotModel(coefExplFit)
+```
+
+Look at the underlying model matrix
+```{r, fig.height=5, fig.width=15}
+plotModelMatrix(coefExplFit)
+```
+
+Look at the magnitude of each coefficient
+```{r, fig.height=5, fig.width=15}
+plotCoef(coefExplFit)
+```
+
+For a better insight, we use another gene of interest, the notch receptor 1 (ENSG00000148400). This single-pass transmembrane receptor plays a role in a variety of developmental processes by controlling cell fate decisions. NOTCH1 has emerged as the most commonly mutated gene in CLL at diagnosis, and NOTCH1 mutations are associated with poor outcomes ([Rosati et. al](https://www.ncbi.nlm.nih.gov/pmc/articles/PMC6030253/)).
+```{r, fig.height=5, fig.width=15}
+geneNOTCH1 <- c(78, 107, 181, 7, 111, 34, 35, 82)
+patAnno_small$NOTCH1expression <- geneNOTCH1
+coefExplFit <- CoefExplainer(patAnno_small,
+                             NOTCH1expression ~ FSC.SSC.DMSO + IGHV + IGHV:patIDgroup + IGHV:treatment)
+plotCoef(coefExplFit)
+```
+
+```{r, fig.height=5, fig.width=15}
+coefExplFit <- CoefExplainer(patAnno_small,
+                             NOTCH1expression ~ IGHV + FSC.SSC.DMSO + IGHV:patIDgroup + IGHV:treatment)
+plotCoef(coefExplFit)
+```
+
+```{r, fig.height=5, fig.width=15}
+coefExplFit <- CoefExplainer(patAnno_small,
+                             NOTCH1expression ~ IGHV + FSC.SSC.DMSO + IGHV:treatment)
+plotCoef(coefExplFit)
+```
+
+```{r, fig.height=5, fig.width=15}
+coefExplFit <- CoefExplainer(patAnno_small,
+                             NOTCH1expression ~ IGHV + IGHV:patIDgroup + IGHV:treatment)
+plotCoef(coefExplFit)
+```
+
+## Run DESeq2
+
+The DESeq function fits the raw counts to the negative binomial model. The final dds object contains all the information needed for performing DE testing between specific sample groups. New information such as shrunken dispersions, model coefficients, Wald test results, and gene-wise dispersions will be added to the dds object.
+
+In the design formula we used IGHV, patID, treatment and DMSO viability.
+```{r, include=TRUE, eval=FALSE}
+for(drug in IbrDuvNut){
+  load(sprintf("./DE/dds_IGHVpatIDviabDMSO_%s_STAR_20220422.RData", drug))
+  DEres <- DESeq(dds, parallel=TRUE)
+  save(DEres, file = sprintf("./DE/DEres_IGHVpatIDviabDMSO_%s_STAR_20220422.RData", drug))
+}
+```
+
+***Works with FSC.SSC but not with FSC.SSC.DMSO because column contains same information as IGHV status for one patient.***
+
+# Results of DESeq
+
+## Load and transform results
+
+Load results of individual treatments and combine all results in a list
+```{r}
+DEres_list <- list()
+for(drug in IbrDuvNut){
+  load(sprintf("./DE/DEres_IGHVpatIDviabDMSO_%s_STAR_20220422.RData", drug))
+  drug <- list(DEres)
+  DEres_list <- append(DEres_list, drug)
+}
+names(DEres_list) <- IbrDuvNut
+```
+
+The results for wild type and mutated IGHV are extracted separately with prior shrinkage of LFC values using the apeglm estimator. 
+```{r, include=TRUE, eval=FALSE}
+resIbrShrink_wt <- lfcShrink(DEres_list$Ibrutinib[which(mcols(DEres_list$Ibrutinib)$betaConv),],
+                             coef="IGHV0.treatmentIbrutinib", type="apeglm", parallel=TRUE)
+resIbrShrink_m <- lfcShrink(DEres_list$Ibrutinib[which(mcols(DEres_list$Ibrutinib)$betaConv),],
+                            coef="IGHV1.treatmentIbrutinib", type="apeglm", parallel=TRUE)
+                                  
+resDuvShrink_wt <- lfcShrink(DEres_list$Duvelisib[which(mcols(DEres_list$Duvelisib)$betaConv),],
+                             coef="IGHV0.treatmentDuvelisib", type="apeglm", parallel=TRUE)
+resDuvShrink_m <- lfcShrink(DEres_list$Duvelisib[which(mcols(DEres_list$Duvelisib)$betaConv),],
+                            coef="IGHV1.treatmentDuvelisib", type="apeglm", parallel=TRUE)
+                                  
+resNutShrink_wt <- lfcShrink(DEres_list$Nutlin_3a[which(mcols(DEres_list$Nutlin_3a)$betaConv),],
+                                coef="IGHV0.treatmentNutlin_3a", type="apeglm", parallel=TRUE)
+resNutShrink_m <- lfcShrink(DEres_list$Nutlin_3a[which(mcols(DEres_list$Nutlin_3a)$betaConv),],
+                               coef="IGHV1.treatmentNutlin_3a", type="apeglm", parallel=TRUE)
+
+allResShrink_IGHVpatID <- list(resIbrShrink_wt, resIbrShrink_m, resDuvShrink_wt,
+                     resDuvShrink_m, resNutShrink_wt, resNutShrink_m)  
+
+names(allResShrink_IGHVpatID) <- c("Ibrutinib_wt", "Ibrutinib_m", "Duvelisib_wt",
+                         "Duvelisib_m", "Nutlin_wt", "Nutlin_m")
+
+save(allResShrink_IGHVpatID, file = "./DE/allResShrink_IGHVpatIDviabDMSO_%s_STAR_20220422.RData")
+```
+
+Load results data frames with shrunken LFC values
+```{r}
+load("./DE/allResShrink_IGHVpatIDviabDMSO_%s_STAR_20220422.RData")
+```
+
+Create results data frames from the resulting dds files with shrunken LFCs
+```{r}
+counter <- 0
+allRes <- lapply(allResShrink_IGHVpatID, function(res) {
+  counter <<- counter + 1
+  resTab <- data.frame(res@listData) %>%
+      mutate(treatment = sprintf("%s_IGHV%s",
+                                 strsplit(names(allResShrink_IGHVpatID), "[_]")[[counter]][1],
+                                 strsplit(names(allResShrink_IGHVpatID), "[_]")[[counter]][2])) %>%
+      rownames_to_column(var = "Ensembl") %>%
+      mutate(symbol = rowData(ddsDrug)[Ensembl,]$symbol) %>%
+      mutate(chromosome = rowData(ddsDrug)[Ensembl,]$chromosome)
+  names(resTab)[names(resTab) == "log2FoldChange"] <- "log2FC"
+  resTab_final <- resTab
+})
+names(allRes) <- names(allResShrink_IGHVpatID)
+```
+
+The results of the different drugs are combined to one df
+```{r}
+# Change names of columns by adding treatment and mutation status
+colname <- c("Ibr_wt", "Ibr_m", "Duv_wt", "Duv_m", "Nut_wt", "Nut_m")
+name <- 0
+
+allRes_names <- lapply(allRes, function(df) {
+  name <<- name + 1
+  colnames(df) <- paste(colnames(df),colname[name],sep="_")
+  df_new <- df
+})
+names(allRes_names) <- names(allResShrink_IGHVpatID)
+
+
+# Create one df with the results of all treatments
+allRes_combined <- allRes$Ibrutinib_wt %>%
+  dplyr::select(Ensembl, symbol, chromosome)
+
+coljoin <- c("Ensembl_Ibr_wt", "Ensembl_Ibr_m", "Ensembl_Duv_wt",
+             "Ensembl_Duv_m", "Ensembl_Nut_wt", "Ensembl_Nut_m")
+enumerator <- 0
+
+for(df in allRes_names){
+  enumerator <- enumerator + 1
+  allRes_combined <- full_join(allRes_combined, df,
+                             by=c("Ensembl" = coljoin[enumerator]), keep=FALSE)
+}
+```
+
+
+## Visualize DE results
+
+In this section we explore how well our data fit the model.
+
+### Dispersion of results before shrinkage
+
+A measure of the variance for a given mean is described by a metric called dispersion. The DESeq2 model uses dispersion to assess the variability expression when modelling the counts. The dispersion is indirectly related to the mean and the variance of the data using the following formula, with alpha denoting the dispersion and mu the mean:
+
+Dispersion formula: Var = mu + alpha * mu^2
+
+An increase in variance will increase dispersion, while an increase in mean will decrease dispersion. Thus, for any two genes with the same mean expression a difference in dispersion will be caused by a difference in variance.
+
+The dispersion estimates are used to model the raw counts. If the dispersions do not follow the assumptions made by DESeq2, then the variation in the data could be poorly estimated and the DE results could be less accurate.
+```{r}
+# Ibrutinib
+DEres_IbrutinibC <- DEres_list$Ibrutinib[which(mcols(DEres_list$Ibrutinib)$betaConv),]
+plotDispEsts(DEres_IbrutinibC)
+
+# Duvelisib
+DEres_DuvelisibC <- DEres_list$Duvelisib[which(mcols(DEres_list$Duvelisib)$betaConv),]
+plotDispEsts(DEres_DuvelisibC)
+
+# Nutlin
+DEres_NutlinC <- DEres_list$Nutlin[which(mcols(DEres_list$Nutlin)$betaConv),]
+plotDispEsts(DEres_NutlinC)
+```
+This plot looks quite good, as we expect the dispersion values to decrease with increasing mean and that they cluster around the fitted maximum likelihood line. Larger numbers of replicates can estimate the mean and variation more accurately, so yield less shrinkage.
+
+Each black dot is a gene with an associated mean and dispersion value. The red line represents information used across all genes to determine the most likely estimates of dispersion for a given gene expression value. Genes with inaccurately small estimates of variation could yield many false positive genes identified as DE although there are not. Therefore, the original gene-wise dispersion estimates (black dots) are shrunken toward the curve to yield more accurate estimates of dispersion (blue dots), which are used to model the counts for determining the DE genes. Extremely high dispersion values surrounded by blue circles are not shrunken due to the likelihood that the gene may have higher variability than other genes for biological or technical reasons. Reducing the variation could result in false positives.
+
+### Distribution of shrunken LFCs
+
+Plot distribution of shrunken LFCs for wild type and mutated genotype
+```{r}
+# Ibrutinib
+p1 <- plotMA(allResShrink_IGHVpatID$Ibrutinib_wt, ylim=c(-3,3),
+             cex=.8, main="Ibrutinib IGHV wild type")
+p1 <- abline(h=c(-1,1), col="dodgerblue", lwd=2)
+
+p2 <- plotMA(allResShrink_IGHVpatID$Ibrutinib_m, ylim=c(-3,3),
+             cex=.8, main="Ibrutinib IGHV mutation")
+p2 <- abline(h=c(-1,1), col="dodgerblue", lwd=2)
+
+plot_grid(p1, p2, ncol=2)
+
+# Duvelisib
+plotMA(allResShrink_IGHVpatID$Duvelisib_wt, ylim=c(-3,3),
+             cex=.8, main="Duvelisib IGHV wild type")
+bline(h=c(-1,1), col="dodgerblue", lwd=2)
+
+plotMA(allResShrink_IGHVpatID$Duvelisib_m, ylim=c(-3,3),
+             cex=.8, main="Duvelisib IGHV mutation")
+abline(h=c(-1,1), col="dodgerblue", lwd=2)
+
+# Nutlin
+plotMA(allResShrink_IGHVpatID$Nutlin_wt, ylim=c(-3,3),
+             cex=.8, main="Nutlin IGHV wild type")
+bline(h=c(-1,1), col="dodgerblue", lwd=2)
+
+plotMA(allResShrink_IGHVpatID$Nutlin_m, ylim=c(-3,3),
+             cex=.8, main="Nutlin IGHV mutation")
+abline(h=c(-1,1), col="dodgerblue", lwd=2)
+```
+
+### P-value histogram
+
+```{r, fig.height=6, fig.width=7}
+hist_list <- lapply(allRes, function(res) {
+ ggplot(res, aes(x=pvalue)) +
+    geom_histogram(fill="lightblue", color="black",binwidth=0.025) +
+  geom_vline(xintercept=0.05,color="red",linetype="longdash") +
+  facet_wrap(~ treatment) +
+  scale_x_continuous(breaks = seq(0,1,by=0.2)) +
+  ylab("# of genes") +
+  theme(plot.title = element_text(face="bold",hjust=0.5))
+})
+
+plot_grid(plotlist=hist_list, ncol=2)
+```
+
+### Number of significant DE genes 
+
+#### Preparation
+Function for creating a df with significant up- or downregulated genes
+```{r}
+object_names <- names(allRes)
+
+sig_genes_df <- function(gle, fdr){
+  # Create new df with number of sign. genes for each treatment
+  genes_df <- setNames(data.frame(matrix(ncol = 2, nrow = 0)),
+                         c("treatment", "sig_genes"))
+  compare <- match.fun(gle)
+
+  for(df in allRes){
+    n_genes <- filter(df, compare(log2FC,0) & padj < fdr) %>% 
+      summarise(n=length(Ensembl)) %>% pull(n)
+    tr <- unique(df$treatment)
+    tr <- gsub('IGHV', '', tr)
+  
+    new_row <- c(tr, n_genes)
+    genes_df[nrow(genes_df) + 1, ] <- new_row
+  }
+  genes_df$sig_genes <- as.numeric(genes_df$sig_genes)
+  genes_df$treatment <- factor(genes_df$treatment,
+                                 levels = object_names)
+  return(genes_df)
+}
+```
+
+Function for plotting number of significant genes for each treatment
+```{r}
+sigDEgenes <- function(df, title){
+  plot <- ggplot(df, aes(x=treatment, y=sig_genes)) +
+    geom_bar(stat = "identity", color="black", fill="#0C3C9F") +
+    theme(axis.text.x = element_text(angle = 90, vjust=0.5, hjust=1)) +
+    ylab("# significant DE genes") +
+    theme(axis.title.x = element_blank()) +
+    ggtitle(title) +
+    geom_text(aes(label=sig_genes),vjust=-0.25,size=3)
+  return(plot)
+}
+```
+
+#### 5% FDR
+```{r,fig.height=3, fig.width=8}
+# Upregulated
+sig_genes_df_up <- sig_genes_df(gle=">", fdr=0.05)
+genes_5FDRup <- sigDEgenes(df=sig_genes_df_up, title="5% FDR upregulated")
+
+# Downregulated
+sig_genes_df_down <- sig_genes_df(gle="<", fdr=0.05)
+genes_5FDRdown <- sigDEgenes(df=sig_genes_df_down, title="5% FDR downregulated")
+
+plot_grid(genes_5FDRup, genes_5FDRdown, ncol=2)
+```
+
+#### 10% FDR
+```{r,fig.height=3, fig.width=8}
+# Upregulated
+sig_genes_df_up <- sig_genes_df(gle=">", fdr=0.1)
+genes_10FDRup <- sigDEgenes(df=sig_genes_df_up, title="10% FDR upregulated")
+
+# Downregulated
+sig_genes_df_down <- sig_genes_df(gle="<", fdr=0.1)
+genes_10FDRdown <- sigDEgenes(df=sig_genes_df_down, title="10% FDR downregulated")
+
+plot_grid(genes_10FDRup, genes_10FDRdown, ncol=2)
+```
+
+#### 25% FDR
+```{r,fig.height=3, fig.width=8}
+# Upregulated
+sig_genes_df_up <- sig_genes_df(gle=">", fdr=0.25)
+genes_25FDRup <- sigDEgenes(df=sig_genes_df_up, title="25% FDR upregulated")
+
+# Downregulated
+sig_genes_df_down <- sig_genes_df(gle="<", fdr=0.25)
+genes_25FDRdown <- sigDEgenes(df=sig_genes_df_down, title="25% FDR downregulated")
+
+plot_grid(genes_25FDRup, genes_25FDRdown, ncol=2)
+```
+
+ 
+### Table of significant associations of all treatments and IGHV
+
+```{r}
+allRes_combined %>%
+  dplyr::select(Ensembl, symbol, chromosome, log2FC_Ibr_wt,
+                pvalue_Ibr_wt, padj_Ibr_wt, log2FC_Ibr_m,
+                pvalue_Ibr_m, padj_Ibr_m, log2FC_Duv_wt,
+                pvalue_Duv_wt, padj_Duv_wt, log2FC_Duv_m,
+                pvalue_Duv_m, padj_Duv_m, log2FC_Nut_wt,
+                pvalue_Nut_wt, padj_Nut_wt, log2FC_Nut_m,
+                pvalue_Nut_m, padj_Nut_m) %>%
+  mutate_if(is.numeric, formatC, digits=2) %>%
+  DT::datatable()
+```
+
+### Volcano plots
+
+Function for creating volcano plot
+```{r}
+volcano <- function(res, title){
+  plot <- ggplot(res, aes(x=log2FC, y=-log10(padj))) +
+    geom_vline(xintercept = 0, color="black", linetype="solid", size=0.25) +
+    geom_hline(yintercept = -log10(0.01), color="darkgrey", linetype="dashed") +
+    geom_hline(yintercept = -log10(0.10), color="darkgrey", linetype="dashed") +
+    geom_vline(xintercept = 1, color="darkgrey", linetype="dashed") +
+    geom_vline(xintercept =-1, color="darkgrey", linetype="dashed") +
+    geom_point(data=res[res$log2FC >= 0 & res$padj <= 0.1,],
+              color="firebrick3", size=0.9) +
+    geom_point(data=res[res$log2FC <= 0 & res$padj <= 0.1,],
+              color="navy", size=0.9) +
+    geom_point(data=res[res$padj >= 0.1,], color="darkgrey", size=0.9) +
+    geom_label(data=res[res$padj <= 0.001,], aes(label=symbol),
+               label.size=NA, fill=NA, size=2, nudge_y=c(log10(2))) +
+    ggtitle(title) +
+    theme(plot.title = element_text(hjust=0.5, face="bold"))
+  return(plot)
+}
+```
+
+Remove genes with non-calculated adjusted p-values
+```{r}
+allRes_na<- lapply(allRes, function(df) {
+  df <- df[!is.na(df$padj),]
+  })
+names(allRes_na) <- object_names
+```
+
+Show volcano plot for all conditions
+```{r, fig.height=12, fig.width=10}
+p1 <- volcano(allRes_na$Ibrutinib_wt, title="Ibrutinib IGHV wt")
+p2 <- volcano(allRes_na$Ibrutinib_m, title="Ibrutinib IGHV m")
+p3 <- volcano(allRes_na$Duvelisib_wt, title="Duvelisib IGHV wt")
+p4 <- volcano(allRes_na$Duvelisib_wt, title="Duvelisib IGHV m")
+p5 <- volcano(allRes_na$Nutlin_wt, title="Nutlin IGHV wt")
+p6 <- volcano(allRes_na$Nutlin_wt, title="Nutlin IGHV m")
+
+plot_grid(p1, p2, p3, p4, p5, p6, ncol=2)
+```
+
+
+### Heatmap
+
+#### Preparations
+
+Extract the top genes of the individual results. 
+First, we filter the log fold change values and then, we select the smallest p-values.
+```{r}
+ngenes <- 500
+LFC <- 1.5
+
+# All significant genes
+top_genes <- lapply(object_names, function(tr) {
+  allRes_sub <- allRes[[tr]] %>%
+    filter(log2FC < -LFC | log2FC > LFC) %>%
+    arrange(padj) %>% slice(1:ngenes)
+  vec <- allRes_sub$Ensembl
+  })
+all_top_genes <- unique(unlist(top_genes))
+
+# Upregulated significant genes
+top_genes_up <- lapply(object_names, function(tr) {
+  allRes_sub <- allRes[[tr]] %>%
+    filter(log2FC > LFC) %>%
+    arrange(padj) %>% slice(1:ngenes)
+  vec <- allRes_sub$Ensembl
+  })
+all_top_genes_up <- unique(unlist(top_genes_up))
+
+# Downregulated significant genes
+top_genes_down <- lapply(object_names, function(tr) {
+  allRes_sub <- allRes[[tr]] %>%
+    filter(log2FC < -LFC) %>%
+    arrange(padj) %>% slice(1:ngenes)
+  vec <- allRes_sub$Ensembl
+  })
+all_top_genes_down <- unique(unlist(top_genes_down))
+```
+
+Define annotations and colors
+```{r}
+# Define annotations
+annoCol <- as.data.frame(ddsAllnorm@colData) %>%
+  dplyr::select(patID, FSC.SSC, treatment, IGHV, TP53, trisomy12, batch)
+
+annoCol$IGHV <- as.character(annoCol$IGHV)
+annoCol$IGHV[annoCol$IGHV == "0"] <- "U"
+annoCol$IGHV[annoCol$IGHV == "1"] <- "M"
+annoCol$TP53 <- as.character(annoCol$TP53)
+annoCol$TP53[annoCol$TP53 == "0"] <- "wt"
+annoCol$TP53[annoCol$TP53 == "1"] <- "m"
+annoCol$trisomy12 <- as.character(annoCol$trisomy12)
+annoCol$trisomy12[annoCol$trisomy12 == "0"] <- "wt"
+annoCol$trisomy12[annoCol$trisomy12 == "1"] <- "m"
+
+# Define colors of annotations
+color_anno = list(
+  batch = c(pilot="#F8F417", batch1="#B5E222", batch2="#76EE3D", batch3="#07D256", batch4="#0A9C43"),
+  trisomy12 = c(wt = "#DB86C6", m = "#9E137B"),
+  TP53 = c(wt = "#F0C538", m = "#AC8400"),
+  IGHV = c(U="#A4FFF4", M="#17C6B1"),
+  treatment = c(DMSO="#FFB716", Duvelisib="#4A72A6", 
+                Ibrutinib="#B75F49", Nutlin_3a="#07D262"))
+
+# Define fill colors of heatmap
+color_fill <- colorRampPalette( rev(brewer.pal(9,"RdBu")) )(255)
+
+#color_anno = list(
+#  treatment = c(DMSO="#FFFFFF", C26="#E41A1C", Duvelisib="#4A72A6", Everolimus="#7E6E85",
+#                IBET762="#D16948", Ibr_x_C26="#FFB716", Ibrutinib="#E1C62F", MK2206="#B75F49",
+#                Nutlin_3a = "#EC83BA", Selinexor="#999999", Trametinib="#48A462"))
+```
+
+#### Normalized counts
+
+Prepare expression matrix
+```{r}
+# Extract normalized expression matrix
+exprMat.norm <- assay(ddsAllnorm)
+
+# Subset normalized expression matrix by using only top genes
+exprMatsub <- exprMat.norm[rownames(exprMat.norm) %in% all_top_genes,]
+
+# Subset columns by only using treatments of interest
+smp <- unique(ddsAll$ID[ddsAll$treatment %in% IbrDuvNutDMSO])
+exprMatsub <- exprMatsub[,colnames(exprMatsub) %in% smp]
+
+# Scale expression matrix
+exprMatsub <- jyluMisc::mscale(exprMatsub, censor=2)
+```
+
+Show heatmap colored with normalized counts
+```{r, fig.width=16, fig.height=13}
+pheatmap(exprMatsub, color = color_fill, annotation_col = annoCol,
+         annotation_colors = color_anno, clustering_method = "ward.D2", fontsize=13,
+         labels_col = paste0(patAnno[colnames(exprMatsub),]$patID,"_",
+                             patAnno[colnames(exprMatsub),]$treatment),
+         show_rownames=T, fontsize_row=3, show_colnames=T, fontsize_col=2,
+         main = sprintf("Heatmap of top %s genes of IGHV m and wt (Ibrutinib, Duvelisib, Nutlin)", ngenes))
+```
+
+#### DMSO viability-adjusted counts
+
+As we see in the previous heatmap, viability (FSC.SSC) is the major source of variation between the samples, although DMSO viability was added as a covariate to the DESeq design formula. 
+Since we are interested in the differences between the treatments and not in the differences due to viability, we can adjust the visual representation in the heatmap by correcting for viability. 
+
+Again we use the DMSO viability, but this time we correct the normalized gene expression counts matrix with the "removeBatchEffect" function from limma.
+
+***Question***: Adjust for DMSO viability before or after subsetting the norm. counts matrix to only contain DMSO, Ibrutinib, Duvelisib and Nutlin?
+
+Adjust normalized counts for DMSO viability
+```{r}
+exprMat.DMSOnorm <- limma::removeBatchEffect(exprMat.norm,
+                                             batch=factor(ddsAll$FSC.SSC.DMSO))
+# mode(exprMat.DMSOnorm) <- "integer"
+```
+
+#### All significant genes
+```{r}
+# Subset normalized expression matrix by using only top genes
+exprMatsub <- exprMat.DMSOnorm[rownames(exprMat.DMSOnorm) %in% all_top_genes,]
+
+# Subset columns of expression matrix
+smp <- unique(ddsAll$ID[ddsAll$treatment %in% IbrDuvNutDMSO])
+exprMatsub <- exprMatsub[,colnames(exprMatsub) %in% smp]
+
+# Scale expression matrix
+exprMatsub <- jyluMisc::mscale(exprMatsub, censor=2)
+```
+
+```{r, fig.width=16, fig.height=13}
+pheatmap(exprMatsub, color = color_fill, annotation_col = annoCol,
+         annotation_colors = color_anno, clustering_method = "ward.D2", fontsize=13,
+         labels_col = paste0(patAnno[colnames(exprMatsub),]$patID,"_",
+                             patAnno[colnames(exprMatsub),]$treatment),
+         show_rownames=T, fontsize_row=3, show_colnames=T, fontsize_col=2,
+         main = sprintf("Heatmap of top %s genes of IGHV m and wt (Ibrutinib, Duvelisib, Nutlin)", ngenes))
+```
+
+#### Upregulated significant genes
+```{r}
+# Subset normalized expression matrix by using only top genes
+exprMatsub <- exprMat.DMSOnorm[rownames(exprMat.DMSOnorm) %in% all_top_genes_up,]
+
+# Subset columns of expression matrix
+smp <- unique(ddsAll$ID[ddsAll$treatment %in% IbrDuvNutDMSO])
+exprMatsub <- exprMatsub[,colnames(exprMatsub) %in% smp]
+
+# Scale expression matrix
+exprMatsub <- jyluMisc::mscale(exprMatsub, censor=2)
+```
+
+```{r, fig.width=16, fig.height=13}
+pheatmap(exprMatsub, color = color_fill, annotation_col = annoCol,
+         annotation_colors = color_anno, clustering_method = "ward.D2", fontsize=13,
+         labels_col = paste0(patAnno[colnames(exprMatsub),]$patID,"_",
+                             patAnno[colnames(exprMatsub),]$treatment),
+         show_rownames=T, fontsize_row=3, show_colnames=T, fontsize_col=2,
+         main = sprintf("Heatmap of top %s genes of IGHV m and wt (Ibrutinib, Duvelisib, Nutlin)", ngenes))
+```
+
+#### Downregulated significant genes
+```{r}
+# Subset normalized expression matrix by using only top genes
+exprMatsub <- exprMat.DMSOnorm[rownames(exprMat.DMSOnorm) %in% all_top_genes_down,]
+
+# Subset columns of expression matrix
+smp <- unique(ddsAll$ID[ddsAll$treatment %in% IbrDuvNutDMSO])
+exprMatsub <- exprMatsub[,colnames(exprMatsub) %in% smp]
+
+# Scale expression matrix
+exprMatsub <- jyluMisc::mscale(exprMatsub, censor=2)
+```
+
+```{r, fig.width=16, fig.height=9}
+pheatmap(exprMatsub, color = color_fill, annotation_col = annoCol,
+         annotation_colors = color_anno, clustering_method = "ward.D2", fontsize=13,
+         labels_col = paste0(patAnno[colnames(exprMatsub),]$patID,"_",
+                             patAnno[colnames(exprMatsub),]$treatment),
+         show_rownames=T, fontsize_row=3, show_colnames=T, fontsize_col=2,
+         main = sprintf("Heatmap of top %s genes of IGHV m and wt (Ibrutinib, Duvelisib, Nutlin)", ngenes))
+```
+
+
+# Pathway Enrichment Analysis
+
+With camera function
+
+
+
+# Session Info Details
+```{r, echo=FALSE, eval=TRUE}
+sessionInfo()
+```
